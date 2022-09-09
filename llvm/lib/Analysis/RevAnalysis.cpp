@@ -13,14 +13,71 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
 #include <chrono>
+
+#define DEBUG_TYPE "rev-analysis"
+
+
 using namespace std::chrono;
 
 
 
 using namespace llvm;
 
+void AnalyzeLoopBounds(Loop *L, Value *LowerBound, Value *UpperBound,
+                       ScalarEvolution *SE) {
+  enum LoopLevelFormat {
+    Dense,
+    Compressed,
+    Other
+  };
+  using LoopFormat = DenseMap<const Loop *, enum LoopLevelFormat >;
+
+  LoopFormat Res; 
+
+}
 
 bool LegalityAnalysis(Loop *TheLoop, LoopInfo *LI, ScalarEvolution *SE) {
+
+  if (TheLoop->getSubLoops().size() > 1) {
+    LLVM_DEBUG(dbgs() << "there are multiple children loops"
+                      << "\n");
+    return false;
+  }
+
+  LoopNest LN(*TheLoop, *SE);
+  unsigned LD = LN.getNestDepth();
+  LLVM_DEBUG(dbgs() << "Depth is " << LD << "\n");
+
+  if (LD > 2) {
+    LLVM_DEBUG(dbgs() << "not support loop nests with depth > 2"
+                      << "\n");
+    return false;
+  }
+
+  if (!LN.areAllLoopsSimplifyForm()) {
+    LLVM_DEBUG(dbgs() << "not all loops are simplified "
+                      << "\n");
+    return false;
+  }
+
+  for (unsigned I = LD; I > 0; I--) {
+    LoopVectorTy LoopsAtDepth = LN.getLoopsAtDepth(I);
+    if (LoopsAtDepth.size() > 1) {
+      LLVM_DEBUG(dbgs() << "multiple loops at loop depth " << I << "\n");
+      return false;
+    }
+  }
+
+  for (unsigned I = LD; I > 0; I--) {
+    LoopVectorTy LoopsAtDepth = LN.getLoopsAtDepth(I);
+    assert(LoopsAtDepth.size() == 1 &&
+           "there are more than one loop at one depth");
+    Loop *L = LoopsAtDepth[0];
+    Optional<Loop::LoopBounds> Bounds = L->getBounds(*SE);
+
+    // Analyze the loop bound to obtain the property of loop at each level
+  }
+
   int dim = 0;
   for (auto *Loop : TheLoop->getLoopsInPreorder()) {
     // 1 check bounds, affine or not?
@@ -53,9 +110,11 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
-  for (auto *LoopNest : LI.getTopLevelLoops())
+  for (auto *LoopNest : LI.getTopLevelLoops()){
+    LLVM_DEBUG(dbgs() << " " << *LoopNest << "\n");
     if (!LegalityAnalysis(LoopNest, &LI, &SE))
       return PreservedAnalyses::all();
+  }
 
   // analysis here
 
