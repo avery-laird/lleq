@@ -20,12 +20,9 @@ using namespace std::chrono;
 using namespace llvm;
 
 
-bool LegalityAnalysis(Function *F, LoopInfo *LI, ScalarEvolution *SE) {
-  auto Loops = LI->getLoopsInPreorder();
-  if (Loops.size() > 2)
-    return false;
+bool LegalityAnalysis(Loop *TheLoop, LoopInfo *LI, ScalarEvolution *SE) {
   int dim = 0;
-  for (auto *Loop : Loops) {
+  for (auto *Loop : TheLoop->getLoopsInPreorder()) {
     // 1 check bounds, affine or not?
     InductionDescriptor IVDesc;
     Loop->getInductionDescriptor(*SE, IVDesc);
@@ -56,8 +53,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
-  if (!LegalityAnalysis(&F, &LI, &SE))
-    return PreservedAnalyses::all();
+  for (auto *LoopNest : LI.getTopLevelLoops())
+    if (!LegalityAnalysis(LoopNest, &LI, &SE))
+      return PreservedAnalyses::all();
 
   // analysis here
 
