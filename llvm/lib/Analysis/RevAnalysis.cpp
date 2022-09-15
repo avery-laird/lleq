@@ -23,20 +23,76 @@ using namespace std::chrono;
 
 using namespace llvm;
 
-void AnalyzeLoopBounds(Loop *L, Value *LowerBound, Value *UpperBound,
-                       ScalarEvolution *SE) {
-  enum LoopLevelFormat {
-    Dense,
-    Compressed,
-    Other
-  };
-  using LoopFormat = DenseMap<const Loop *, enum LoopLevelFormat >;
+void RevAnalysisPass::AnalyzeLoopBounds(Loop *L, Value *LowerBound,
+                                        Value *UpperBound,
+                                        ScalarEvolution *SE) {
 
-  LoopFormat Res; 
+  const SCEV *LHS = SE->getSCEV(LowerBound);
+  const SCEV *RHS = SE->getSCEV(UpperBound);
+  const SCEV *Res = SE->getMinusSCEV(LHS, RHS);
+//  if (auto *S = dyn_cast<SCEVAddRecExpr>(Res)) {
+//    LLVM_DEBUG(
+//        dbgs() << "The difference between lower and upper bound of loop is:  "
+//               << *Res << "\n");
+//    if (S->isAffine()) {
+//      LoopForm[L] = LoopLevelFormat::Dense;
+//      return;
+//    }
+//  }
+  // ADD Code to Detect Res is Loop Invariant (CSR: 0=>n, COO: 0=>nnz)
+  // =>Dense
+  if(SE->isLoopInvariant(Res, L))
+  {
+    LLVM_DEBUG(dbgs() << "Bound " << *Res << "\n");
+    LoopForm[L] = LoopLevelFormat::Dense;
+    return;
+  }
+  if(auto *C = dyn_cast<SCEVConstant>(Res))
+  {
+    LLVM_DEBUG(dbgs() << "Bound " << *C << "\n");
+    LoopForm[L] = LoopLevelFormat::Dense;
+    return;
+  }
 
+  // Detect Compressed Form: RowPtr[i] ==> RowPtr[i+1]
+  LoadInst *LowInstr = dyn_cast<LoadInst>(LowerBound);
+  LoadInst *UpInstr = dyn_cast<LoadInst>(UpperBound);
+  if (LowInstr && UpInstr) {
+    Value *LowPtr = getLoadStorePointerOperand(LowInstr);
+    Value *UpPtr = getLoadStorePointerOperand(UpInstr);
+    auto *LowGEP = dyn_cast<GetElementPtrInst>(LowPtr);
+    auto *HighGEP = dyn_cast<GetElementPtrInst>(UpPtr);
+    if(LowGEP && HighGEP){
+      Value *LowPtrBase = LowGEP->getPointerOperand();
+      Value *HighPtrBase = HighGEP->getPointerOperand();
+      const SCEV *LowIndex = SE->getSCEV(LowGEP->getOperand(1));
+      const SCEV *HighIndex = SE->getSCEV(HighGEP->getOperand(1));
+      const SCEV *OffsetIndex = SE->getMinusSCEV(HighIndex, LowIndex);
+      while (auto *PCast = dyn_cast<BitCastInst>(LowPtrBase))
+        LowPtrBase = PCast->getOperand(0);
+      while (auto *PCast = dyn_cast<BitCastInst>(HighPtrBase))
+        HighPtrBase = PCast->getOperand(0);
+      if(LowPtrBase == HighPtrBase){
+        if (auto *C = dyn_cast<SCEVConstant>(OffsetIndex)) {
+          LLVM_DEBUG(dbgs() << "offset of loop bounds is : " << *(C->getValue())
+                            << "\n");
+          LoopForm[L] = LoopLevelFormat::Compressed;
+          return;
+          //        dbgs() << "LowIdx: " << *(SE->getMinusSCEV(HighIndex,
+          //        LowIndex)) << "\n"; dbgs() << "return: " << *(C->getValue())
+          //        << "\n";
+        }
+      }
+    }
+  }
+
+//  if (SE->getSCEV(LowerBound))
+
+  LoopForm[L] = LoopLevelFormat::Other;
+  return;
 }
 
-bool LegalityAnalysis(Loop *TheLoop, LoopInfo *LI, ScalarEvolution *SE) {
+bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI, ScalarEvolution *SE) {
 
   if (TheLoop->getSubLoops().size() > 1) {
     LLVM_DEBUG(dbgs() << "there are multiple children loops"
@@ -75,6 +131,9 @@ bool LegalityAnalysis(Loop *TheLoop, LoopInfo *LI, ScalarEvolution *SE) {
     Loop *L = LoopsAtDepth[0];
     Optional<Loop::LoopBounds> Bounds = L->getBounds(*SE);
 
+    Value &LowerBound = Bounds->getInitialIVValue();
+    Value &UpperBound = Bounds->getFinalIVValue();
+    AnalyzeLoopBounds(L, &LowerBound, &UpperBound, SE);
     // Analyze the loop bound to obtain the property of loop at each level
   }
 
