@@ -206,17 +206,8 @@ public:
 
 class LoopAnnotations {
 public:
-  DenseMap<Loop *, SmallVector<Value*>> Loop2Inv;
-  SmallVector<Value*> Postcondition;
-
-  ~LoopAnnotations() {
-    for (auto Elem : Loop2Inv)
-      for (auto *V : Elem.getSecond())
-        V->deleteValue();
-    for (auto *V : Postcondition)
-      V->deleteValue();
-    Loop2Inv.clear();
-  }
+  DenseMap<Loop *, SmallVector<std::string>> Loop2Inv;
+  SmallVector<std::string> Postcondition;
 };
 
 PreservedAnalyses RevAnalysisPass::run(Function &F,
@@ -257,64 +248,68 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       if (L->getInductionVariable(SE) == P) {
         // Handle induction specially
         Optional<Loop::LoopBounds> Bounds = L->getBounds(SE);
-        ICmpInst *Geq = new ICmpInst(ICmpInst::Predicate::ICMP_SGE, P, &Bounds->getInitialIVValue(), "lb");
-        ICmpInst *Lt = new ICmpInst(ICmpInst::Predicate::ICMP_SLT, P, &Bounds->getFinalIVValue(), "ub");
-        Annotate.Loop2Inv[L].push_back(Geq);
-        Annotate.Loop2Inv[L].push_back(Lt);
-        continue ;
+        std::string str;
+        raw_string_ostream os(str);
+        Bounds->getInitialIVValue().printAsOperand(os);
+        os << " <= " << P->getName() << " <= ";
+        Bounds->getFinalIVValue().printAsOperand(os);
+        Annotate.Loop2Inv[L].push_back(str);
+        continue;
       }
       // otherwise, try to detect a recurrence
       RecurrenceDescriptor Rec;
       if (RecurrenceDescriptor::isReductionPHI(P, L, Rec, &DB, &AC, &DT, &SE)) {
         // then describe in terms of the indvar and operation
         auto *Result = Rec.getLoopExitInstr();
-        SmallVector<Instruction*> OpChain = Rec.getReductionOpChain(P, L);
+        SmallVector<Instruction *> OpChain = Rec.getReductionOpChain(P, L);
         // constraint: P == Result
-        FCmpInst *Equal = new FCmpInst(CmpInst::Predicate::FCMP_OEQ, P, Result, "equal");
-        Annotate.Loop2Inv[L].push_back(Equal);
+        std::string str;
+        raw_string_ostream os(str);
+        P->printAsOperand(os);
+        os << " == ";
+        Result->printAsOperand(os);
+        Annotate.Loop2Inv[L].push_back(str);
       } else {
         // try another fallback method
       }
     }
-    LLVM_DEBUG(dbgs() << "Loop Invariants for " << L->getHeader()->getName() << "\n");
-    for (auto *I : Annotate.Loop2Inv[L]) {
-      std::string str;
-      raw_string_ostream os(str);
-      I->print(os, true);
-      LLVM_DEBUG(dbgs() << str << "\n");
+    LLVM_DEBUG(dbgs() << "Loop Invariants for " << L->getHeader()->getName()
+                      << "\n");
+    for (auto I : Annotate.Loop2Inv[L]) {
+      LLVM_DEBUG(dbgs() << I << "\n");
     }
 
-//    LiveInOut InOut(L);
-//    InOut.CollectLiveInOut();
-//    for (auto *I : InOut.LiveOut) {
-//      //    I->dump();
-//      StoreInst *Store;
-//      if ((Store = dyn_cast<StoreInst>(I))) {
-//        // is the store affine?
-//        auto *Ptr = SE.getSCEV(getLoadStorePointerOperand(Store));
-//        if (auto *Expr = dyn_cast<SCEVAddRecExpr>(Ptr)) {
-//          if (Expr->isAffine()) {
-//            std::string str;
-//            raw_string_ostream os(str);
-//            os << "affine write: ";
-//            getLoadStorePointerOperand(Store)->print(os, true);
-//            LLVM_DEBUG(dbgs() << str);
-//          } else {
-//            std::string str;
-//            raw_string_ostream os(str);
-//            os << "non-affine write: ";
-//            getLoadStorePointerOperand(Store)->print(os, true);
-//            LLVM_DEBUG(dbgs() << str);
-//          }
-//        } else {
-//          std::string str;
-//          raw_string_ostream os(str);
-//          os << "non-affine write: ";
-//          getLoadStorePointerOperand(Store)->print(os, true);
-//          LLVM_DEBUG(dbgs() << str);
-//        }
-//      }
-//    }
+    //    LiveInOut InOut(L);
+    //    InOut.CollectLiveInOut();
+    //    for (auto *I : InOut.LiveOut) {
+    //      //    I->dump();
+    //      StoreInst *Store;
+    //      if ((Store = dyn_cast<StoreInst>(I))) {
+    //        // is the store affine?
+    //        auto *Ptr = SE.getSCEV(getLoadStorePointerOperand(Store));
+    //        if (auto *Expr = dyn_cast<SCEVAddRecExpr>(Ptr)) {
+    //          if (Expr->isAffine()) {
+    //            std::string str;
+    //            raw_string_ostream os(str);
+    //            os << "affine write: ";
+    //            getLoadStorePointerOperand(Store)->print(os, true);
+    //            LLVM_DEBUG(dbgs() << str);
+    //          } else {
+    //            std::string str;
+    //            raw_string_ostream os(str);
+    //            os << "non-affine write: ";
+    //            getLoadStorePointerOperand(Store)->print(os, true);
+    //            LLVM_DEBUG(dbgs() << str);
+    //          }
+    //        } else {
+    //          std::string str;
+    //          raw_string_ostream os(str);
+    //          os << "non-affine write: ";
+    //          getLoadStorePointerOperand(Store)->print(os, true);
+    //          LLVM_DEBUG(dbgs() << str);
+    //        }
+    //      }
+    //    }
   }
   // next find the post condition for the outer loop
   LiveInOut InOut(&LN.getOutermostLoop());
@@ -324,16 +319,30 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   if (auto *Store = dyn_cast<StoreInst>(*InOut.LiveOut.begin())) {
     auto *Ptr = dyn_cast<GEPOperator>(getLoadStorePointerOperand(Store));
     auto *ToStore = Store->getValueOperand();
-    LoadInst *GetAt = new LoadInst(Ptr->getResultElementType(), Ptr, "y[i]", dyn_cast<Instruction>(Ptr));
-    FCmpInst *Eq = new FCmpInst(FCmpInst::Predicate::FCMP_OEQ, GetAt, ToStore, "postcond");
-    Annotate.Postcondition.push_back(Eq);
+    // go up def-use chain until a single instruction is found from a lower loop
+    int Depth = 2;
+    for (PHINode *TS; (TS = dyn_cast<PHINode>(ToStore));) {
+      if (TS->getNumIncomingValues() == 1)
+        ToStore = TS->getIncomingValue(0);
+      else
+        for (int i = 0; i < TS->getNumIncomingValues(); ++i) {
+          if (!isa<PHINode>(TS->getIncomingValue(i)))
+            continue;
+          ToStore = TS->getIncomingValue(i);
+        }
+    }
+
+    std::string str;
+    raw_string_ostream os(str);
+    os << "load(" << Ptr->getPointerOperand()->getName() << ", "
+       << Ptr->getOperand(1)->getName() << ") == ";
+    ToStore->printAsOperand(os);
+    Annotate.Postcondition.push_back(str);
   }
 
-  std::string str;
-  raw_string_ostream os(str);
-  Annotate.Postcondition[0]->print(os);
-  LLVM_DEBUG(dbgs() << "Postcondition for " << "\n");
-  LLVM_DEBUG(dbgs() << str << "\n");
+  LLVM_DEBUG(dbgs() << "Postcondition for " << LN.getOutermostLoop().getName()
+                    << "\n");
+  LLVM_DEBUG(dbgs() << Annotate.Postcondition[0] << "\n");
 
   // Get Invariants by working backwards
   // SpMV CSR example:
@@ -358,8 +367,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   //  Loop *TheLoop = LI.getLoopsInPreorder()[1];
   //
   ////  auto &LAM =
-  ///AM.getResult<LoopAnalysisManagerFunctionProxy>(F).getManager(); /  auto &AA
-  ///= AM.getResult<AAManager>(F);
+  /// AM.getResult<LoopAnalysisManagerFunctionProxy>(F).getManager(); /  auto
+  /// &AA = AM.getResult<AAManager>(F);
   ////
   //  auto *Module = F.getParent();
   ////  TargetLibraryInfoImpl TLII(Triple(Module->getTargetTriple()));
@@ -368,7 +377,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   ////  LoopStandardAnalysisResults AR = {AA,  AC,  DT,      LI,      SE,
   ////                                    TLI, TTI, nullptr, nullptr, nullptr};
   ////  LoopNestAnalysis::Result LA = LAM.getResult<LoopNestAnalysis>(*TheLoop,
-  ///AR);
+  /// AR);
   //
   //  // find sum phi
   //  PHINode *Phi = nullptr;
