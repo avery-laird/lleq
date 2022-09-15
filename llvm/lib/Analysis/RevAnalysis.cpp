@@ -189,6 +189,8 @@ public:
     L->getExitBlocks(ExitBlocks);
     for (auto *BB : ExitBlocks)
       for (auto &I : *BB) {
+        if (BB->getTerminator() == &I)
+          break;
         PHINode *Phi = dyn_cast<PHINode>(&I);
         assert(Phi && Phi->getNumIncomingValues() == 1 &&
                "loop should be in LCSSA");
@@ -202,13 +204,17 @@ public:
   }
 };
 
-class LoopInvariants {
+class LoopAnnotations {
 public:
   DenseMap<Loop *, SmallVector<Value*>> Loop2Inv;
-  ~LoopInvariants() {
+  SmallVector<Value*> Postcondition;
+
+  ~LoopAnnotations() {
     for (auto Elem : Loop2Inv)
       for (auto *V : Elem.getSecond())
         V->deleteValue();
+    for (auto *V : Postcondition)
+      V->deleteValue();
     Loop2Inv.clear();
   }
 };
@@ -237,7 +243,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // analysis here
   // live in/out: any scalars used outside the loop, or memory writes in the
   // loop
-  LoopInvariants Invariants;
+  LoopAnnotations Annotate;
 
   LoopNest LN(*LI.getTopLevelLoops()[0], SE);
   auto Depth = LN.getNestDepth();
@@ -253,8 +259,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         Optional<Loop::LoopBounds> Bounds = L->getBounds(SE);
         ICmpInst *Geq = new ICmpInst(ICmpInst::Predicate::ICMP_SGE, P, &Bounds->getInitialIVValue(), "lb");
         ICmpInst *Lt = new ICmpInst(ICmpInst::Predicate::ICMP_SLT, P, &Bounds->getFinalIVValue(), "ub");
-        Invariants.Loop2Inv[L].push_back(Geq);
-        Invariants.Loop2Inv[L].push_back(Lt);
+        Annotate.Loop2Inv[L].push_back(Geq);
+        Annotate.Loop2Inv[L].push_back(Lt);
         continue ;
       }
       // otherwise, try to detect a recurrence
@@ -265,13 +271,13 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         SmallVector<Instruction*> OpChain = Rec.getReductionOpChain(P, L);
         // constraint: P == Result
         FCmpInst *Equal = new FCmpInst(CmpInst::Predicate::FCMP_OEQ, P, Result, "equal");
-        Invariants.Loop2Inv[L].push_back(Equal);
+        Annotate.Loop2Inv[L].push_back(Equal);
       } else {
         // try another fallback method
       }
     }
     LLVM_DEBUG(dbgs() << "Loop Invariants for " << L->getHeader()->getName() << "\n");
-    for (auto *I : Invariants.Loop2Inv[L]) {
+    for (auto *I : Annotate.Loop2Inv[L]) {
       std::string str;
       raw_string_ostream os(str);
       I->print(os, true);
@@ -310,6 +316,24 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 //      }
 //    }
   }
+  // next find the post condition for the outer loop
+  LiveInOut InOut(&LN.getOutermostLoop());
+  InOut.CollectLiveInOut();
+  assert(InOut.LiveOut.size() == 1 && "must be exactly 1 live out");
+  // either a store or reg assignment
+  if (auto *Store = dyn_cast<StoreInst>(*InOut.LiveOut.begin())) {
+    auto *Ptr = dyn_cast<GEPOperator>(getLoadStorePointerOperand(Store));
+    auto *ToStore = Store->getValueOperand();
+    LoadInst *GetAt = new LoadInst(Ptr->getResultElementType(), Ptr, "y[i]", dyn_cast<Instruction>(Ptr));
+    FCmpInst *Eq = new FCmpInst(FCmpInst::Predicate::FCMP_OEQ, GetAt, ToStore, "postcond");
+    Annotate.Postcondition.push_back(Eq);
+  }
+
+  std::string str;
+  raw_string_ostream os(str);
+  Annotate.Postcondition[0]->print(os);
+  LLVM_DEBUG(dbgs() << "Postcondition for " << "\n");
+  LLVM_DEBUG(dbgs() << str << "\n");
 
   // Get Invariants by working backwards
   // SpMV CSR example:
