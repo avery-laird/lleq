@@ -144,23 +144,23 @@ bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI,
     }
   }
 
-//  int dim = 0;
-//  for (auto *Loop : TheLoop->getLoopsInPreorder()) {
-//    // 1 check bounds, affine or not?
-//    InductionDescriptor IVDesc;
-//    Loop->getInductionDescriptor(*SE, IVDesc);
-//    auto *Start = IVDesc.getStartValue();
-//    auto *End = Loop->getLatchCmpInst()->getOperand(1);
-//    errs() << "dim = " << dim++ << "\n";
-//    // check dense
-//    if (dyn_cast<ConstantInt>(Start) &&
-//        (dyn_cast<ConstantInt>(End) || dyn_cast<Argument>(End)))
-//      errs() << "maybe dense or compressed (unordered)\n";
-//    if (dyn_cast<LoadInst>(Start) && dyn_cast<LoadInst>(End))
-//      if (isa<GEPOperator>(getPointerOperand(Start)) &&
-//          isa<GEPOperator>(getPointerOperand(End)))
-//        errs() << "maybe compressed\n";
-//  }
+  //  int dim = 0;
+  //  for (auto *Loop : TheLoop->getLoopsInPreorder()) {
+  //    // 1 check bounds, affine or not?
+  //    InductionDescriptor IVDesc;
+  //    Loop->getInductionDescriptor(*SE, IVDesc);
+  //    auto *Start = IVDesc.getStartValue();
+  //    auto *End = Loop->getLatchCmpInst()->getOperand(1);
+  //    errs() << "dim = " << dim++ << "\n";
+  //    // check dense
+  //    if (dyn_cast<ConstantInt>(Start) &&
+  //        (dyn_cast<ConstantInt>(End) || dyn_cast<Argument>(End)))
+  //      errs() << "maybe dense or compressed (unordered)\n";
+  //    if (dyn_cast<LoadInst>(Start) && dyn_cast<LoadInst>(End))
+  //      if (isa<GEPOperator>(getPointerOperand(Start)) &&
+  //          isa<GEPOperator>(getPointerOperand(End)))
+  //        errs() << "maybe compressed\n";
+  //  }
 
   return true;
 }
@@ -247,17 +247,18 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   LoopAnnotations Annotate;
 
   LoopNest LN(*LI.getTopLevelLoops()[0], SE);
+  DenseMap<Value *, std::string> LiveOutMap;
   auto Depth = LN.getNestDepth();
   for (; Depth > 0; --Depth) {
     // first make partial Inv by equating all Phis
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
+    Optional<Loop::LoopBounds> Bounds = L->getBounds(SE);
     for (auto &I : *L->getHeader()) {
       auto *P = dyn_cast<PHINode>(&I);
       if (P == nullptr)
         break;
       if (L->getInductionVariable(SE) == P) {
         // Handle induction specially
-        Optional<Loop::LoopBounds> Bounds = L->getBounds(SE);
         std::string str;
         raw_string_ostream os(str);
         Bounds->getInitialIVValue().printAsOperand(os);
@@ -274,11 +275,18 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         SmallVector<Instruction *> OpChain = Rec.getReductionOpChain(P, L);
         // constraint: P == Result
         std::string str;
+        std::string rstring;
+        raw_string_ostream resos(rstring);
         raw_string_ostream os(str);
         P->printAsOperand(os);
         os << " == ";
-        Result->printAsOperand(os);
-        Annotate.Loop2Inv[L].push_back(str);
+        resos << "Sum(";
+        Bounds->getInitialIVValue().printAsOperand(resos);
+        resos << ", " << L->getInductionVariable(SE)->getName() << " - 1, ";
+        OpChain[0]->print(resos);
+        resos << ")";
+        Annotate.Loop2Inv[L].push_back(str + rstring);
+        LiveOutMap[Result] = rstring;
       } else {
         // try another fallback method
       }
@@ -286,7 +294,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     LLVM_DEBUG(dbgs() << "Loop Invariants for " << L->getHeader()->getName()
                       << "\n");
     for (auto I : Annotate.Loop2Inv[L]) {
-      LLVM_DEBUG(dbgs() << I << "\n");
+      LLVM_DEBUG(dbgs() << "\t" << I << "\n");
     }
 
     //    LiveInOut InOut(L);
@@ -346,13 +354,16 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     raw_string_ostream os(str);
     os << "load(" << Ptr->getPointerOperand()->getName() << ", "
        << Ptr->getOperand(1)->getName() << ") == ";
-    ToStore->printAsOperand(os);
+    if (LiveOutMap.count(ToStore))
+      os << LiveOutMap[ToStore];
+    else
+      ToStore->printAsOperand(os);
     Annotate.Postcondition.push_back(str);
   }
 
   LLVM_DEBUG(dbgs() << "Postcondition for " << LN.getOutermostLoop().getName()
                     << "\n");
-  LLVM_DEBUG(dbgs() << Annotate.Postcondition[0] << "\n");
+  LLVM_DEBUG(dbgs() << "\t" << Annotate.Postcondition[0] << "\n");
 
   // Get Invariants by working backwards
   // SpMV CSR example:
