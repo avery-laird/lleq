@@ -1,14 +1,14 @@
 #include "llvm/Analysis/RevAnalysis.h"
-#include "llvm/Analysis/IVDescriptors.h"
-#include "llvm/Analysis/DemandedBits.h"
-#include "llvm/Analysis/AssumptionCache.h"
-#include "llvm/Analysis/LoopNestAnalysis.h"
-#include "llvm/Analysis/LoopAccessAnalysis.h"
-#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/DemandedBits.h"
+#include "llvm/Analysis/IVDescriptors.h"
+#include "llvm/Analysis/LoopAccessAnalysis.h"
+#include "llvm/Analysis/LoopNestAnalysis.h"
+#include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
-#include "llvm/ADT/Triple.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
@@ -16,10 +16,7 @@
 
 #define DEBUG_TYPE "rev-analysis"
 
-
 using namespace std::chrono;
-
-
 
 using namespace llvm;
 
@@ -30,25 +27,24 @@ void RevAnalysisPass::AnalyzeLoopBounds(Loop *L, Value *LowerBound,
   const SCEV *LHS = SE->getSCEV(LowerBound);
   const SCEV *RHS = SE->getSCEV(UpperBound);
   const SCEV *Res = SE->getMinusSCEV(LHS, RHS);
-//  if (auto *S = dyn_cast<SCEVAddRecExpr>(Res)) {
-//    LLVM_DEBUG(
-//        dbgs() << "The difference between lower and upper bound of loop is:  "
-//               << *Res << "\n");
-//    if (S->isAffine()) {
-//      LoopForm[L] = LoopLevelFormat::Dense;
-//      return;
-//    }
-//  }
+  //  if (auto *S = dyn_cast<SCEVAddRecExpr>(Res)) {
+  //    LLVM_DEBUG(
+  //        dbgs() << "The difference between lower and upper bound of loop is:
+  //        "
+  //               << *Res << "\n");
+  //    if (S->isAffine()) {
+  //      LoopForm[L] = LoopLevelFormat::Dense;
+  //      return;
+  //    }
+  //  }
   // ADD Code to Detect Res is Loop Invariant (CSR: 0=>n, COO: 0=>nnz)
   // =>Dense
-  if(SE->isLoopInvariant(Res, L))
-  {
+  if (SE->isLoopInvariant(Res, L)) {
     LLVM_DEBUG(dbgs() << "Bound " << *Res << "\n");
     LoopForm[L] = LoopLevelFormat::Dense;
     return;
   }
-  if(auto *C = dyn_cast<SCEVConstant>(Res))
-  {
+  if (auto *C = dyn_cast<SCEVConstant>(Res)) {
     LLVM_DEBUG(dbgs() << "Bound " << *C << "\n");
     LoopForm[L] = LoopLevelFormat::Dense;
     return;
@@ -62,7 +58,7 @@ void RevAnalysisPass::AnalyzeLoopBounds(Loop *L, Value *LowerBound,
     Value *UpPtr = getLoadStorePointerOperand(UpInstr);
     auto *LowGEP = dyn_cast<GetElementPtrInst>(LowPtr);
     auto *HighGEP = dyn_cast<GetElementPtrInst>(UpPtr);
-    if(LowGEP && HighGEP){
+    if (LowGEP && HighGEP) {
       Value *LowPtrBase = LowGEP->getPointerOperand();
       Value *HighPtrBase = HighGEP->getPointerOperand();
       const SCEV *LowIndex = SE->getSCEV(LowGEP->getOperand(1));
@@ -72,7 +68,7 @@ void RevAnalysisPass::AnalyzeLoopBounds(Loop *L, Value *LowerBound,
         LowPtrBase = PCast->getOperand(0);
       while (auto *PCast = dyn_cast<BitCastInst>(HighPtrBase))
         HighPtrBase = PCast->getOperand(0);
-      if(LowPtrBase == HighPtrBase){
+      if (LowPtrBase == HighPtrBase) {
         if (auto *C = dyn_cast<SCEVConstant>(OffsetIndex)) {
           LLVM_DEBUG(dbgs() << "offset of loop bounds is : " << *(C->getValue())
                             << "\n");
@@ -86,13 +82,14 @@ void RevAnalysisPass::AnalyzeLoopBounds(Loop *L, Value *LowerBound,
     }
   }
 
-//  if (SE->getSCEV(LowerBound))
+  //  if (SE->getSCEV(LowerBound))
 
   LoopForm[L] = LoopLevelFormat::Other;
   return;
 }
 
-bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI, ScalarEvolution *SE) {
+bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI,
+                                       ScalarEvolution *SE) {
 
   if (TheLoop->getSubLoops().size() > 1) {
     LLVM_DEBUG(dbgs() << "there are multiple children loops"
@@ -146,10 +143,12 @@ bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI, ScalarEvolut
     auto *End = Loop->getLatchCmpInst()->getOperand(1);
     errs() << "dim = " << dim++ << "\n";
     // check dense
-    if (dyn_cast<ConstantInt>(Start) && (dyn_cast<ConstantInt>(End) || dyn_cast<Argument>(End)))
+    if (dyn_cast<ConstantInt>(Start) &&
+        (dyn_cast<ConstantInt>(End) || dyn_cast<Argument>(End)))
       errs() << "maybe dense or compressed (unordered)\n";
     if (dyn_cast<LoadInst>(Start) && dyn_cast<LoadInst>(End))
-      if (isa<GEPOperator>(getPointerOperand(Start)) && isa<GEPOperator>(getPointerOperand(End)))
+      if (isa<GEPOperator>(getPointerOperand(Start)) &&
+          isa<GEPOperator>(getPointerOperand(End)))
         errs() << "maybe compressed\n";
   }
 
@@ -165,40 +164,52 @@ public:
 
   void CollectLiveInOut() {
     SmallPtrSet<Instruction *, 16> WorkList;
-      for (auto *BB : L->getBlocks()) {
-        for (auto &I : *BB) {
-          WorkList.insert(&I);
-          if (isa<StoreInst>(I))
-            LiveOut.insert(&I);
-        }
+    for (auto *BB : L->getBlocks()) {
+      for (auto &I : *BB) {
+        WorkList.insert(&I);
+        if (isa<StoreInst>(I))
+          LiveOut.insert(&I);
+      }
+    }
+
+    //    while (true) {
+    //      auto Elems = WorkList.size();
+    //      SmallPtrSet<Instruction *, 4> NewElems;
+    //      for (auto *I : WorkList) {
+    //        for (auto *User : I->users()) {
+    //          NewElems.insert(dyn_cast<Instruction>(User));
+    //        }
+    //      }
+    //      WorkList.insert(NewElems.begin(), NewElems.end());
+    //      if (Elems == WorkList.size())
+    //        break;
+    //    }
+    // assume loop is LCSSA and just look at the exit block
+    SmallVector<BasicBlock *> ExitBlocks;
+    L->getExitBlocks(ExitBlocks);
+    for (auto *BB : ExitBlocks)
+      for (auto &I : *BB) {
+        PHINode *Phi = dyn_cast<PHINode>(&I);
+        assert(Phi && Phi->getNumIncomingValues() == 1 &&
+               "loop should be in LCSSA");
+        LiveOut.insert(Phi->getIncomingValue(0));
       }
 
-//    while (true) {
-//      auto Elems = WorkList.size();
-//      SmallPtrSet<Instruction *, 4> NewElems;
-//      for (auto *I : WorkList) {
-//        for (auto *User : I->users()) {
-//          NewElems.insert(dyn_cast<Instruction>(User));
-//        }
-//      }
-//      WorkList.insert(NewElems.begin(), NewElems.end());
-//      if (Elems == WorkList.size())
-//        break;
-//    }
-      // assume loop is LCSSA and just look at the exit block
-      SmallVector<BasicBlock*> ExitBlocks;
-      L->getExitBlocks(ExitBlocks);
-      for (auto *BB : ExitBlocks)
-        for (auto &I : *BB) {
-          PHINode *Phi = dyn_cast<PHINode>(&I);
-          assert(Phi && Phi->getNumIncomingValues() == 1 && "loop should be in LCSSA");
-          LiveOut.insert(Phi->getIncomingValue(0));
-        }
-
     for (auto *I : WorkList) {
-        if (!L->contains(I))
-          LiveOut.insert(I);
+      if (!L->contains(I))
+        LiveOut.insert(I);
     }
+  }
+};
+
+class LoopInvariants {
+public:
+  DenseMap<Loop *, SmallVector<Value*>> Loop2Inv;
+  ~LoopInvariants() {
+    for (auto Elem : Loop2Inv)
+      for (auto *V : Elem.getSecond())
+        V->deleteValue();
+    Loop2Inv.clear();
   }
 };
 
@@ -212,6 +223,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   AssumptionCache AC = AM.getResult<AssumptionAnalysis>(F);
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
   DemandedBits DB(F, AC, DT);
+  Module *M = F.getParent();
+  LLVMContext &C = M->getContext();
 
   LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
@@ -224,41 +237,78 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // analysis here
   // live in/out: any scalars used outside the loop, or memory writes in the
   // loop
+  LoopInvariants Invariants;
 
   LoopNest LN(*LI.getTopLevelLoops()[0], SE);
   auto Depth = LN.getNestDepth();
-  for (; Depth >= 0; --Depth) {
-    LiveInOut InOut(LN.getLoopsAtDepth(Depth)[0]);
-    InOut.CollectLiveInOut();
-    for (auto *I : InOut.LiveOut) {
-      //    I->dump();
-      StoreInst *Store;
-      if ((Store = dyn_cast<StoreInst>(I))) {
-        // is the store affine?
-        auto *Ptr = SE.getSCEV(getLoadStorePointerOperand(Store));
-        if (auto *Expr = dyn_cast<SCEVAddRecExpr>(Ptr)) {
-          if (Expr->isAffine()) {
-            std::string str;
-            raw_string_ostream os(str);
-            os << "affine write: ";
-            getLoadStorePointerOperand(Store)->print(os, true);
-            LLVM_DEBUG(dbgs() << str);
-          } else {
-            std::string str;
-            raw_string_ostream os(str);
-            os << "non-affine write: ";
-            getLoadStorePointerOperand(Store)->print(os, true);
-            LLVM_DEBUG(dbgs() << str);
-          }
-        } else {
-          std::string str;
-          raw_string_ostream os(str);
-          os << "non-affine write: ";
-          getLoadStorePointerOperand(Store)->print(os, true);
-          LLVM_DEBUG(dbgs() << str);
-        }
+  for (; Depth > 0; --Depth) {
+    // first make partial Inv by equating all Phis
+    Loop *L = LN.getLoopsAtDepth(Depth)[0];
+    for (auto &I : *L->getHeader()) {
+      auto *P = dyn_cast<PHINode>(&I);
+      if (P == nullptr)
+        break;
+      if (L->getInductionVariable(SE) == P) {
+        // Handle induction specially
+        Optional<Loop::LoopBounds> Bounds = L->getBounds(SE);
+        ICmpInst *Geq = new ICmpInst(ICmpInst::Predicate::ICMP_SGE, P, &Bounds->getInitialIVValue(), "lb");
+        ICmpInst *Lt = new ICmpInst(ICmpInst::Predicate::ICMP_SLT, P, &Bounds->getFinalIVValue(), "ub");
+        Invariants.Loop2Inv[L].push_back(Geq);
+        Invariants.Loop2Inv[L].push_back(Lt);
+        continue ;
+      }
+      // otherwise, try to detect a recurrence
+      RecurrenceDescriptor Rec;
+      if (RecurrenceDescriptor::isReductionPHI(P, L, Rec, &DB, &AC, &DT, &SE)) {
+        // then describe in terms of the indvar and operation
+        auto *Result = Rec.getLoopExitInstr();
+        SmallVector<Instruction*> OpChain = Rec.getReductionOpChain(P, L);
+        // constraint: P == Result
+        FCmpInst *Equal = new FCmpInst(CmpInst::Predicate::FCMP_OEQ, P, Result, "equal");
+        Invariants.Loop2Inv[L].push_back(Equal);
+      } else {
+        // try another fallback method
       }
     }
+    LLVM_DEBUG(dbgs() << "Loop Invariants for " << L->getHeader()->getName() << "\n");
+    for (auto *I : Invariants.Loop2Inv[L]) {
+      std::string str;
+      raw_string_ostream os(str);
+      I->print(os, true);
+      LLVM_DEBUG(dbgs() << str << "\n");
+    }
+
+//    LiveInOut InOut(L);
+//    InOut.CollectLiveInOut();
+//    for (auto *I : InOut.LiveOut) {
+//      //    I->dump();
+//      StoreInst *Store;
+//      if ((Store = dyn_cast<StoreInst>(I))) {
+//        // is the store affine?
+//        auto *Ptr = SE.getSCEV(getLoadStorePointerOperand(Store));
+//        if (auto *Expr = dyn_cast<SCEVAddRecExpr>(Ptr)) {
+//          if (Expr->isAffine()) {
+//            std::string str;
+//            raw_string_ostream os(str);
+//            os << "affine write: ";
+//            getLoadStorePointerOperand(Store)->print(os, true);
+//            LLVM_DEBUG(dbgs() << str);
+//          } else {
+//            std::string str;
+//            raw_string_ostream os(str);
+//            os << "non-affine write: ";
+//            getLoadStorePointerOperand(Store)->print(os, true);
+//            LLVM_DEBUG(dbgs() << str);
+//          }
+//        } else {
+//          std::string str;
+//          raw_string_ostream os(str);
+//          os << "non-affine write: ";
+//          getLoadStorePointerOperand(Store)->print(os, true);
+//          LLVM_DEBUG(dbgs() << str);
+//        }
+//      }
+//    }
   }
 
   // Get Invariants by working backwards
@@ -271,114 +321,122 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   //
   // Loop nest PC --> needs y[i]
   // y[i] gets it's value (store) from sum.0
-  // sum.0 gets its value from .lcssa -> %5 -> check recurrences? generated by %sum.03
-  // y[i] in outer loop, %sum.03 in inner loop
-  // Inner invariant = (less than i) && (= i)
-  // Outer invariant = (less than i)
+  // sum.0 gets its value from .lcssa -> %5 -> check recurrences? generated by
+  // %sum.03 y[i] in outer loop, %sum.03 in inner loop Inner invariant = (less
+  // than i) && (= i) Outer invariant = (less than i) step 1: make partial Inv
+  // for all loops
+  //        partial Inv: phi instruction backedge == phi instruction header
+  // step 2: make partial PC for outer loop
+  //        live outs == PC(depth-1)
 
   return PreservedAnalyses::all();
 
-
-//  Loop *TheLoop = LI.getLoopsInPreorder()[1];
-//
-////  auto &LAM = AM.getResult<LoopAnalysisManagerFunctionProxy>(F).getManager();
-////  auto &AA = AM.getResult<AAManager>(F);
-////
-//  auto *Module = F.getParent();
-////  TargetLibraryInfoImpl TLII(Triple(Module->getTargetTriple()));
-////  TargetLibraryInfo TLI(TLII);
-////  TargetTransformInfo TTI(Module->getDataLayout());
-////  LoopStandardAnalysisResults AR = {AA,  AC,  DT,      LI,      SE,
-////                                    TLI, TTI, nullptr, nullptr, nullptr};
-////  LoopNestAnalysis::Result LA = LAM.getResult<LoopNestAnalysis>(*TheLoop, AR);
-//
-//  // find sum phi
-//  PHINode *Phi = nullptr;
-//  for (auto &I : *TheLoop->getHeader())
-//    if (I.getName() == "sum.03" && (Phi = dyn_cast<PHINode>(&I)))
-//      break;
-//
-//  auto Sum = RecurrenceDescriptor::isReductionPHI(Phi, TheLoop, RedDes, &DB, &AC,
-//                                       &DT, &SE);
-//
-//  errs() << Sum << "\n";
-//
-//  // get start/end of inner loop
-//  InductionDescriptor IVDesc;
-//  TheLoop->getInductionDescriptor(SE, IVDesc);
-//
-//  //
-//
-//
-//  // The instruction who's value is used outside the loop.
-//  auto *LiveOut = RedDes.getLoopExitInstr();
-//  // Then find the store
-//  StoreInst *Store = nullptr;
-//  std::function<void(User*)> FindStore;
-//  FindStore = [&](User *User) {
-//    if (Store != nullptr) return;
-//    if ((Store = dyn_cast<StoreInst>(User))) return;
-//    for (auto *User2 : User->users()) FindStore(User2);
-//  };
-//
-//  for (auto *User : LiveOut->users()) FindStore(User);
-//
-//  // Two cases: loop is currently iterating, then
-//  // ( forall s s == i ) sum = sigma(l = rptr[i], k, val[l]*x[col[l]])
-//  auto *LowerBound = IVDesc.getStartValue();
-//  auto *CurrentUpper = TheLoop->getInductionVariable(SE);
-//  auto *Mul1 = LiveOut->getOperand(0);
-//  auto *Mul2 = LiveOut->getOperand(1);
-//
-//  std::string str;
-//  raw_string_ostream OS(str);
-//  auto *OuterIV = TheLoop->getParentLoop()->getInductionVariable(SE);
-//
-//  // now outer loop invariant:
-//  auto *OuterLoop = TheLoop->getParentLoop();
-//  // look for side-effects in outer loop (assume store for now):
-//  // find y array
-//  auto *Y = dyn_cast<GEPOperator>(getLoadStorePointerOperand(Store))->getOperand(0);
-//  auto *Rptr = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LowerBound))->getOperand(0);
-//
-//  InductionDescriptor IVOuter;
-//  OuterLoop->getInductionDescriptor(SE, IVOuter);
-//
-//  auto stop = high_resolution_clock::now();
-//  auto duration = duration_cast<microseconds>(stop - start);
-//  errs() << "\n\n" << duration.count() << "\n\n";
-//
-//  OS << "forall s: ";
-//  IVOuter.getStartValue()->printAsOperand(OS, true, Module);
-//  OS << " <= s < " << OuterIV->getName() << " ==> " << Y->getName() << "[s] == " << Store->getValueOperand()->getName() << "\n";
-//  std::string str_Outer(str);
-//  errs() << "\nOuterloop invariant:\n" << str;
-//  str.clear();
-//
-//
-//  OS << "forall s: s == " << OuterIV->getName() << " ==> " << Phi->getName() << " == sigma(l=";
-//  OS << dyn_cast<GEPOperator>(getLoadStorePointerOperand(LowerBound))->getPointerOperand()->getName() << "[s]";
-//  OS << ", " << CurrentUpper->getName() << ", ";
-//  Mul1->printAsOperand(OS, true, Module);
-//  OS << "*";
-//  Mul2->printAsOperand(OS, true, Module);
-//  OS << ")\n";
-//  errs() << "\nInnerloop invariant:\n" << str << "  and\n" << str_Outer;
-//
-//  // innerloop invariant = outerloop invariant + innerloop body invariant
-//
-//
-//
-//  auto *OuterUpperBound = OuterLoop->getLatchCmpInst()->getOperand(1);
-//
-//  str.clear();
-//  OS << "forall s: ";
-//  IVOuter.getStartValue()->printAsOperand(OS, true, Module);
-//  OS << " <= s < " << OuterUpperBound->getName() << " ==> " << Y->getName() << "[s] == " << Store->getValueOperand()->getName() << "\n";
-//  OS << "  and " << OuterIV->getName() << " == " << OuterUpperBound->getName() << "\n";
-//  errs() << "\nPostcondition:\n" << str;
-//
-//
-//
-//  return PreservedAnalyses::all();
+  //  Loop *TheLoop = LI.getLoopsInPreorder()[1];
+  //
+  ////  auto &LAM =
+  ///AM.getResult<LoopAnalysisManagerFunctionProxy>(F).getManager(); /  auto &AA
+  ///= AM.getResult<AAManager>(F);
+  ////
+  //  auto *Module = F.getParent();
+  ////  TargetLibraryInfoImpl TLII(Triple(Module->getTargetTriple()));
+  ////  TargetLibraryInfo TLI(TLII);
+  ////  TargetTransformInfo TTI(Module->getDataLayout());
+  ////  LoopStandardAnalysisResults AR = {AA,  AC,  DT,      LI,      SE,
+  ////                                    TLI, TTI, nullptr, nullptr, nullptr};
+  ////  LoopNestAnalysis::Result LA = LAM.getResult<LoopNestAnalysis>(*TheLoop,
+  ///AR);
+  //
+  //  // find sum phi
+  //  PHINode *Phi = nullptr;
+  //  for (auto &I : *TheLoop->getHeader())
+  //    if (I.getName() == "sum.03" && (Phi = dyn_cast<PHINode>(&I)))
+  //      break;
+  //
+  //  auto Sum = RecurrenceDescriptor::isReductionPHI(Phi, TheLoop, RedDes, &DB,
+  //  &AC,
+  //                                       &DT, &SE);
+  //
+  //  errs() << Sum << "\n";
+  //
+  //  // get start/end of inner loop
+  //  InductionDescriptor IVDesc;
+  //  TheLoop->getInductionDescriptor(SE, IVDesc);
+  //
+  //  //
+  //
+  //
+  //  // The instruction who's value is used outside the loop.
+  //  auto *LiveOut = RedDes.getLoopExitInstr();
+  //  // Then find the store
+  //  StoreInst *Store = nullptr;
+  //  std::function<void(User*)> FindStore;
+  //  FindStore = [&](User *User) {
+  //    if (Store != nullptr) return;
+  //    if ((Store = dyn_cast<StoreInst>(User))) return;
+  //    for (auto *User2 : User->users()) FindStore(User2);
+  //  };
+  //
+  //  for (auto *User : LiveOut->users()) FindStore(User);
+  //
+  //  // Two cases: loop is currently iterating, then
+  //  // ( forall s s == i ) sum = sigma(l = rptr[i], k, val[l]*x[col[l]])
+  //  auto *LowerBound = IVDesc.getStartValue();
+  //  auto *CurrentUpper = TheLoop->getInductionVariable(SE);
+  //  auto *Mul1 = LiveOut->getOperand(0);
+  //  auto *Mul2 = LiveOut->getOperand(1);
+  //
+  //  std::string str;
+  //  raw_string_ostream OS(str);
+  //  auto *OuterIV = TheLoop->getParentLoop()->getInductionVariable(SE);
+  //
+  //  // now outer loop invariant:
+  //  auto *OuterLoop = TheLoop->getParentLoop();
+  //  // look for side-effects in outer loop (assume store for now):
+  //  // find y array
+  //  auto *Y =
+  //  dyn_cast<GEPOperator>(getLoadStorePointerOperand(Store))->getOperand(0);
+  //  auto *Rptr =
+  //  dyn_cast<GEPOperator>(getLoadStorePointerOperand(LowerBound))->getOperand(0);
+  //
+  //  InductionDescriptor IVOuter;
+  //  OuterLoop->getInductionDescriptor(SE, IVOuter);
+  //
+  //  auto stop = high_resolution_clock::now();
+  //  auto duration = duration_cast<microseconds>(stop - start);
+  //  errs() << "\n\n" << duration.count() << "\n\n";
+  //
+  //  OS << "forall s: ";
+  //  IVOuter.getStartValue()->printAsOperand(OS, true, Module);
+  //  OS << " <= s < " << OuterIV->getName() << " ==> " << Y->getName() << "[s]
+  //  == " << Store->getValueOperand()->getName() << "\n"; std::string
+  //  str_Outer(str); errs() << "\nOuterloop invariant:\n" << str; str.clear();
+  //
+  //
+  //  OS << "forall s: s == " << OuterIV->getName() << " ==> " << Phi->getName()
+  //  << " == sigma(l="; OS <<
+  //  dyn_cast<GEPOperator>(getLoadStorePointerOperand(LowerBound))->getPointerOperand()->getName()
+  //  << "[s]"; OS << ", " << CurrentUpper->getName() << ", ";
+  //  Mul1->printAsOperand(OS, true, Module);
+  //  OS << "*";
+  //  Mul2->printAsOperand(OS, true, Module);
+  //  OS << ")\n";
+  //  errs() << "\nInnerloop invariant:\n" << str << "  and\n" << str_Outer;
+  //
+  //  // innerloop invariant = outerloop invariant + innerloop body invariant
+  //
+  //
+  //
+  //  auto *OuterUpperBound = OuterLoop->getLatchCmpInst()->getOperand(1);
+  //
+  //  str.clear();
+  //  OS << "forall s: ";
+  //  IVOuter.getStartValue()->printAsOperand(OS, true, Module);
+  //  OS << " <= s < " << OuterUpperBound->getName() << " ==> " << Y->getName()
+  //  << "[s] == " << Store->getValueOperand()->getName() << "\n"; OS << "  and
+  //  " << OuterIV->getName() << " == " << OuterUpperBound->getName() << "\n";
+  //  errs() << "\nPostcondition:\n" << str;
+  //
+  //
+  //
+  //  return PreservedAnalyses::all();
 }
