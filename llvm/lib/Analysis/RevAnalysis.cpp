@@ -134,23 +134,33 @@ bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI,
     // Analyze the loop bound to obtain the property of loop at each level
   }
 
-  int dim = 0;
-  for (auto *Loop : TheLoop->getLoopsInPreorder()) {
-    // 1 check bounds, affine or not?
-    InductionDescriptor IVDesc;
-    Loop->getInductionDescriptor(*SE, IVDesc);
-    auto *Start = IVDesc.getStartValue();
-    auto *End = Loop->getLatchCmpInst()->getOperand(1);
-    errs() << "dim = " << dim++ << "\n";
-    // check dense
-    if (dyn_cast<ConstantInt>(Start) &&
-        (dyn_cast<ConstantInt>(End) || dyn_cast<Argument>(End)))
-      errs() << "maybe dense or compressed (unordered)\n";
-    if (dyn_cast<LoadInst>(Start) && dyn_cast<LoadInst>(End))
-      if (isa<GEPOperator>(getPointerOperand(Start)) &&
-          isa<GEPOperator>(getPointerOperand(End)))
-        errs() << "maybe compressed\n";
+  for (unsigned I = 1; I <= LD; I++) {
+    LoopVectorTy LoopsAtDepth = LN.getLoopsAtDepth(I);
+    Loop *L = LoopsAtDepth[0];
+    LLVM_DEBUG(dbgs() << "Loop Form: " << LoopForm[L] << "\n");
+    if (LoopForm[L] == LoopLevelFormat::Other) {
+      LLVM_DEBUG(dbgs() << "LLNA: detect the unsupported loop \n");
+      return false;
+    }
   }
+
+//  int dim = 0;
+//  for (auto *Loop : TheLoop->getLoopsInPreorder()) {
+//    // 1 check bounds, affine or not?
+//    InductionDescriptor IVDesc;
+//    Loop->getInductionDescriptor(*SE, IVDesc);
+//    auto *Start = IVDesc.getStartValue();
+//    auto *End = Loop->getLatchCmpInst()->getOperand(1);
+//    errs() << "dim = " << dim++ << "\n";
+//    // check dense
+//    if (dyn_cast<ConstantInt>(Start) &&
+//        (dyn_cast<ConstantInt>(End) || dyn_cast<Argument>(End)))
+//      errs() << "maybe dense or compressed (unordered)\n";
+//    if (dyn_cast<LoadInst>(Start) && dyn_cast<LoadInst>(End))
+//      if (isa<GEPOperator>(getPointerOperand(Start)) &&
+//          isa<GEPOperator>(getPointerOperand(End)))
+//        errs() << "maybe compressed\n";
+//  }
 
   return true;
 }
