@@ -5,8 +5,9 @@
 #ifndef LLVM_REVANALYSIS_H
 #define LLVM_REVANALYSIS_H
 
-#include "llvm/IR/PassManager.h"
+#include "LoopNestAnalysis.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/IR/PassManager.h"
 
 namespace llvm {
 
@@ -21,13 +22,16 @@ class RevAnalysisPass : public PassInfoMixin<RevAnalysisPass> {
     Other
   };
 
-  using LoopFormat = DenseMap<const Loop *, enum LoopLevelFormat >;
+  using LoopFormat = DenseMap<const Loop *, enum LoopLevelFormat>;
 
   LoopFormat LoopForm;
 
   bool LegalityAnalysis(Loop *TheLoop, LoopInfo *LI, ScalarEvolution *SE);
   void AnalyzeLoopBounds(Loop *L, Value *LowerBound, Value *UpperBound,
                          ScalarEvolution *SE);
+
+  void AnalyzeLoopStatements(LoopNest *LN, ScalarEvolution *SE);
+
 public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };
