@@ -1,4 +1,5 @@
 #include "llvm/Analysis/RevAnalysis.h"
+#include "z3++.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AssumptionCache.h"
@@ -13,7 +14,6 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
 #include <chrono>
-#include "z3++.h"
 
 #define DEBUG_TYPE "rev-analysis"
 
@@ -253,21 +253,40 @@ public:
 
 class Z3Converter {
 public:
-  DenseMap<Value*, expr *> Value2Z3;
-  context c;
+  DenseMap<Value *, expr *> Value2Z3;
+  context *c;
+  Z3Converter(context *c) : c(c){};
 
-  expr to_Z3(Value* V) {
-    expr symbol(c);
+  z3::sort type_to_sort(Type *T) {
+    if (T->getTypeID() == Type::TypeID::IntegerTyID)
+      return c->int_sort();
+    if (T->getTypeID() == Type::TypeID::DoubleTyID)
+      return c->real_sort();
+  }
+
+  expr to_Z3(Value *V) {
     if (auto *Const = dyn_cast<Constant>(V)) {
       switch (Const->getType()->getTypeID()) {
       case Type::TypeID::IntegerTyID:
-        symbol = c.int_const(V->getName().data());
+        return c->int_val(dyn_cast<ConstantInt>(V)->getSExtValue());
         break;
       default:
         assert(0 && "unsupported constant type");
         break;
       }
+    } else if (auto *Load = dyn_cast<LoadInst>(V)) {
+      return to_Z3(getLoadStorePointerOperand(V));
+    } else if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+      assert(GEP->getNumIndices() == 1);
+      z3::sort asort = c->array_sort(type_to_sort(GEP->getSourceElementType()), type_to_sort(GEP->getResultElementType()));
+      return c->constant(GEP->getPointerOperand()->getName().data(), asort)[to_Z3(GEP->getOperand(1))];
+    } else if (auto *Cast = dyn_cast<CastInst>(V)) {
+      return to_Z3(Cast->getOperand(0));
+    } else if (auto *Phi = dyn_cast<PHINode>(V)) {
+
     }
+
+    return c->bool_val(true);
   }
 };
 
@@ -299,7 +318,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // live in/out: any scalars used outside the loop, or memory writes in the
   // loop
   LoopAnnotations Annotate;
-  Z3Converter Conv;
+  context c;
+  Z3Converter Conv(&c);
 
   LoopNest LN(*LI.getTopLevelLoops()[0], SE);
   DenseMap<Value *, std::string> LiveOutMap;
@@ -317,7 +337,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         std::string str;
         raw_string_ostream os(str);
         Bounds->getInitialIVValue().printAsOperand(os);
-        Conv.to_Z3(&Bounds->getInitialIVValue());
+        auto lb = Conv.to_Z3(&Bounds->getInitialIVValue());
+        auto lbstr = lb.to_string();
+        auto ub = Conv.to_Z3(&Bounds->getFinalIVValue());
+        auto ubstr = lb.to_string();
         os << " <= " << P->getName() << " <= ";
         Bounds->getFinalIVValue().printAsOperand(os);
         Annotate.Loop2Inv[L].push_back(str);
@@ -330,8 +353,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         auto *Result = Rec.getLoopExitInstr();
         SmallVector<Instruction *> OpChain = Rec.getReductionOpChain(P, L);
         // constraint: P == Result
-//        expr Ps = c.real_const(P->getName().data());
-//        expr Res = c.real_const(Result->getName().data());
+        //        expr Ps = c.real_const(P->getName().data());
+        //        expr Res = c.real_const(Result->getName().data());
         std::string str;
         std::string rstring;
         raw_string_ostream resos(rstring);
