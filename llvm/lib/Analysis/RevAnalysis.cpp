@@ -251,6 +251,26 @@ public:
   SmallVector<std::string> Postcondition;
 };
 
+class Z3Converter {
+public:
+  DenseMap<Value*, expr *> Value2Z3;
+  context c;
+
+  expr to_Z3(Value* V) {
+    expr symbol(c);
+    if (auto *Const = dyn_cast<Constant>(V)) {
+      switch (Const->getType()->getTypeID()) {
+      case Type::TypeID::IntegerTyID:
+        symbol = c.int_const(V->getName().data());
+        break;
+      default:
+        assert(0 && "unsupported constant type");
+        break;
+      }
+    }
+  }
+};
+
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
   errs() << F.getName() << "\n";
@@ -279,7 +299,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // live in/out: any scalars used outside the loop, or memory writes in the
   // loop
   LoopAnnotations Annotate;
-  context c;
+  Z3Converter Conv;
 
   LoopNest LN(*LI.getTopLevelLoops()[0], SE);
   DenseMap<Value *, std::string> LiveOutMap;
@@ -297,6 +317,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         std::string str;
         raw_string_ostream os(str);
         Bounds->getInitialIVValue().printAsOperand(os);
+        Conv.to_Z3(&Bounds->getInitialIVValue());
         os << " <= " << P->getName() << " <= ";
         Bounds->getFinalIVValue().printAsOperand(os);
         Annotate.Loop2Inv[L].push_back(str);
@@ -309,8 +330,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         auto *Result = Rec.getLoopExitInstr();
         SmallVector<Instruction *> OpChain = Rec.getReductionOpChain(P, L);
         // constraint: P == Result
-        expr Ps = c.real_const(P->getName().data());
-        expr Res = c.real_const(Result->getName().data());
+//        expr Ps = c.real_const(P->getName().data());
+//        expr Res = c.real_const(Result->getName().data());
         std::string str;
         std::string rstring;
         raw_string_ostream resos(rstring);
