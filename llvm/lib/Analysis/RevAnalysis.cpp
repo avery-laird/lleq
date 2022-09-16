@@ -13,12 +13,14 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
 #include <chrono>
+#include "z3++.h"
 
 #define DEBUG_TYPE "rev-analysis"
 
 using namespace std::chrono;
 
 using namespace llvm;
+using namespace z3;
 
 void RevAnalysisPass::AnalyzeLoopBounds(Loop *L, Value *LowerBound,
                                         Value *UpperBound,
@@ -245,6 +247,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // live in/out: any scalars used outside the loop, or memory writes in the
   // loop
   LoopAnnotations Annotate;
+  context c;
 
   LoopNest LN(*LI.getTopLevelLoops()[0], SE);
   DenseMap<Value *, std::string> LiveOutMap;
@@ -274,6 +277,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         auto *Result = Rec.getLoopExitInstr();
         SmallVector<Instruction *> OpChain = Rec.getReductionOpChain(P, L);
         // constraint: P == Result
+        expr Ps = c.real_const(P->getName().data());
+        expr Res = c.real_const(Result->getName().data());
         std::string str;
         std::string rstring;
         raw_string_ostream resos(rstring);
