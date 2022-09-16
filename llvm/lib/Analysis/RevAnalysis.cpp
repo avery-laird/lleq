@@ -90,6 +90,10 @@ void RevAnalysisPass::AnalyzeLoopBounds(Loop *L, Value *LowerBound,
   return;
 }
 
+void RevAnalysisPass::AnalyzeLoopStatements(LoopNest *LN, ScalarEvolution *SE) {
+
+}
+
 bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI,
                                        ScalarEvolution *SE) {
 
@@ -146,23 +150,48 @@ bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI,
     }
   }
 
-  //  int dim = 0;
-  //  for (auto *Loop : TheLoop->getLoopsInPreorder()) {
-  //    // 1 check bounds, affine or not?
-  //    InductionDescriptor IVDesc;
-  //    Loop->getInductionDescriptor(*SE, IVDesc);
-  //    auto *Start = IVDesc.getStartValue();
-  //    auto *End = Loop->getLatchCmpInst()->getOperand(1);
-  //    errs() << "dim = " << dim++ << "\n";
-  //    // check dense
-  //    if (dyn_cast<ConstantInt>(Start) &&
-  //        (dyn_cast<ConstantInt>(End) || dyn_cast<Argument>(End)))
-  //      errs() << "maybe dense or compressed (unordered)\n";
-  //    if (dyn_cast<LoadInst>(Start) && dyn_cast<LoadInst>(End))
-  //      if (isa<GEPOperator>(getPointerOperand(Start)) &&
-  //          isa<GEPOperator>(getPointerOperand(End)))
-  //        errs() << "maybe compressed\n";
-  //  }
+  unsigned LoopIdx = 1;
+  for (; LoopIdx < LD; LoopIdx++) {
+    LoopVectorTy LoopsAtDepth = LN.getLoopsAtDepth(LoopIdx);
+    Loop *L = LoopsAtDepth[0];
+    Loop *NextL = L->getSubLoops().front();
+    if (!LN.arePerfectlyNested(*L, *NextL, *SE))
+      break;
+  }
+
+  Loop *CurrentLoop = LN.getLoopsAtDepth(LoopIdx)[0];
+  SmallPtrSet<Value *, 16> WorkList;
+  for (auto *BB : CurrentLoop->getBlocks()) {
+    if (LoopIdx < LD) {
+      Loop *NextL = CurrentLoop->getSubLoops().front();
+      if (NextL->contains(BB))
+        continue;
+    }
+    for (auto &I : *BB) {
+      if (isa<StoreInst>(&I)) {
+        LLVM_DEBUG(dbgs() << "Collect Store Instruction " << I << "\n");
+        WorkList.insert(&I);
+      }
+    }
+  }
+
+  if (WorkList.size() > 2)
+    return false;
+
+  SmallVector<BasicBlock *> ExitBlocks;
+  TheLoop->getExitBlocks(ExitBlocks);
+  for (auto *BB : ExitBlocks)
+    for (auto &I : *BB) {
+      if (BB->getTerminator() == &I)
+        break;
+      PHINode *Phi = dyn_cast<PHINode>(&I);
+      assert(Phi && Phi->getNumIncomingValues() == 1 &&
+             "loop should be in LCSSA");
+      WorkList.insert(Phi->getIncomingValue(0));
+    }
+
+  if (WorkList.size() > 2)
+    return false;
 
   return true;
 }
@@ -239,8 +268,11 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
   for (auto *LoopNest : LI.getTopLevelLoops()) {
     LLVM_DEBUG(dbgs() << " " << *LoopNest << "\n");
-    if (!LegalityAnalysis(LoopNest, &LI, &SE))
+    if (!LegalityAnalysis(LoopNest, &LI, &SE)) {
+      LLVM_DEBUG(dbgs() << "LLNA: "
+                        << "fail to pass legality check \n");
       return PreservedAnalyses::all();
+    }
   }
 
   // analysis here
