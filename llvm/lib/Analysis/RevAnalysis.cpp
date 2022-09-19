@@ -253,7 +253,8 @@ public:
 
 class Z3Converter {
 public:
-  DenseMap<Value *, expr *> Value2Z3;
+  DenseMap<Value *, expr> Value2Z3;
+  std::vector<std::pair<Value*, expr>> Allocated;
   context *c;
   Z3Converter(context *c) : c(c){};
 
@@ -283,7 +284,20 @@ public:
     } else if (auto *Cast = dyn_cast<CastInst>(V)) {
       return to_Z3(Cast->getOperand(0));
     } else if (auto *Phi = dyn_cast<PHINode>(V)) {
-
+      for (auto &pair : Allocated)
+        if (pair.first == Phi)
+          return pair.second;
+      auto Tmp = c->constant(Phi->getName().data(), type_to_sort(Phi->getType()));
+      Allocated.push_back({Phi, Tmp});
+      return Tmp;
+    } else if (auto *BinOp = dyn_cast<BinaryOperator>(V)) {
+      switch (BinOp->getOpcode()) {
+        case BinaryOperator::BinaryOps::Add:
+          return to_Z3(BinOp->getOperand(0)) + to_Z3(BinOp->getOperand(1));
+        default:
+          assert(0 && "unsupported binop type.");
+          break;
+      }
     }
 
     return c->bool_val(true);
@@ -336,13 +350,13 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         // Handle induction specially
         std::string str;
         raw_string_ostream os(str);
-        Bounds->getInitialIVValue().printAsOperand(os);
+//        Bounds->getInitialIVValue().printAsOperand(os);
         auto lb = Conv.to_Z3(&Bounds->getInitialIVValue());
         auto lbstr = lb.to_string();
         auto ub = Conv.to_Z3(&Bounds->getFinalIVValue());
-        auto ubstr = lb.to_string();
-        os << " <= " << P->getName() << " <= ";
-        Bounds->getFinalIVValue().printAsOperand(os);
+        auto ubstr = ub.to_string();
+        os << lbstr << " <= " << P->getName() << " <= " << ubstr;
+//        Bounds->getFinalIVValue().printAsOperand(os);
         Annotate.Loop2Inv[L].push_back(str);
         continue;
       }
