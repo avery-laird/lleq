@@ -255,6 +255,7 @@ class Z3Converter {
 public:
   DenseMap<Value *, expr> Value2Z3;
   std::vector<std::pair<Value*, expr>> Allocated;
+  std::vector<std::pair<Value*, func_decl>> Functions;
   context *c;
   Z3Converter(context *c) : c(c){};
 
@@ -263,6 +264,30 @@ public:
       return c->int_sort();
     if (T->getTypeID() == Type::TypeID::DoubleTyID)
       return c->real_sort();
+  }
+
+  expr ReductionPHI(ScalarEvolution *SE, Loop *L, PHINode *Phi, RecurrenceDescriptor *Rec, Value *Start, Value *End) {
+
+    auto Func = c->recfun("SymbolicSum", c->int_sort(), c->int_sort(), type_to_sort(Rec->getRecurrenceType()));
+    auto from = c->int_const("from");
+    auto to = c->int_const("to");
+
+    InductionDescriptor IVDec;
+    L->getInductionDescriptor(*SE, IVDec);
+//    auto lb = to_Z3(IVDec.getStartValue()).
+    auto OpChain = Rec->getReductionOpChain(Phi, L);
+    if (auto *Call = dyn_cast<CallInst>(OpChain[0])) {
+      if (RecurrenceDescriptor::isFMulAddIntrinsic(Call)) {
+        auto A = to_Z3(Call->getOperand(0));
+        auto B = to_Z3(Call->getOperand(1));
+        auto C = to_Z3(Call->getOperand(2));
+        expr_vector Args(*c);
+        Args.push_back(from); Args.push_back(to);
+        c->recdef(Func, Args, ite(to < from, c->int_val(0), Func(from, to -1) + A*B + C));
+        Functions.push_back({Rec->getLoopExitInstr(), Func});
+        return Func(to_Z3(Start), to_Z3(End)-1);
+      }
+    }
   }
 
   expr to_Z3(Value *V) {
@@ -275,11 +300,11 @@ public:
         assert(0 && "unsupported constant type");
         break;
       }
-    } else if (auto *Load = dyn_cast<LoadInst>(V)) {
+    } else if (isa<LoadInst>(V) || isa<StoreInst>(V)) {
       return to_Z3(getLoadStorePointerOperand(V));
     } else if (auto *GEP = dyn_cast<GEPOperator>(V)) {
       assert(GEP->getNumIndices() == 1);
-      z3::sort asort = c->array_sort(type_to_sort(GEP->getSourceElementType()), type_to_sort(GEP->getResultElementType()));
+      z3::sort asort = c->array_sort(type_to_sort(GEP->getOperand(1)->getType()), type_to_sort(GEP->getResultElementType()));
       return c->constant(GEP->getPointerOperand()->getName().data(), asort)[to_Z3(GEP->getOperand(1))];
     } else if (auto *Cast = dyn_cast<CastInst>(V)) {
       return to_Z3(Cast->getOperand(0));
@@ -298,18 +323,100 @@ public:
           assert(0 && "unsupported binop type.");
           break;
       }
-    } else if (auto *Arg = dyn_cast<Argument>(V)) {
+    } else if (isa<Argument>(V) || isa<CallInst>(V)) {
       for (auto &pair : Allocated)
-        if (pair.first == Arg)
+        if (pair.first == V)
           return pair.second;
-      auto Tmp = c->constant(Arg->getName().data(), type_to_sort(Arg->getType()));
-      Allocated.push_back({Arg, Tmp});
+      auto Tmp = c->constant(V->getNameOrAsOperand().data(), type_to_sort(V->getType()));
+      Allocated.push_back({V, Tmp});
       return Tmp;
     }
 
     return c->bool_val(true);
   }
 };
+
+static Value *TraceValDefinition(Value *V) {
+
+}
+
+static expr PostconditionTemplate(DemandedBits *DB, AssumptionCache *AC, DominatorTree *DT, ScalarEvolution *SE, LoopAnnotations *Annotate, DenseMap<Value *, std::string> *LiveOutMap, Z3Converter *Conv, LoopNest *LN, int Depth) {
+  // find the postcondition first
+  // collect all stores or vars used outside
+  DenseSet<Value*> LoopOuts;
+  DenseMap<Value*, std::pair<RecurrenceDescriptor, PHINode*>> Recurrences;
+  Loop *Loop = LN->getLoopsAtDepth(Depth)[0];
+
+  // find any recurrences and map then to outputs
+  for (auto &I : *Loop->getHeader()) {
+    auto *PN = dyn_cast<PHINode>(&I);
+    if (PN == nullptr)
+      break;
+    RecurrenceDescriptor Rec;
+    if (RecurrenceDescriptor::isReductionPHI(PN, Loop, Rec, DB, AC, DT, SE))
+      Recurrences[Rec.getLoopExitInstr()] = {Rec, PN};
+  }
+
+  for (auto *BB : Loop->getBlocks())
+    for (auto &I : *BB)
+      if (isa<StoreInst>(&I))
+        LoopOuts.insert(&I);
+  for (auto &I : *Loop->getUniqueExitBlock())
+    if (auto *PN = dyn_cast<PHINode>(&I)) {
+      // find the definition inside the loop
+      assert(PN->getNumIncomingValues() == 1 && "loop is not in lcssa form");
+      auto *ToFind = PN->getOperand(0);
+      if (Recurrences.count(ToFind))
+        LoopOuts.insert(Recurrences[ToFind].second);
+    }
+
+  // Now find the postcondition(v for val in OuterLoopOuts)
+  for (auto *V : LoopOuts) {
+
+    if (auto *Store = dyn_cast<StoreInst>(V)) {
+      // should be stored val == value to store
+      auto Left = Conv->to_Z3(Store);
+      // trace origin of value to store
+      auto *ToStore = Store->getValueOperand();
+      // trigger building the PC for any inner loops that generate this
+      auto PC = Left == PostconditionTemplate(DB, AC, DT, SE, Annotate, LiveOutMap, Conv, LN, Depth+1);
+      return PC;
+    }
+
+    // Phi nodes must be the LCSSA types from being used outside.
+    // First find the definition inside the loop.
+    if (auto *P = dyn_cast<PHINode>(V)) {
+      // bounds for the OUTER function
+      Optional<Loop::LoopBounds> Bounds = Loop->getBounds(*SE);
+      RecurrenceDescriptor Rec;
+      if (RecurrenceDescriptor::isReductionPHI(P, Loop, Rec, DB, AC, DT, SE)) {
+        // then describe in terms of the indvar and operation
+        auto *Result = Rec.getLoopExitInstr();
+        SmallVector<Instruction *> OpChain = Rec.getReductionOpChain(P, Loop);
+        // constraint: P == Result
+        //        expr Ps = c.real_const(P->getName().data());
+        //        expr Res = c.real_const(Result->getName().data());
+//        std::string str;
+//        std::string rstring;
+//        raw_string_ostream resos(rstring);
+//        raw_string_ostream os(str);
+        auto Constraint = Conv->to_Z3(Rec.getLoopExitInstr()) == Conv->ReductionPHI(SE, Loop, P, &Rec, &Bounds->getInitialIVValue(), &Bounds->getFinalIVValue());
+//        P->printAsOperand(os);
+//        os << " == ";
+//        resos << "Sum(";
+//        Bounds->getInitialIVValue().printAsOperand(resos);
+//        resos << ", " << Loop->getInductionVariable(*SE)->getName() << " - 1, ";
+//        OpChain[0]->print(resos);
+//        resos << ")";
+        Annotate->Loop2Inv[Loop].push_back(Constraint.to_string());
+//        (*LiveOutMap)[Result] = rstring;
+        return Constraint;
+      } else {
+        // try another fallback method
+      }
+    }
+  }
+}
 
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
@@ -339,13 +446,23 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // live in/out: any scalars used outside the loop, or memory writes in the
   // loop
   LoopAnnotations Annotate;
+  DenseMap<Value *, std::string> LiveOutMap;
   context c;
   Z3Converter Conv(&c);
-
   LoopNest LN(*LI.getTopLevelLoops()[0], SE);
-  DenseMap<Value *, std::string> LiveOutMap;
+
+  PostconditionTemplate(&DB, &AC, &DT, &SE, &Annotate, &LiveOutMap,&Conv, &LN, 1);
+  for (int Depth = 1; Depth <= LN.getNestDepth(); ++Depth) {
+    Loop *L = LN.getLoopsAtDepth(Depth)[0];
+    LLVM_DEBUG(dbgs() << "Loop Invariants\n"
+                      << L->getHeader()->getName() << "\n");
+    for (auto I : Annotate.Loop2Inv[L]) {
+      LLVM_DEBUG(dbgs() << "\t" << I << "\n");
+    }
+  }
+
   auto Depth = LN.getNestDepth();
-  for (; Depth > 0; --Depth) {
+  for (; Depth > 0; --Depth) { // first pass is inner -> outer just to handle induction phis
     // first make partial Inv by equating all Phis
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
     Optional<Loop::LoopBounds> Bounds = L->getBounds(SE);
@@ -364,32 +481,51 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         Annotate.Loop2Inv[L].push_back(inv.to_string());
         continue;
       }
-      // otherwise, try to detect a recurrence
-      RecurrenceDescriptor Rec;
-      if (RecurrenceDescriptor::isReductionPHI(P, L, Rec, &DB, &AC, &DT, &SE)) {
-        // then describe in terms of the indvar and operation
-        auto *Result = Rec.getLoopExitInstr();
-        SmallVector<Instruction *> OpChain = Rec.getReductionOpChain(P, L);
-        // constraint: P == Result
-        //        expr Ps = c.real_const(P->getName().data());
-        //        expr Res = c.real_const(Result->getName().data());
-        std::string str;
-        std::string rstring;
-        raw_string_ostream resos(rstring);
-        raw_string_ostream os(str);
-        P->printAsOperand(os);
-        os << " == ";
-        resos << "Sum(";
-        Bounds->getInitialIVValue().printAsOperand(resos);
-        resos << ", " << L->getInductionVariable(SE)->getName() << " - 1, ";
-        OpChain[0]->print(resos);
-        resos << ")";
-        Annotate.Loop2Inv[L].push_back(str + rstring);
-        LiveOutMap[Result] = rstring;
-      } else {
-        // try another fallback method
+    }
+
+    // END PHASE 1
+
+    for (Depth = 1; Depth <= LN.getNestDepth(); ++Depth) { // next pass goes outer -> inner to handle addrecs
+      Loop *L = LN.getLoopsAtDepth(Depth)[0];
+      Optional<Loop::LoopBounds> Bounds = L->getBounds(SE);
+      for (auto &I : *L->getLoopLatch()) {
+        auto *P = dyn_cast<PHINode>(&I);
+        if (P == nullptr)
+          break;
+
+        if (L->getInductionVariable(SE) == P) {
+          // For the 2nd pass induction, try to figure out the invariant form
+
+        }
+
+        RecurrenceDescriptor Rec;
+        if (RecurrenceDescriptor::isReductionPHI(P, L, Rec, &DB, &AC, &DT, &SE)) {
+          // then describe in terms of the indvar and operation
+          auto *Result = Rec.getLoopExitInstr();
+          SmallVector<Instruction *> OpChain = Rec.getReductionOpChain(P, L);
+          // constraint: P == Result
+          //        expr Ps = c.real_const(P->getName().data());
+          //        expr Res = c.real_const(Result->getName().data());
+          std::string str;
+          std::string rstring;
+          raw_string_ostream resos(rstring);
+          raw_string_ostream os(str);
+          auto Constraint = Conv.to_Z3(Rec.getLoopExitInstr()) == Conv.ReductionPHI(&SE, L, P, &Rec, &Bounds->getInitialIVValue(), L->getInductionVariable(SE));
+          P->printAsOperand(os);
+          os << " == ";
+          resos << "Sum(";
+          Bounds->getInitialIVValue().printAsOperand(resos);
+          resos << ", " << L->getInductionVariable(SE)->getName() << " - 1, ";
+          OpChain[0]->print(resos);
+          resos << ")";
+          Annotate.Loop2Inv[L].push_back(str + rstring);
+          LiveOutMap[Result] = rstring;
+        } else {
+          // try another fallback method
+        }
       }
     }
+
     LLVM_DEBUG(dbgs() << "Loop Invariants for " << L->getHeader()->getName()
                       << "\n");
     for (auto I : Annotate.Loop2Inv[L]) {
