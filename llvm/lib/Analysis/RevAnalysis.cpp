@@ -298,6 +298,13 @@ public:
           assert(0 && "unsupported binop type.");
           break;
       }
+    } else if (auto *Arg = dyn_cast<Argument>(V)) {
+      for (auto &pair : Allocated)
+        if (pair.first == Arg)
+          return pair.second;
+      auto Tmp = c->constant(Arg->getName().data(), type_to_sort(Arg->getType()));
+      Allocated.push_back({Arg, Tmp});
+      return Tmp;
     }
 
     return c->bool_val(true);
@@ -348,16 +355,13 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         break;
       if (L->getInductionVariable(SE) == P) {
         // Handle induction specially
-        std::string str;
-        raw_string_ostream os(str);
 //        Bounds->getInitialIVValue().printAsOperand(os);
         auto lb = Conv.to_Z3(&Bounds->getInitialIVValue());
-        auto lbstr = lb.to_string();
         auto ub = Conv.to_Z3(&Bounds->getFinalIVValue());
-        auto ubstr = ub.to_string();
-        os << lbstr << " <= " << P->getName() << " <= " << ubstr;
+        auto indvar = Conv.to_Z3(P);
+        auto inv = (lb <= indvar) && (indvar <= ub);
 //        Bounds->getFinalIVValue().printAsOperand(os);
-        Annotate.Loop2Inv[L].push_back(str);
+        Annotate.Loop2Inv[L].push_back(inv.to_string());
         continue;
       }
       // otherwise, try to detect a recurrence
