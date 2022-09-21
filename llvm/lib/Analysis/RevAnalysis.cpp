@@ -462,9 +462,6 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         //        Bounds->getInitialIVValue().printAsOperand(os);
         auto lb = Conv.to_Z3(&Bounds->getInitialIVValue());
         auto ub = Conv.to_Z3(&Bounds->getFinalIVValue());
-        LLVM_DEBUG(dbgs() << "lb= " << lb.to_string() << "\n");
-        LLVM_DEBUG(dbgs() << "ub= " << ub.to_string() << "\n");
-
         auto indvar = Conv.to_Z3(P);
         auto inv = (lb <= indvar) && (indvar <= ub);
         //        Bounds->getFinalIVValue().printAsOperand(os);
