@@ -254,7 +254,7 @@ public:
 class Z3Converter {
 public:
   DenseMap<Value *, expr> Value2Z3;
-  std::vector<std::pair<Value*, expr>> Allocated;
+  std::vector<std::pair<Value *, expr>> Allocated;
   context *c;
   Z3Converter(context *c) : c(c){};
 
@@ -279,30 +279,34 @@ public:
       return to_Z3(getLoadStorePointerOperand(V));
     } else if (auto *GEP = dyn_cast<GEPOperator>(V)) {
       assert(GEP->getNumIndices() == 1);
-      z3::sort asort = c->array_sort(type_to_sort(GEP->getSourceElementType()), type_to_sort(GEP->getResultElementType()));
-      return c->constant(GEP->getPointerOperand()->getName().data(), asort)[to_Z3(GEP->getOperand(1))];
+      z3::sort asort = c->array_sort(type_to_sort(GEP->getSourceElementType()),
+                                     type_to_sort(GEP->getResultElementType()));
+      return c->constant(GEP->getPointerOperand()->getName().data(),
+                         asort)[to_Z3(GEP->getOperand(1))];
     } else if (auto *Cast = dyn_cast<CastInst>(V)) {
       return to_Z3(Cast->getOperand(0));
     } else if (auto *Phi = dyn_cast<PHINode>(V)) {
       for (auto &pair : Allocated)
         if (pair.first == Phi)
           return pair.second;
-      auto Tmp = c->constant(Phi->getName().data(), type_to_sort(Phi->getType()));
+      auto Tmp =
+          c->constant(Phi->getName().data(), type_to_sort(Phi->getType()));
       Allocated.push_back({Phi, Tmp});
       return Tmp;
     } else if (auto *BinOp = dyn_cast<BinaryOperator>(V)) {
       switch (BinOp->getOpcode()) {
-        case BinaryOperator::BinaryOps::Add:
-          return to_Z3(BinOp->getOperand(0)) + to_Z3(BinOp->getOperand(1));
-        default:
-          assert(0 && "unsupported binop type.");
-          break;
+      case BinaryOperator::BinaryOps::Add:
+        return to_Z3(BinOp->getOperand(0)) + to_Z3(BinOp->getOperand(1));
+      default:
+        assert(0 && "unsupported binop type.");
+        break;
       }
     } else if (auto *Arg = dyn_cast<Argument>(V)) {
       for (auto &pair : Allocated)
         if (pair.first == Arg)
           return pair.second;
-      auto Tmp = c->constant(Arg->getName().data(), type_to_sort(Arg->getType()));
+      auto Tmp =
+          c->constant(Arg->getName().data(), type_to_sort(Arg->getType()));
       Allocated.push_back({Arg, Tmp});
       return Tmp;
     }
@@ -310,6 +314,65 @@ public:
     return c->bool_val(true);
   }
 };
+
+static expr GetPostCondition() {}
+
+static void GetLiveIns(Loop *L, SmallPtrSet<Value *, 4> &LiveIns) {
+  for (auto *BB : L->getBlocks()) {
+    for (auto &I : *BB) {
+      for (auto &O : I.operands()) {
+        if (auto *Inst = dyn_cast<Instruction>(&O))
+          if (!L->contains(Inst))
+            LiveIns.insert(Inst);
+        if (auto *Arg = dyn_cast<Argument>(&O))
+          LiveIns.insert(Arg);
+      }
+    }
+  }
+
+  LLVM_DEBUG(dbgs() << "Found " << LiveIns.size() << " live ins:\n");
+  for (auto *V : LiveIns) {
+    LLVM_DEBUG(dbgs() << *V << "\n");
+  }
+}
+
+static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
+  SmallVector<BasicBlock *> ExitBlocks;
+  L->getExitBlocks(ExitBlocks);
+  for (auto *BB : ExitBlocks)
+    for (auto &I : *BB)
+      if (auto *PN = dyn_cast<PHINode>(&I))
+        LiveOuts.insert(&I);
+}
+
+//class Grammar {
+//public:
+//  class Choice {
+//  public:
+//    SmallVector<Value *> Terminals;
+//    Choice() {};
+//    Choice(SmallVector<Value *> Terminals) : Terminals(Terminals) {};
+//  };
+//  class IndVar : Choice {};
+//  class BinOp : Choice {
+//  public:
+//    Choice *Left;
+//    Choice *Right;
+//    BinOp(Choice *Left, Choice *Right) : Left(Left), Right(Right){};
+//  };
+//  class And : BinOp {
+//    using BinOp::BinOp;
+//  };
+//  class Eq : BinOp {
+//    using BinOp::BinOp;
+//  };
+//
+//  struct Category {
+//    SmallVector<Choice *> Choices;
+//  };
+//
+//  DenseSet<Category *> Categories;
+//};
 
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
@@ -341,9 +404,49 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   LoopAnnotations Annotate;
   context c;
   Z3Converter Conv(&c);
-
   LoopNest LN(*LI.getTopLevelLoops()[0], SE);
   DenseMap<Value *, std::string> LiveOutMap;
+
+  // for each loop in the nest, inner to outer:
+  //    1. find all liveins and liveouts
+  //    2. create postcondition template: PC(liveins) = indvar = ub && liveout =
+  //    <phi exit value or op_hole>
+  //    3. create invariant template:     INV(liveins) = lb <= indvar <= ub &&
+  //    liveout.store_target_or_phi = liveout.store_val_or_phi_exit
+  //    4. are the templates complete?
+  //        4.1 yes: map liveout to PC and go to next loop
+  //        4.2 no : synthesize PC then map liveout to PC and go to next loop
+
+  // PC grammar:
+  // pc       := <indvar> == <ub> && <liveout> == <phi exit or op_hole>
+  // indvar   := {any register in loop}
+  // ub       := {any register in loop or int constant}
+  // liveout  := {any register in exit blocks or store in loop}
+  // lb       := {any register in loop or int constant}
+  // op_hole  := sum(lb, ub, op_hole)
+  //           | add(<op_hole>, <op_hole>) | sub | ...
+  //           | cast(<op_hole>) | load(gep(<op_hole>, <op_hole>)) | ...
+  //           | any register in loop | int constant | fp constant
+
+  for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
+    Loop *L = LN.getLoopsAtDepth(Depth)[0];
+    // get live ins and live outs
+    SmallPtrSet<Value *, 4> LiveIns;
+    SmallPtrSet<Value *, 4> LiveOuts;
+    GetLiveIns(L, LiveIns);
+    GetLiveOuts(L, LiveOuts);
+    assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
+
+    // first create the pc template
+//    Grammar PC;
+//    Grammar::Choice IndVar({L->getInductionVariable(SE)});
+//    auto Bounds = L->getBounds(SE);
+//    Grammar::Choice UpperBound({&Bounds->getFinalIVValue()});
+//    Grammar::Choice LiveOut({*LiveOuts.begin()});
+//    Grammar::Choice ExitVal({})
+//    Grammar::And(&Example, &Example);
+  }
+
   auto Depth = LN.getNestDepth();
   for (; Depth > 0; --Depth) {
     // first make partial Inv by equating all Phis
@@ -355,12 +458,12 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         break;
       if (L->getInductionVariable(SE) == P) {
         // Handle induction specially
-//        Bounds->getInitialIVValue().printAsOperand(os);
+        //        Bounds->getInitialIVValue().printAsOperand(os);
         auto lb = Conv.to_Z3(&Bounds->getInitialIVValue());
         auto ub = Conv.to_Z3(&Bounds->getFinalIVValue());
         auto indvar = Conv.to_Z3(P);
         auto inv = (lb <= indvar) && (indvar <= ub);
-//        Bounds->getFinalIVValue().printAsOperand(os);
+        //        Bounds->getFinalIVValue().printAsOperand(os);
         Annotate.Loop2Inv[L].push_back(inv.to_string());
         continue;
       }
