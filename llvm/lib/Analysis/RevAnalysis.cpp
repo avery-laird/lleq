@@ -193,6 +193,7 @@ bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI,
   if (WorkList.size() > 2)
     return false;
 
+  // todo: check phi instructions and exclude the loops which we don't support
   return true;
 }
 
@@ -358,6 +359,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 //        Bounds->getInitialIVValue().printAsOperand(os);
         auto lb = Conv.to_Z3(&Bounds->getInitialIVValue());
         auto ub = Conv.to_Z3(&Bounds->getFinalIVValue());
+        LLVM_DEBUG(dbgs() << "lb= " << lb.to_string() << "\n");
+        LLVM_DEBUG(dbgs() << "ub= " << ub.to_string() << "\n");
+
         auto indvar = Conv.to_Z3(P);
         auto inv = (lb <= indvar) && (indvar <= ub);
 //        Bounds->getFinalIVValue().printAsOperand(os);
@@ -437,7 +441,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     auto *Ptr = dyn_cast<GEPOperator>(getLoadStorePointerOperand(Store));
     auto *ToStore = Store->getValueOperand();
     // go up def-use chain until a single instruction is found from a lower loop
-    int Depth = 2;
+    //    int Depth = 2;
     for (PHINode *TS; (TS = dyn_cast<PHINode>(ToStore));) {
       if (TS->getNumIncomingValues() == 1)
         ToStore = TS->getIncomingValue(0);
