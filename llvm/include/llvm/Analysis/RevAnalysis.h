@@ -5,6 +5,7 @@
 #ifndef LLVM_REVANALYSIS_H
 #define LLVM_REVANALYSIS_H
 
+#include "DemandedBits.h"
 #include "LoopNestAnalysis.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/PassManager.h"
@@ -29,6 +30,10 @@ class RevAnalysisPass : public PassInfoMixin<RevAnalysisPass> {
   bool LegalityAnalysis(Loop *TheLoop, LoopInfo *LI, ScalarEvolution *SE);
   void AnalyzeLoopBounds(Loop *L, Value *LowerBound, Value *UpperBound,
                          ScalarEvolution *SE);
+
+  bool canSupportPhiInstrs(Loop *TheLoop, LoopInfo *LI,
+                           DemandedBits *DB, AssumptionCache *AC,
+                           DominatorTree *DT, ScalarEvolution *SE);
 
   void AnalyzeLoopStatements(LoopNest *LN, ScalarEvolution *SE);
 
