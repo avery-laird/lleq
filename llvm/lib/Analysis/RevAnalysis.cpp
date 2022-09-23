@@ -410,6 +410,7 @@ class CVCConv {
 public:
   Solver &slv;
   DenseMap<int, Sort> SpecialSorts;
+  SmallPtrSet<Term*, 16> Leaves;
   CVCConv(Solver &slv) : slv(slv) {
     SpecialSorts[Type::TypeID::DoubleTyID] = slv.mkFloatingPointSort(11, 53);
   };
@@ -427,7 +428,7 @@ public:
     if (auto *Const = dyn_cast<Constant>(V)) {
       switch (Const->getType()->getTypeID()) {
       case Type::TypeID::IntegerTyID:
-        return slv.mkInteger(dyn_cast<ConstantInt>(V)->getSExtValue());
+        return Env[V] = slv.mkInteger(dyn_cast<ConstantInt>(V)->getSExtValue());
         break;
       default:
         assert(0 && "unsupported constant type");
@@ -445,21 +446,34 @@ public:
         // TODO assume 1d memory accesses
         Sort asort = slv.mkArraySort(ToSort(GEP->getOperand(1)->getType()),
                                      ToSort(GEP->getResultElementType()));
-        Array = slv.mkVar(asort, GEP->getPointerOperand()->getNameOrAsOperand());
-        Env[V] = Array;
+        Array =
+            slv.mkVar(asort, GEP->getPointerOperand()->getNameOrAsOperand());
+        Env[GEP->getPointerOperand()] = Array;
+        Leaves.insert(&(Env[GEP->getPointerOperand()]));
       }
-      return slv.mkTerm(SELECT, {Array, MakeTerm(GEP->getOperand(1), Env)});
+      return Env[V] = slv.mkTerm(SELECT, {Array, MakeTerm(GEP->getOperand(1), Env)});
     } else if (auto *Cast = dyn_cast<CastInst>(V)) {
       return MakeTerm(Cast->getOperand(0), Env);
     } else if (isa<PHINode>(V) || isa<Argument>(V)) {
-      return slv.mkVar(ToSort(V->getType()), V->getNameOrAsOperand());
+      Env[V] = slv.mkVar(ToSort(V->getType()), V->getNameOrAsOperand());
+      Leaves.insert(&Env[V]);
+      return Env[V];
     } else if (auto *BinOp = dyn_cast<BinaryOperator>(V)) {
       switch (BinOp->getOpcode()) {
       case BinaryOperator::BinaryOps::Add:
-        return slv.mkTerm(ADD, {MakeTerm(BinOp->getOperand(0), Env),
-                                MakeTerm(BinOp->getOperand(1), Env)});
+        return Env[V] = slv.mkTerm(ADD, {MakeTerm(BinOp->getOperand(0), Env),
+                                         MakeTerm(BinOp->getOperand(1), Env)});
       default:
         assert(0 && "unsupported binop type.");
+        break;
+      }
+    } else if (auto *Cmp = dyn_cast<CmpInst>(V)) {
+      switch (Cmp->getPredicate()) {
+      case CmpInst::ICMP_SLT:
+        return Env[V] = slv.mkTerm(LT, {MakeTerm(Cmp->getOperand(0), Env),
+                                        MakeTerm(Cmp->getOperand(1), Env)});
+      default:
+        assert(0 && "unsupported predicate type.");
         break;
       }
     }
@@ -534,7 +548,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   //           | cast(<op_hole>) | load(gep(<op_hole>, <op_hole>)) | ...
   //           | any register in loop | int constant | fp constant
 
-  // TODO loop works for inner loop only right now, need to filter out the inner loop BBs
+  // TODO loop works for inner loop only right now, need to filter out the inner
+  // loop BBs
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
     // get live ins and live outs
@@ -560,8 +575,12 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     InvariantInputs.insert(LiveIns.begin(), LiveIns.end());
     DenseMap<Value *, Term> Ins2Terms;
     for (auto *V : InvariantInputs) {
-      Ins2Terms[V] = CConv.MakeTerm(V, Ins2Terms);
+      CConv.MakeTerm(V, Ins2Terms);
       LLVM_DEBUG(dbgs() << Ins2Terms[V].toString() << "\n");
+    }
+    LLVM_DEBUG(dbgs() << "LEAVES:\n");
+    for (auto *Leaf : CConv.Leaves) {
+      LLVM_DEBUG(dbgs() << Leaf->toString() << "\n");
     }
 
     // Next step is to look at the phis
