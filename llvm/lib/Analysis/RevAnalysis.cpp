@@ -168,6 +168,7 @@ bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI,
     }
   }
 
+  // The code below guarantees the loop nest only has one live-out.
   unsigned LoopIdx = 1;
   for (; LoopIdx < LD; LoopIdx++) {
     LoopVectorTy LoopsAtDepth = LN.getLoopsAtDepth(LoopIdx);
@@ -364,6 +365,11 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
       if (auto *PN = dyn_cast<PHINode>(&I))
         LiveOuts.insert(&I);
   // TODO: considering the StoreInst
+  for (auto *BB : L->getBlocks())
+    for (auto &I : *BB) {
+      if (isa<StoreInst>(&I))
+        LiveOuts.insert(&I);
+    }
 }
 
 //class Grammar {
