@@ -14,6 +14,7 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
 #include <chrono>
+#include <cvc5/cvc5.h>
 
 #define DEBUG_TYPE "rev-analysis"
 
@@ -21,6 +22,7 @@ using namespace std::chrono;
 
 using namespace llvm;
 using namespace z3;
+using namespace cvc5;
 
 void RevAnalysisPass::AnalyzeLoopBounds(Loop *L, Value *LowerBound,
                                         Value *UpperBound,
@@ -322,11 +324,14 @@ static void GetLiveIns(Loop *L, SmallPtrSet<Value *, 4> &LiveIns) {
   for (auto *BB : L->getBlocks()) {
     for (auto &I : *BB) {
       for (auto &O : I.operands()) {
+        // store the whole instruction and not just the operand so
+        // that the type information is known (for example loads
+        // and GEP on opaque pointers) https://llvm.org/docs/OpaquePointers.html
         if (auto *Inst = dyn_cast<Instruction>(&O))
           if (!L->contains(Inst))
-            LiveIns.insert(Inst);
+            LiveIns.insert(&I);
         if (auto *Arg = dyn_cast<Argument>(&O))
-          LiveIns.insert(Arg);
+          LiveIns.insert(&I);
       }
     }
   }
@@ -346,34 +351,97 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
         LiveOuts.insert(&I);
 }
 
-//class Grammar {
-//public:
-//  class Choice {
-//  public:
-//    SmallVector<Value *> Terminals;
-//    Choice() {};
-//    Choice(SmallVector<Value *> Terminals) : Terminals(Terminals) {};
-//  };
-//  class IndVar : Choice {};
-//  class BinOp : Choice {
-//  public:
-//    Choice *Left;
-//    Choice *Right;
-//    BinOp(Choice *Left, Choice *Right) : Left(Left), Right(Right){};
-//  };
-//  class And : BinOp {
-//    using BinOp::BinOp;
-//  };
-//  class Eq : BinOp {
-//    using BinOp::BinOp;
-//  };
+// class Grammar {
+// public:
+//   class Choice {
+//   public:
+//     SmallVector<Value *> Terminals;
+//     Choice() {};
+//     Choice(SmallVector<Value *> Terminals) : Terminals(Terminals) {};
+//   };
+//   class IndVar : Choice {};
+//   class BinOp : Choice {
+//   public:
+//     Choice *Left;
+//     Choice *Right;
+//     BinOp(Choice *Left, Choice *Right) : Left(Left), Right(Right){};
+//   };
+//   class And : BinOp {
+//     using BinOp::BinOp;
+//   };
+//   class Eq : BinOp {
+//     using BinOp::BinOp;
+//   };
 //
-//  struct Category {
-//    SmallVector<Choice *> Choices;
-//  };
+//   struct Category {
+//     SmallVector<Choice *> Choices;
+//   };
 //
-//  DenseSet<Category *> Categories;
-//};
+//   DenseSet<Category *> Categories;
+// };
+
+class CVCConv {
+public:
+  Solver &slv;
+  DenseMap<int, Sort> SpecialSorts;
+  CVCConv(Solver &slv) : slv(slv) {
+    SpecialSorts[Type::TypeID::DoubleTyID] = slv.mkFloatingPointSort(11, 53);
+  };
+
+  Sort ToSort(Type *T) {
+    if (T->getTypeID() == Type::TypeID::IntegerTyID)
+      return slv.getIntegerSort();
+    if (T->getTypeID() == Type::TypeID::DoubleTyID)
+      return SpecialSorts[T->getTypeID()];
+  }
+
+  Term MakeTerm(Value *V, DenseMap<Value *, Term> &Env) {
+    if (Env.count(V))
+      return Env[V];
+    if (auto *Const = dyn_cast<Constant>(V)) {
+      switch (Const->getType()->getTypeID()) {
+      case Type::TypeID::IntegerTyID:
+        return slv.mkInteger(dyn_cast<ConstantInt>(V)->getSExtValue());
+        break;
+      default:
+        assert(0 && "unsupported constant type");
+        break;
+      }
+    } else if (auto *Load = dyn_cast<LoadInst>(V)) {
+      return MakeTerm(getLoadStorePointerOperand(V), Env);
+    } else if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+      assert(GEP->getNumIndices() == 1);
+      // make the array if it doesn't exist
+      Term Array;
+      if (Env.count(V)) {
+        Array = Env[V];
+      } else {
+        // TODO assume 1d memory accesses
+        Sort asort = slv.mkArraySort(ToSort(GEP->getOperand(1)->getType()),
+                                     ToSort(GEP->getResultElementType()));
+        Array = slv.mkVar(asort, GEP->getPointerOperand()->getNameOrAsOperand());
+        Env[V] = Array;
+      }
+      return slv.mkTerm(SELECT, {Array, MakeTerm(GEP->getOperand(1), Env)});
+    } else if (auto *Cast = dyn_cast<CastInst>(V)) {
+      return MakeTerm(Cast->getOperand(0), Env);
+    } else if (isa<PHINode>(V) || isa<Argument>(V)) {
+      return slv.mkVar(ToSort(V->getType()), V->getNameOrAsOperand());
+    } else if (auto *BinOp = dyn_cast<BinaryOperator>(V)) {
+      switch (BinOp->getOpcode()) {
+      case BinaryOperator::BinaryOps::Add:
+        return slv.mkTerm(ADD, {MakeTerm(BinOp->getOperand(0), Env),
+                                MakeTerm(BinOp->getOperand(1), Env)});
+      default:
+        assert(0 && "unsupported binop type.");
+        break;
+      }
+    }
+
+    assert(0 && ("unsupported value " + V->getNameOrAsOperand()).data());
+    return slv.mkBoolean(false);
+  }
+};
 
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
@@ -429,6 +497,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   //           | cast(<op_hole>) | load(gep(<op_hole>, <op_hole>)) | ...
   //           | any register in loop | int constant | fp constant
 
+  // TODO loop works for inner loop only right now, need to filter out the inner loop BBs
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
     // get live ins and live outs
@@ -438,15 +507,39 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     GetLiveOuts(L, LiveOuts);
     assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
 
+    PHINode *IndVar = L->getInductionVariable(SE);
+
+    Solver slv;
+    CVCConv CConv(slv);
+
+    slv.setOption("sygus", "true");
+    slv.setOption("incremental", "false");
+    slv.setOption("sygus-rec-fun", "true");
+    slv.setOption("fmf-fun", "true");
+
+    // Invariant inputs are just the induction var, lb, ub, + live ins
+    SmallPtrSet<Value *, 6> InvariantInputs;
+    InvariantInputs.insert(IndVar);
+    InvariantInputs.insert(LiveIns.begin(), LiveIns.end());
+    DenseMap<Value *, Term> Ins2Terms;
+    for (auto *V : InvariantInputs) {
+      Ins2Terms[V] = CConv.MakeTerm(V, Ins2Terms);
+      LLVM_DEBUG(dbgs() << Ins2Terms[V].toString() << "\n");
+    }
+
+    // Next step is to look at the phis
+
     // first create the pc template
-//    Grammar PC;
-//    Grammar::Choice IndVar({L->getInductionVariable(SE)});
-//    auto Bounds = L->getBounds(SE);
-//    Grammar::Choice UpperBound({&Bounds->getFinalIVValue()});
-//    Grammar::Choice LiveOut({*LiveOuts.begin()});
-//    Grammar::Choice ExitVal({})
-//    Grammar::And(&Example, &Example);
+    //    Grammar PC;
+    //    Grammar::Choice IndVar({L->getInductionVariable(SE)});
+    //    auto Bounds = L->getBounds(SE);
+    //    Grammar::Choice UpperBound({&Bounds->getFinalIVValue()});
+    //    Grammar::Choice LiveOut({*LiveOuts.begin()});
+    //    Grammar::Choice ExitVal({})
+    //    Grammar::And(&Example, &Example);
   }
+
+  return PreservedAnalyses::all();
 
   auto Depth = LN.getNestDepth();
   for (; Depth > 0; --Depth) {

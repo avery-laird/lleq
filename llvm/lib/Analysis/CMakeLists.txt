@@ -32,6 +32,8 @@ if (DEFINED LLVM_HAVE_TF_AOT OR DEFINED LLVM_HAVE_TF_API)
   endif()
 endif()
 
+find_package(cvc5 REQUIRED)
+
 add_llvm_component_library(LLVMAnalysis
   AliasAnalysis.cpp
   AliasAnalysisEvaluator.cpp
@@ -166,6 +168,8 @@ add_llvm_component_library(LLVMAnalysis
 
   LINK_LIBS
   ${MLLinkDeps}
+  cvc5::cvc5
+  cvc5::cvc5parser
 
   LINK_COMPONENTS
   BinaryFormat
