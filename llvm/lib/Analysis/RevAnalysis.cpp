@@ -24,6 +24,24 @@ using namespace llvm;
 using namespace z3;
 using namespace cvc5;
 
+bool RevAnalysisPass::canSupportPhiInstrs(Loop *TheLoop, LoopInfo *LI,
+                                          DemandedBits *DB, AssumptionCache *AC,
+                                          DominatorTree *DT,
+                                          ScalarEvolution *SE) {
+
+  BasicBlock *Header = TheLoop->getHeader();
+  for (PHINode &Phi : Header->phis()) {
+    RecurrenceDescriptor RedDes;
+    if (RecurrenceDescriptor::isReductionPHI(&Phi, TheLoop, RedDes, DB, AC, DT))
+      continue;
+    if (TheLoop->getInductionVariable(*SE) == (&Phi))
+      continue;
+    LLVM_DEBUG(dbgs() << "Found Unsupported Phi Instruction: " << Phi << "\n");
+    return false;
+  }
+  return true;
+}
+
 void RevAnalysisPass::AnalyzeLoopBounds(Loop *L, Value *LowerBound,
                                         Value *UpperBound,
                                         ScalarEvolution *SE) {
@@ -152,6 +170,7 @@ bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI,
     }
   }
 
+  // The code below guarantees the loop nest only has one live-out.
   unsigned LoopIdx = 1;
   for (; LoopIdx < LD; LoopIdx++) {
     LoopVectorTy LoopsAtDepth = LN.getLoopsAtDepth(LoopIdx);
@@ -196,6 +215,7 @@ bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI,
     return false;
 
   // todo: check phi instructions and exclude the loops which we don't support
+
   return true;
 }
 
@@ -349,6 +369,12 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
     for (auto &I : *BB)
       if (auto *PN = dyn_cast<PHINode>(&I))
         LiveOuts.insert(&I);
+  // TODO: considering the StoreInst
+  for (auto *BB : L->getBlocks())
+    for (auto &I : *BB) {
+      if (isa<StoreInst>(&I))
+        LiveOuts.insert(&I);
+    }
 }
 
 // class Grammar {
@@ -458,12 +484,23 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
-  for (auto *LoopNest : LI.getTopLevelLoops()) {
-    LLVM_DEBUG(dbgs() << " " << *LoopNest << "\n");
-    if (!LegalityAnalysis(LoopNest, &LI, &SE)) {
+  for (auto *LP : LI.getTopLevelLoops()) {
+    LLVM_DEBUG(dbgs() << " " << *LP << "\n");
+
+    if (!LegalityAnalysis(LP, &LI, &SE)) {
       LLVM_DEBUG(dbgs() << "LLNA: "
                         << "fail to pass legality check \n");
       return PreservedAnalyses::all();
+    }
+
+    LoopNest LN(*LP, SE);
+    for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
+      Loop *SubLoop = LN.getLoopsAtDepth(Depth)[0];
+      if (!canSupportPhiInstrs(SubLoop, &LI, &DB, &AC, &DT, &SE)) {
+        LLVM_DEBUG(dbgs() << "LLNA: "
+                          << "fail to pass legality check \n");
+        return PreservedAnalyses::all();
+      }
     }
   }
 
