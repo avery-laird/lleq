@@ -425,6 +425,7 @@ public:
   DenseMap<StringRef, Term> SynthFuns;
   DenseMap<Term*, Term> UniversalVars;
   DenseMap<StringRef, Term> SynthFunCalls;
+  DenseMap<Loop*, Term> Loop2PC;
 
   struct UFInfo {
     std::vector<Term> BoundTerms;
@@ -662,6 +663,11 @@ public:
       } else {
 
       }
+    } else if (auto *Store = dyn_cast<StoreInst>(V)) {
+      // calculate compute chain for a store.
+      // the value might depend on inner loops.
+      // if so, it is the PC for that loop.
+
     } else {
       assert(0 && "liveout must be described as a phi right now.");
     }
@@ -725,9 +731,8 @@ public:
     slv.addSygusConstraint(slv.mkTerm(IMPLIES, {slv.mkTerm(AND, {Invariant, Exit}), Postcondition}));
     SynthResult res = slv.checkSynth();
     if (res.hasSolution()) {
-      auto test = slv.getSynthSolutions({SynthFuns["inv"], SynthFuns["pc"]});
-      for (auto term : test)
-        LLVM_DEBUG(dbgs() << term.toString() << "\n");
+      Loop2PC[L] = slv.getSynthSolution(SynthFuns["pc"]);
+      LLVM_DEBUG(dbgs() << "FOUND Postcondition:\n" << Loop2PC[L].toString() << "\n");
     } else {
       LLVM_DEBUG(dbgs() << "no solution.\n");
     }
