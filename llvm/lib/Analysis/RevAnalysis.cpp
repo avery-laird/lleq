@@ -423,7 +423,7 @@ public:
   Term *indvar;
   Term *liveout;
   DenseMap<StringRef, Term> SynthFuns;
-  std::vector<Term> UniversalVars;
+  DenseMap<Term*, Term> UniversalVars;
   DenseMap<StringRef, Term> SynthFunCalls;
 
   struct UFInfo {
@@ -682,22 +682,23 @@ public:
 
   void MakeUniversalVars(std::vector<GrammarRecord> &Grammars) {
     for (auto *T : NonTerminals)
-      UniversalVars.push_back(slv.declareSygusVar(T->getSymbol(), T->getSort()));
+      UniversalVars[T] = slv.declareSygusVar("sys_" + T->getSymbol(), T->getSort());
   }
 
   void MakeSynthFunCalls() {
     for (auto Elem : SynthFuns) {
       std::vector<Term> Args = {Elem.second};
-      Args.insert(Args.end(), UniversalVars.begin(), UniversalVars.end());
+      for (auto *T : NonTerminals)
+        Args.push_back(UniversalVars[T]);
       SynthFunCalls[Elem.first] = slv.mkTerm(APPLY_UF, Args);
     }
   }
 
-  void MakeVerificationConditions(Loop *L, DenseMap<Value *, Term> Env) {
-    // make a COPY of env
-    // inject the universalvars where the previous values where
-//    for (auto &Elem : Env) {
-//      if (Elem.second.getSymbol() == Uni)
+  void MakeVerificationConditions(Loop *L, DenseMap<Value *, Term> &Env) {
+    // modify env to inject the universalvars where the previous values were
+    // TODO clean up this whole pointers mess, we need a better way to test equality
+//    for (auto &Elem : UniversalVars) {
+//      Env[Terms2Vals[Elem.first]] = Elem.second;
 //    }
     Term Precondition = slv.mkBoolean(false); // TODO fix this hack later
     Term &Postcondition = SynthFunCalls["pc"];
@@ -706,16 +707,36 @@ public:
     Term Exit = LoopCond->notTerm();
     // then make the updated arg vals for invariant
     std::vector<Term> NewArgs;
-    ExecuteOneIteration(L, NewArgs, Env);
-    NewArgs.insert(NewArgs.begin(), Invariant);
+    DenseMap<Value *, Term> SysEnv;
+    // sandbox everything in a totally new env
+    for (auto *T : NonTerminals)
+      SysEnv[Terms2Vals[T]] = UniversalVars[T];
+    ExecuteOneIteration(L, NewArgs, SysEnv);
+    NewArgs.insert(NewArgs.begin(), SynthFuns["inv"]);
     LLVM_DEBUG(dbgs() << "NEW ARGS:\n");
     for (auto &A : NewArgs)
       LLVM_DEBUG(dbgs() << A.toString() << "\n");
     Term NewInv = slv.mkTerm(APPLY_UF, NewArgs);
+
+    // then add constraints
+    slv.addSygusAssume(slv.mkTerm(LT, {*MakeTerm(Terms2Vals[lb], SysEnv), *MakeTerm(Terms2Vals[ub], SysEnv)}));
+//    slv.addSygusConstraint(slv.mkTerm(IMPLIES, {Precondition, Invariant}));
+    slv.addSygusConstraint(slv.mkTerm(IMPLIES, {slv.mkTerm(AND, {Invariant, *LoopCond}), NewInv}));
+    slv.addSygusConstraint(slv.mkTerm(IMPLIES, {slv.mkTerm(AND, {Invariant, Exit}), Postcondition}));
+    SynthResult res = slv.checkSynth();
+    if (res.hasSolution()) {
+      auto test = slv.getSynthSolutions({SynthFuns["inv"], SynthFuns["pc"]});
+      for (auto term : test)
+        LLVM_DEBUG(dbgs() << term.toString() << "\n");
+    } else {
+      LLVM_DEBUG(dbgs() << "no solution.\n");
+    }
+    slv.printStatisticsSafe( fileno(stdout));
   }
 
   void ExecuteOneIteration(Loop *L, std::vector<Term> &InvArgs, DenseMap<Value *, Term> &Env) {
     for (auto *NT : NonTerminals) {
+      Term &UniVal = UniversalVars[NT];
       Value *V = Terms2Vals[NT];
 //      if (V == nullptr) {
 //        LLVM_DEBUG(dbgs() << "WARNING: creating new term for " << NT->toString() << "\n");
@@ -723,7 +744,7 @@ public:
 //        Terms2Vals[NT] = V;
 //      }
       if (L->isLoopInvariant(V)) {
-        InvArgs.push_back(*NT);
+        InvArgs.push_back(UniVal);
         continue ;
       }
       // otherwise, either Phi or load
@@ -976,6 +997,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     slv.setOption("incremental", "false");
     slv.setOption("sygus-rec-fun", "true");
     slv.setOption("fmf-fun", "true");
+    slv.setOption("output", "sygus");
 
     // Invariant inputs are just the induction var, lb, ub, + live ins
 //    SmallPtrSet<Value *, 6> InvariantInputs;
