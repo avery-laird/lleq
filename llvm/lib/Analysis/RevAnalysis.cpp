@@ -720,7 +720,7 @@ public:
 
     // then add constraints
     slv.addSygusAssume(slv.mkTerm(LT, {*MakeTerm(Terms2Vals[lb], SysEnv), *MakeTerm(Terms2Vals[ub], SysEnv)}));
-//    slv.addSygusConstraint(slv.mkTerm(IMPLIES, {Precondition, Invariant}));
+    slv.addSygusConstraint(slv.mkTerm(IMPLIES, {Precondition, Invariant}));
     slv.addSygusConstraint(slv.mkTerm(IMPLIES, {slv.mkTerm(AND, {Invariant, *LoopCond}), NewInv}));
     slv.addSygusConstraint(slv.mkTerm(IMPLIES, {slv.mkTerm(AND, {Invariant, Exit}), Postcondition}));
     SynthResult res = slv.checkSynth();
