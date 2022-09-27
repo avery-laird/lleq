@@ -406,7 +406,8 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
 //
 //   DenseSet<Category *> Categories;
 // };
-
+// TODO all based on pointers, so dangerous if MakTerm is run
+// after the mapping
 class CVCConv {
 public:
   Solver &slv;
@@ -415,10 +416,15 @@ public:
   Term RoundingMode;
   std::vector<Term*> SumArgs;
   std::vector<Term*> NonTerminals;
+  DenseMap<Term*, Value*> Terms2Vals;
+  DenseMap<Term*, Value*> Uni2Vals;
   Term *lb;
   Term *ub;
   Term *indvar;
   Term *liveout;
+  DenseMap<StringRef, Term> SynthFuns;
+  std::vector<Term> UniversalVars;
+  DenseMap<StringRef, Term> SynthFunCalls;
 
   struct UFInfo {
     std::vector<Term> BoundTerms;
@@ -494,15 +500,28 @@ public:
         break;
       }
     } else if (auto *CI = dyn_cast<CallInst>(V)) {
-      assert(0 && "MakeTerm shouldn't be called on functions.");
-      std::vector<Sort> Sorts;
-      for (auto &Arg : CI->args())
-        Sorts.push_back(ToSort(Arg->getType()));
-      Sort FunSort = slv.mkFunctionSort(Sorts, ToSort(CI->getType()));
-      //      Term FunDec = slv.mkConst(FunSort, )
+      auto *F = CI->getCalledFunction();
+      if (F && F->getIntrinsicID() == Intrinsic::fmuladd) {
+        // a*b + c
+        Term *a = MakeTerm(CI->getOperand(0), Env);
+        Term *b = MakeTerm(CI->getOperand(1), Env);
+        Term *c = MakeTerm(CI->getOperand(2), Env);
+        Env[V] = slv.mkTerm(FLOATINGPOINT_ADD,
+                            {
+                                RoundingMode,
+                                slv.mkTerm(FLOATINGPOINT_MULT,
+                                           {
+                                               RoundingMode, *a, *b
+                                           }),
+                                *c
+                            });
+        return &Env[V];
+      } else {
+        assert(0 && "arbitrary functions aren't supported.");
+      }
     }
 
-    assert(0 && ("unsupported value " + V->getNameOrAsOperand()).data());
+    assert(0 && "unsupported value");
     return &(Env[V] = slv.mkBoolean(false));
   }
 
@@ -550,22 +569,8 @@ public:
   }
 
   UFInfo MakeComputeChain(Value *V, Loop *L, DenseMap<Value *, Term> &Env,
-                        DemandedBits *DB, AssumptionCache *AC,
-                        DominatorTree *DT, ScalarEvolution *SE) {
-    // first look over all the phis
-    DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>> RecDecs;
-    BasicBlock *Header = L->getHeader();
-    for (auto &I : *Header) {
-      if (auto *PN = dyn_cast<PHINode>(&I)) {
-        RecurrenceDescriptor RecDec;
-        if (RecurrenceDescriptor::isReductionPHI(PN, L, RecDec, DB, AC, DT,
-                                                 SE)) {
-          RecDecs[RecDec.getLoopExitInstr()] = {RecDec, PN};
-        }
-      } else {
-        break;
-      }
-    }
+                          DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>> &RecDecs) {
+
     if (RecDecs.count(V)) {
       // liveout is described by a phi!
       RecurrenceDescriptor RD = RecDecs[V].first;
@@ -662,13 +667,94 @@ public:
     }
   }
 
+  struct GrammarRecord {
+    Grammar &G;
+    StringRef Name;
+  };
+
+  void MakeSynthFuns(std::vector<GrammarRecord> &Grammars) {
+    std::vector<Term> BoundVars;
+    for (auto *T : NonTerminals) BoundVars.push_back(*T);
+
+    for (auto GR : Grammars)
+      SynthFuns[GR.Name] = slv.synthFun(GR.Name.str(), BoundVars, slv.getBooleanSort(), GR.G);
+  }
+
+  void MakeUniversalVars(std::vector<GrammarRecord> &Grammars) {
+    for (auto *T : NonTerminals)
+      UniversalVars.push_back(slv.declareSygusVar(T->getSymbol(), T->getSort()));
+  }
+
+  void MakeSynthFunCalls() {
+    for (auto Elem : SynthFuns) {
+      std::vector<Term> Args = {Elem.second};
+      Args.insert(Args.end(), UniversalVars.begin(), UniversalVars.end());
+      SynthFunCalls[Elem.first] = slv.mkTerm(APPLY_UF, Args);
+    }
+  }
+
+  void MakeVerificationConditions(Loop *L, DenseMap<Value *, Term> Env) {
+    // make a COPY of env
+    // inject the universalvars where the previous values where
+//    for (auto &Elem : Env) {
+//      if (Elem.second.getSymbol() == Uni)
+//    }
+    Term Precondition = slv.mkBoolean(false); // TODO fix this hack later
+    Term &Postcondition = SynthFunCalls["pc"];
+    Term &Invariant = SynthFunCalls["inv"];
+    Term *LoopCond = MakeTerm(L->getLatchCmpInst(), Env);
+    Term Exit = LoopCond->notTerm();
+    // then make the updated arg vals for invariant
+    std::vector<Term> NewArgs;
+    ExecuteOneIteration(L, NewArgs, Env);
+    NewArgs.insert(NewArgs.begin(), Invariant);
+    LLVM_DEBUG(dbgs() << "NEW ARGS:\n");
+    for (auto &A : NewArgs)
+      LLVM_DEBUG(dbgs() << A.toString() << "\n");
+    Term NewInv = slv.mkTerm(APPLY_UF, NewArgs);
+  }
+
+  void ExecuteOneIteration(Loop *L, std::vector<Term> &InvArgs, DenseMap<Value *, Term> &Env) {
+    for (auto *NT : NonTerminals) {
+      Value *V = Terms2Vals[NT];
+//      if (V == nullptr) {
+//        LLVM_DEBUG(dbgs() << "WARNING: creating new term for " << NT->toString() << "\n");
+//        Term *NV = MakeTerm(V, Env);
+//        Terms2Vals[NT] = V;
+//      }
+      if (L->isLoopInvariant(V)) {
+        InvArgs.push_back(*NT);
+        continue ;
+      }
+      // otherwise, either Phi or load
+      if (auto *PN = dyn_cast<PHINode>(V)) {
+        // for phi instructions, get the incoming (backedge) value
+        Value *NextIter = PN->getIncomingValueForBlock(L->getLoopLatch());
+        Term *NewVal = MakeTerm(NextIter, Env);
+        InvArgs.push_back(*NewVal);
+      } else if (auto *Load = dyn_cast<LoadInst>(V)) {
+        assert(0 && "loads not supported yet");
+      } else {
+        assert(0 && "unsupported instruction");
+      }
+    }
+  }
+
   void MakeNonTerminals(Loop *L, ScalarEvolution *SE, UFInfo &computechain, DenseMap<Value *, Term> &Env) {
+    SmallPtrSet<Term*, 8> NonTerms;
+
     auto Bounds = L->getBounds(*SE);
     auto *UB = &Bounds->getFinalIVValue();
     auto *LB = &Bounds->getInitialIVValue();
     auto *INDVAR = L->getInductionVariable(*SE);
+    // also visit all the phis
+//    for (auto &I : *L->getHeader()) {
+//      if (!isa<PHINode>(&I))
+//        break;
+//      MakeTerm(&I, Env);
+//      RetrieveLeaves(&I, Env, NonTerms);
+//    }
 
-    SmallPtrSet<Term*, 8> NonTerms;
     RetrieveLeaves(UB, Env, NonTerms);
     RetrieveLeaves(LB, Env, NonTerms);
     RetrieveLeaves(INDVAR, Env, NonTerms);
@@ -700,6 +786,10 @@ public:
     LLVM_DEBUG(dbgs() << "Created nonterminals:\n");
     for (auto &T : NonTerminals)
       LLVM_DEBUG(dbgs() << T->toString() << "\n");
+
+    // create the reverse mapping
+    for (auto &Elem : Env)
+      Terms2Vals[&Elem.second] = Elem.first;
 
 //    Leaves = LeavesBackup;
   }
@@ -744,7 +834,7 @@ public:
     return inv_gram;
   }
 
-  Grammar MakePCGrammar(Value *LB, Value *UB, Value *INDVAR, std::vector<Term> _Leaves2, SmallVector<PHINode*> PhiNodes, CVCConv::UFInfo compute_chain, Term liveout) {
+  Grammar MakePCGrammar(CVCConv::UFInfo compute_chain) {
 //    auto LeavesBackup = Leaves;
 //    Leaves.clear();
 //    DenseMap<Value*, Term> DummyEnv;
@@ -778,8 +868,8 @@ public:
       Args.push_back(*A);
 
     Term sumpc = slv.mkTerm(APPLY_UF, Args);
-    Term Eq1 = slv.mkTerm(EQUAL, {indvar, ub});
-    Term Eq2 = slv.mkTerm(FLOATINGPOINT_EQ, {liveout, sumpc});
+    Term Eq1 = slv.mkTerm(EQUAL, {*indvar, *ub});
+    Term Eq2 = slv.mkTerm(FLOATINGPOINT_EQ, {*liveout, sumpc});
     Term AndPC = slv.mkTerm(AND, {Eq1, Eq2});
     // TODO make this general to handle non-sum cases
 
@@ -900,18 +990,37 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 //    for (auto Leaf : CConv.Leaves) {
 //      LLVM_DEBUG(dbgs() << Leaf->toString() << "\n");
 //    }
+    // check all the phis for reductions/inductions
+    DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>> RecDecs;
+    BasicBlock *Header = L->getHeader();
+    for (auto &I : *Header) {
+      if (auto *PN = dyn_cast<PHINode>(&I)) {
+        RecurrenceDescriptor RecDec;
+        if (RecurrenceDescriptor::isReductionPHI(PN, L, RecDec, &DB, &AC, &DT,
+                                                 &SE)) {
+          RecDecs[RecDec.getLoopExitInstr()] = {RecDec, PN};
+        }
+      } else {
+        break;
+      }
+    }
 
     // Then also get the live out
     Value *LLVMLiveOut = (*LiveOuts.begin());
-    if (isa<PHINode>(LLVMLiveOut))
+    Value *LiveOutEnd = nullptr;
+    if (isa<PHINode>(LLVMLiveOut)) {
       LLVMLiveOut = dyn_cast<PHINode>(LLVMLiveOut)->getOperand(0);
-    else // must be store
+      if (RecDecs.count(LLVMLiveOut)) {
+        RecurrenceDescriptor &RD = RecDecs[LLVMLiveOut].first;
+        LLVMLiveOut = RecDecs[LLVMLiveOut].second;
+        LiveOutEnd = RD.getReductionOpChain(dyn_cast<PHINode>(LLVMLiveOut), L)[0];
+      }
+    } else // must be store
     {
     }
 
-    Term liveout = slv.mkVar(CConv.ToSort(LLVMLiveOut->getType()),
-                             LLVMLiveOut->getNameOrAsOperand());
-    CConv.liveout = &liveout;
+    Term *liveout = CConv.MakeTerm(LLVMLiveOut, Ins2Terms);
+    CConv.liveout = liveout;
 
 
     // Now, have to define the sum function for any phis
@@ -942,7 +1051,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     CConv.indvar = CConv.MakeTerm(INDVAR, Ins2Terms);
 
     // translate the computation for the liveout
-    CVCConv::UFInfo liveout_compute_chain = CConv.MakeComputeChain(LLVMLiveOut, L, Ins2Terms, &DB, &AC, &DT, &SE);
+    CVCConv::UFInfo liveout_compute_chain = CConv.MakeComputeChain(LiveOutEnd, L, Ins2Terms, RecDecs);
     LLVM_DEBUG(dbgs() << "COMPUTE CHAIN:\n");
     LLVM_DEBUG(dbgs() << liveout_compute_chain.UF.toString() << "\n");
 
@@ -951,8 +1060,13 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     auto inv_gram = CConv.MakeInvGram(liveout_compute_chain);
 
     // next, make the PC grammar
-//    Grammar pc_gram = CConv.MakePCGrammar(lb, ub, indvar, BoundVars, {}, liveout_compute_chain, liveout);
+    Grammar pc_gram = CConv.MakePCGrammar(liveout_compute_chain);
 
+    std::vector<CVCConv::GrammarRecord> GR = {{inv_gram, "inv"}, {pc_gram, "pc"}};
+    CConv.MakeSynthFuns(GR);
+    CConv.MakeUniversalVars(GR);
+    CConv.MakeSynthFunCalls();
+    CConv.MakeVerificationConditions(L, Ins2Terms);
   }
 
   return PreservedAnalyses::all();
