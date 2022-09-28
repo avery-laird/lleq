@@ -425,7 +425,6 @@ public:
   DenseMap<StringRef, Term> SynthFuns;
   DenseMap<Term*, Term> UniversalVars;
   DenseMap<StringRef, Term> SynthFunCalls;
-  DenseMap<Loop*, Term> Loop2PC;
 
   struct UFInfo {
     std::vector<Term> BoundTerms;
@@ -445,6 +444,7 @@ public:
       return slv.getIntegerSort();
     if (T->getTypeID() == Type::TypeID::DoubleTyID)
       return SpecialSorts[T->getTypeID()];
+    assert(0 && "unsupported LLVM Type");
   }
 
   Term *MakeTerm(Value *V, DenseMap<Value *, Term> &Env) {
@@ -461,8 +461,17 @@ public:
         assert(0 && "unsupported constant type");
         break;
       }
-    } else if (auto *Load = dyn_cast<LoadInst>(V)) {
-      return &(Env[V] = *MakeTerm(getLoadStorePointerOperand(V), Env));
+    } else if (isa<LoadInst>(V) || isa<StoreInst>(V)) {
+      auto *GEP = dyn_cast<GEPOperator>(getLoadStorePointerOperand(V));
+      // eg. y[i]
+      Term *ArrayAddr = MakeTerm(GEP, Env); // (tuple base offset)
+      // if store, y[i] = ...  (store)
+      // if load %0 = y[i]     (select)
+      Kind ArrayOp = isa<LoadInst>(V) ? SELECT : STORE;
+      std::vector<Term> ArgArray = {ArrayAddr->operator[](1), ArrayAddr->operator[](2)};
+      if (auto *Store = dyn_cast<StoreInst>(V))
+        ArgArray.push_back(*MakeTerm(Store->getValueOperand(), Env));
+      return &(Env[V] = slv.mkTerm(ArrayOp, ArgArray));
     } else if (auto *GEP = dyn_cast<GEPOperator>(V)) {
       assert(GEP->getNumIndices() == 1);
       // make the array if it doesn't exist
@@ -474,8 +483,12 @@ public:
             slv.mkVar(asort, GEP->getPointerOperand()->getNameOrAsOperand());
         Leaves.insert(&Env[GEP->getPointerOperand()]);
       }
+//      return &(Env[V] =
+//                 slv.mkTerm(SELECT, {*&Env[GEP->getPointerOperand()], *MakeTerm(GEP->getOperand(1), Env)}));
+      Term *Base = &Env[GEP->getPointerOperand()];
+      Term *Offset = MakeTerm(GEP->getOperand(1), Env);
       return &(Env[V] =
-                 slv.mkTerm(SELECT, {*&Env[GEP->getPointerOperand()], *MakeTerm(GEP->getOperand(1), Env)}));
+                   slv.mkTuple({Base->getSort(), Offset->getSort()}, {*Base, *Offset}));
     } else if (auto *Cast = dyn_cast<CastInst>(V)) {
       return &(Env[V] = *MakeTerm(Cast->getOperand(0), Env));
     } else if (isa<PHINode>(V) || isa<Argument>(V)) {
@@ -700,7 +713,7 @@ public:
     }
   }
 
-  void MakeVerificationConditions(Loop *L, DenseMap<Value *, Term> &Env) {
+  void MakeVerificationConditions(Loop *L, DenseMap<Value *, Term> &Env, DenseMap<Loop*, Term> &Loop2PC) {
     // modify env to inject the universalvars where the previous values were
     // TODO clean up this whole pointers mess, we need a better way to test equality
 //    for (auto &Elem : UniversalVars) {
@@ -984,6 +997,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   // TODO loop works for inner loop only right now, need to filter out the inner
   // loop BBs
+  DenseMap<Loop*, Term> Loop2PC;
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
     // get live ins and live outs
@@ -1042,12 +1056,18 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         LLVMLiveOut = RecDecs[LLVMLiveOut].second;
         LiveOutEnd = RD.getReductionOpChain(dyn_cast<PHINode>(LLVMLiveOut), L)[0];
       }
+      CConv.liveout = CConv.MakeTerm(LLVMLiveOut, Ins2Terms);
     } else // must be store
     {
+      auto *Store = dyn_cast<StoreInst>(LLVMLiveOut);
+      auto *GEP = dyn_cast<GEPOperator>(Store->getPointerOperand()); // get the GEP
+      LLVMLiveOut = GEP->getPointerOperand(); // then get the base ptr
+      LiveOutEnd = Store;
+      // make the GEP:
+      CConv.MakeTerm(GEP, Ins2Terms);
+      // we only want the base
+      CConv.liveout = &Ins2Terms[LLVMLiveOut];
     }
-
-    Term *liveout = CConv.MakeTerm(LLVMLiveOut, Ins2Terms);
-    CConv.liveout = liveout;
 
 
     // Now, have to define the sum function for any phis
@@ -1093,7 +1113,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     CConv.MakeSynthFuns(GR);
     CConv.MakeUniversalVars(GR);
     CConv.MakeSynthFunCalls();
-    CConv.MakeVerificationConditions(L, Ins2Terms);
+    CConv.MakeVerificationConditions(L, Ins2Terms, Loop2PC);
   }
 
   return PreservedAnalyses::all();
