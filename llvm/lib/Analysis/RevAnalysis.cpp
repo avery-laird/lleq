@@ -1,7 +1,7 @@
 #include "llvm/Analysis/RevAnalysis.h"
 #include "z3++.h"
-#include "llvm/ADT/Triple.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/DemandedBits.h"
@@ -412,24 +412,24 @@ class CVCConv {
 public:
   Solver &slv;
   DenseMap<int, Sort> SpecialSorts;
-  SmallSet<Term*, 16> Leaves;
+  SmallSet<Term *, 16> Leaves;
   Term RoundingMode;
-  std::vector<Term*> SumArgs;
-  std::vector<Term*> NonTerminals;
-  DenseMap<Term*, Value*> Terms2Vals;
-  DenseMap<Term*, Value*> Uni2Vals;
+  std::vector<Term *> SumArgs;
+  std::vector<Term *> NonTerminals;
+  DenseMap<Term *, Value *> Terms2Vals;
+  DenseMap<Term *, Value *> Uni2Vals;
   Term *lb;
   Term *ub;
   Term *indvar;
   Term *liveout;
   DenseMap<StringRef, Term> SynthFuns;
-  DenseMap<Term*, Term> UniversalVars;
+  DenseMap<Term *, Term> UniversalVars;
   DenseMap<StringRef, Term> SynthFunCalls;
 
   struct UFInfo {
     std::vector<Term> BoundTerms;
     Term UF;
-    std::vector<Value*> ArgVals;
+    std::vector<Value *> ArgVals;
   };
 
   CVCConv(Solver &slv) : slv(slv) {
@@ -453,10 +453,16 @@ public:
     if (auto *Const = dyn_cast<Constant>(V)) {
       switch (Const->getType()->getTypeID()) {
       case Type::TypeID::IntegerTyID:
-        return &(Env[V] = slv.mkInteger(dyn_cast<ConstantInt>(V)->getSExtValue()));
+        return &(Env[V] =
+                     slv.mkInteger(dyn_cast<ConstantInt>(V)->getSExtValue()));
         break;
       case Type::TypeID::DoubleTyID:
-        return &(Env[V] = slv.mkFloatingPoint(11, 53, slv.mkBitVector(64, dyn_cast<ConstantFP>(V)->getValue().convertToDouble())));
+        return &(
+            Env[V] = slv.mkFloatingPoint(
+                11, 53,
+                slv.mkBitVector(
+                    64,
+                    dyn_cast<ConstantFP>(V)->getValue().convertToDouble())));
       default:
         assert(0 && "unsupported constant type");
         break;
@@ -468,7 +474,8 @@ public:
       // if store, y[i] = ...  (store)
       // if load %0 = y[i]     (select)
       Kind ArrayOp = isa<LoadInst>(V) ? SELECT : STORE;
-      std::vector<Term> ArgArray = {ArrayAddr->operator[](1), ArrayAddr->operator[](2)};
+      std::vector<Term> ArgArray = {ArrayAddr->operator[](1),
+                                    ArrayAddr->operator[](2)};
       if (auto *Store = dyn_cast<StoreInst>(V))
         ArgArray.push_back(*MakeTerm(Store->getValueOperand(), Env));
       return &(Env[V] = slv.mkTerm(ArrayOp, ArgArray));
@@ -483,12 +490,13 @@ public:
             slv.mkVar(asort, GEP->getPointerOperand()->getNameOrAsOperand());
         Leaves.insert(&Env[GEP->getPointerOperand()]);
       }
-//      return &(Env[V] =
-//                 slv.mkTerm(SELECT, {*&Env[GEP->getPointerOperand()], *MakeTerm(GEP->getOperand(1), Env)}));
+      //      return &(Env[V] =
+      //                 slv.mkTerm(SELECT, {*&Env[GEP->getPointerOperand()],
+      //                 *MakeTerm(GEP->getOperand(1), Env)}));
       Term *Base = &Env[GEP->getPointerOperand()];
       Term *Offset = MakeTerm(GEP->getOperand(1), Env);
-      return &(Env[V] =
-                   slv.mkTuple({Base->getSort(), Offset->getSort()}, {*Base, *Offset}));
+      return &(Env[V] = slv.mkTuple({Base->getSort(), Offset->getSort()},
+                                    {*Base, *Offset}));
     } else if (auto *Cast = dyn_cast<CastInst>(V)) {
       return &(Env[V] = *MakeTerm(Cast->getOperand(0), Env));
     } else if (isa<PHINode>(V) || isa<Argument>(V)) {
@@ -498,8 +506,9 @@ public:
     } else if (auto *BinOp = dyn_cast<BinaryOperator>(V)) {
       switch (BinOp->getOpcode()) {
       case BinaryOperator::BinaryOps::Add:
-        return &(Env[V] = slv.mkTerm(ADD, {*MakeTerm(BinOp->getOperand(0), Env),
-                                         *MakeTerm(BinOp->getOperand(1), Env)}));
+        return &(Env[V] =
+                     slv.mkTerm(ADD, {*MakeTerm(BinOp->getOperand(0), Env),
+                                      *MakeTerm(BinOp->getOperand(1), Env)}));
       default:
         assert(0 && "unsupported binop type.");
         break;
@@ -508,7 +517,7 @@ public:
       switch (Cmp->getPredicate()) {
       case CmpInst::ICMP_SLT:
         return &(Env[V] = slv.mkTerm(LT, {*MakeTerm(Cmp->getOperand(0), Env),
-                                        *MakeTerm(Cmp->getOperand(1), Env)}));
+                                          *MakeTerm(Cmp->getOperand(1), Env)}));
       default:
         assert(0 && "unsupported predicate type.");
         break;
@@ -520,15 +529,10 @@ public:
         Term *a = MakeTerm(CI->getOperand(0), Env);
         Term *b = MakeTerm(CI->getOperand(1), Env);
         Term *c = MakeTerm(CI->getOperand(2), Env);
-        Env[V] = slv.mkTerm(FLOATINGPOINT_ADD,
-                            {
-                                RoundingMode,
-                                slv.mkTerm(FLOATINGPOINT_MULT,
-                                           {
-                                               RoundingMode, *a, *b
-                                           }),
-                                *c
-                            });
+        Env[V] = slv.mkTerm(
+            FLOATINGPOINT_ADD,
+            {RoundingMode,
+             slv.mkTerm(FLOATINGPOINT_MULT, {RoundingMode, *a, *b}), *c});
         return &Env[V];
       } else {
         assert(0 && "arbitrary functions aren't supported.");
@@ -540,11 +544,15 @@ public:
   }
 
   // TODO make a general visitor pattern to unify MakeTerm and RetrieveLeaves
-  void RetrieveLeaves(Value *V, DenseMap<Value *, Term> &Env, SmallPtrSet<Term*, 8> &LocalLeaves) {
+  void RetrieveLeaves(Value *V, DenseMap<Value *, Term> &Env,
+                      SmallPtrSet<Term *, 8> &LocalLeaves) {
     if (auto *Const = dyn_cast<Constant>(V)) {
       return;
-    } else if (auto *Load = dyn_cast<LoadInst>(V)) {
-      return RetrieveLeaves(getLoadStorePointerOperand(V), Env, LocalLeaves);
+    } else if (isa<LoadInst>(V) || isa<StoreInst>(V)) {
+      RetrieveLeaves(getLoadStorePointerOperand(V), Env, LocalLeaves);
+      if (auto *Store = dyn_cast<StoreInst>(V))
+        RetrieveLeaves(Store->getValueOperand(), Env, LocalLeaves);
+      return;
     } else if (auto *GEP = dyn_cast<GEPOperator>(V)) {
       LocalLeaves.insert(&Env[GEP->getPointerOperand()]);
       RetrieveLeaves(GEP->getOperand(1), Env, LocalLeaves);
@@ -577,13 +585,23 @@ public:
       }
       return;
     }
-    
+
     assert(0 && ("unsupported value " + V->getNameOrAsOperand()).data());
     return;
   }
 
-  UFInfo MakeComputeChain(Value *V, Loop *L, DenseMap<Value *, Term> &Env,
-                          DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>> &RecDecs) {
+  UFInfo MakeComputeChain(
+      Value *V, Loop *L, DenseMap<Value *, Term> &Env,
+      DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode *>> &RecDecs) {
+    // Everything is uninterpreted functions.
+    // This module tries to represent the liveout operation chain
+    // as a single UF over all Phi nodes. For example, consider a liveout store:
+    // store double %sum, ptr %arrayidx   (where arrayidx represents y[i])
+    // in a loop with a single Phi node in the header, the indvar %i.
+    // This should be wrapped in an UF loop(lb_i, ub_i, y[i] = sum)
+    // lb_i and ub_i will be supplied later by the inv and pc grammars,
+    // but practically it will be the Bounds.getInitialIV and
+    // L->getInductionVariable() - 1
 
     if (RecDecs.count(V)) {
       // liveout is described by a phi!
@@ -595,32 +613,36 @@ public:
         if (auto *CI = dyn_cast<CallInst>(Chain[0])) {
           auto *F = CI->getCalledFunction();
           if (F && F->getIntrinsicID() == Intrinsic::fmuladd) {
-//            auto Bounds = L->getBounds(*SE);
+            //            auto Bounds = L->getBounds(*SE);
             // from is the lower bound, that for now is any term
-//            Term from = MakeTerm(&Bounds->getInitialIVValue(), Env);
+            //            Term from = MakeTerm(&Bounds->getInitialIVValue(),
+            //            Env);
             Term from = slv.mkVar(slv.getIntegerSort(), "from");
             // copy the leaves then use them to get the atoms here
-//            auto LeavesBackup = Leaves;
-//            Leaves.clear();
-//            DenseMap<Value *, Term> LocalEnv;
+            //            auto LeavesBackup = Leaves;
+            //            Leaves.clear();
+            //            DenseMap<Value *, Term> LocalEnv;
 
             // to is the upper bound, that we assume is the indvar
             // also we assume the a and b vars all change w.r.t a single Phi
             // TODO assert that this is true
             Term to = slv.mkVar(slv.getIntegerSort(), "to");
-//            Term c = MakeTerm(CI->getOperand(2), LocalEnv);
+            //            Term c = MakeTerm(CI->getOperand(2), LocalEnv);
             Term *a = MakeTerm(CI->getOperand(0), Env);
             Term *b = MakeTerm(CI->getOperand(1), Env);
-            std::vector<Value*> ArgVals = {CI->getOperand(0), CI->getOperand(1)};
+            std::vector<Value *> ArgVals = {CI->getOperand(0),
+                                            CI->getOperand(1)};
 
-            SmallSet<Term*, 8> BoundVars;
+            SmallPtrSet<Term *, 8> BoundVars;
             RetrieveLeaves(CI->getOperand(0), Env, BoundVars);
             RetrieveLeaves(CI->getOperand(1), Env, BoundVars);
             // copy into non-ptr array
-//            std::vector<Term> BoundVars2;
+            //            std::vector<Term> BoundVars2;
             for (auto *T : BoundVars)
-              if (T == indvar) continue ; // skip indvar
-              else SumArgs.push_back(T);
+              if (T == indvar)
+                continue; // skip indvar
+              else
+                SumArgs.push_back(T);
             for (auto *T : SumArgs)
               LLVM_DEBUG(dbgs() << T->toString() << "\n");
 
@@ -628,59 +650,118 @@ public:
             std::vector<Term> SumArgsLocal;
             Sorts.push_back(from.getSort());
             Sorts.push_back(to.getSort());
-            for (auto *Arg: SumArgs) {
+            for (auto *Arg : SumArgs) {
               Sorts.push_back(Arg->getSort());
               SumArgsLocal.push_back(*Arg);
             }
             Sort SumSort = slv.mkFunctionSort(Sorts, ToSort(CI->getType()));
-            Term SumDec = slv.mkConst(SumSort, ("recurrence_" + CI->getNameOrAsOperand()).data());
-            std::vector<Term> InductionStepChildren = {SumDec, from, slv.mkTerm(SUB, {to, slv.mkInteger(1)})};
-            InductionStepChildren.insert(InductionStepChildren.end(), SumArgsLocal.begin(), SumArgsLocal.end());
+            Term SumDec = slv.mkConst(
+                SumSort, ("recurrence_" + CI->getNameOrAsOperand()).data());
+            std::vector<Term> InductionStepChildren = {
+                SumDec, from, slv.mkTerm(SUB, {to, slv.mkInteger(1)})};
+            InductionStepChildren.insert(InductionStepChildren.end(),
+                                         SumArgsLocal.begin(),
+                                         SumArgsLocal.end());
             Term InductionStep = slv.mkTerm(APPLY_UF, InductionStepChildren);
             Term Mult = slv.mkTerm(FLOATINGPOINT_MULT, {RoundingMode, *a, *b});
             // add = mult + induction step
             // a*b + c
-            Term FMA = slv.mkTerm(cvc5::FLOATINGPOINT_ADD, {RoundingMode, InductionStep, Mult});
-            Term SumBody = slv.mkTerm(ITE, {
-                                               slv.mkTerm(LT, {to, from}),
-                                               *MakeTerm(ConstantFP::get(CI->getType(), 0), Env),
-                                               FMA
-                                           });
+            Term FMA = slv.mkTerm(cvc5::FLOATINGPOINT_ADD,
+                                  {RoundingMode, InductionStep, Mult});
+            Term SumBody = slv.mkTerm(
+                ITE, {slv.mkTerm(LT, {to, from}),
+                      *MakeTerm(ConstantFP::get(CI->getType(), 0), Env), FMA});
             std::vector<Term> TotalVars;
             TotalVars.push_back(from);
             TotalVars.push_back(to);
-            TotalVars.insert(TotalVars.end(), SumArgsLocal.begin(), SumArgsLocal.end());
+            TotalVars.insert(TotalVars.end(), SumArgsLocal.begin(),
+                             SumArgsLocal.end());
             Term SumFunc = slv.defineFunRec(SumDec, TotalVars, SumBody);
-//            Leaves = LeavesBackup;
+            //            Leaves = LeavesBackup;
 
-//            // finally, specialize to the loop bounds
-//            Term *lower = MakeTerm(&Bounds->getInitialIVValue(), Env);
-//            Term upper = slv.mkTerm(SUB, {*MakeTerm(L->getInductionVariable(*SE), Env), slv.mkInteger(1)});
-//            std::vector<Term> FnArgs;
-//            FnArgs.push_back(SumDec);
-//            FnArgs.push_back(*lower);
-//            FnArgs.push_back(upper);
-//            FnArgs.insert(FnArgs.end(), SumArgsLocal.begin(), SumArgsLocal.end());
-//            assert(FnArgs.size() == SumArgsLocal.size() + 3 && "some bound vars are missing");
-//
-//            std::vector<Term> AllBoundVars;
-//            AllBoundVars.push_back(*MakeTerm(L->getInductionVariable(*SE), Env));
-//            AllBoundVars.insert(AllBoundVars.end(), SumArgsLocal.begin(), SumArgsLocal.end());
-//
-//            Term call = slv.mkTerm(APPLY_UF, FnArgs);
+            //            // finally, specialize to the loop bounds
+            //            Term *lower = MakeTerm(&Bounds->getInitialIVValue(),
+            //            Env); Term upper = slv.mkTerm(SUB,
+            //            {*MakeTerm(L->getInductionVariable(*SE), Env),
+            //            slv.mkInteger(1)}); std::vector<Term> FnArgs;
+            //            FnArgs.push_back(SumDec);
+            //            FnArgs.push_back(*lower);
+            //            FnArgs.push_back(upper);
+            //            FnArgs.insert(FnArgs.end(), SumArgsLocal.begin(),
+            //            SumArgsLocal.end()); assert(FnArgs.size() ==
+            //            SumArgsLocal.size() + 3 && "some bound vars are
+            //            missing");
+            //
+            //            std::vector<Term> AllBoundVars;
+            //            AllBoundVars.push_back(*MakeTerm(L->getInductionVariable(*SE),
+            //            Env)); AllBoundVars.insert(AllBoundVars.end(),
+            //            SumArgsLocal.begin(), SumArgsLocal.end());
+            //
+            //            Term call = slv.mkTerm(APPLY_UF, FnArgs);
             return {{}, SumDec, ArgVals};
           } else {
             assert(0 && "arbitrary function calls are not supported");
           }
         }
       } else {
-
       }
     } else if (auto *Store = dyn_cast<StoreInst>(V)) {
       // calculate compute chain for a store.
       // the value might depend on inner loops.
       // if so, it is the PC for that loop.
+      Term *Chain = MakeTerm(Store, Env); // (STORE base offset val)
+      Term Probe = slv.mkTerm(SELECT, {Chain->operator[](0), Chain->operator[](1)});
+      SmallPtrSet<Term *, 8> LLeaves;
+      RetrieveLeaves(Store, Env, LLeaves);
+      SumArgs.insert(SumArgs.begin(), LLeaves.begin(), LLeaves.end());
+      std::vector<Term> BoundVars;
+      for (auto * T : LLeaves) BoundVars.push_back(*T);
+      auto ArraySort = Chain->operator[](0).getSort();
+      auto StoreValSort = Chain->operator[](2).getSort();
+      // these are dummy vars just to fit the template
+      Term from = slv.mkVar(slv.getIntegerSort(), "from");
+      Term to = slv.mkVar(slv.getIntegerSort(), "to");
+      BoundVars.insert(BoundVars.begin(), to);
+      BoundVars.insert(BoundVars.begin(), from);
+      auto FunDef = slv.defineFun("StoreFun", BoundVars, ArraySort, *Chain);
+//      Kind EqKind = ToSort(Store->getValueOperand()->getType()) == slv.getIntegerSort() ? EQUAL : FLOATINGPOINT_EQ;
+//      Term Eq = slv.mkTerm(EqKind, {Probe, *MakeTerm(Store->getValueOperand(), Env)});
+      std::vector<Value *> FnVals;
+      for (int i = 0; i < Store->getNumOperands(); ++i)
+        FnVals.push_back(Store->getOperand(i));
 
+
+//
+//      Term *ToEq = MakeTerm(Store->getValueOperand(), Env);
+//      // collect all the phis, these are args to the loop UF
+//      std::vector<Term> FnArgs;
+//      std::vector<Value *> FnVals;
+//      std::vector<Term> Bounds;
+//      std::vector<Term> Phis;
+//      std::vector<Sort> Sorts;
+//      for (auto &I : *L->getHeader()) {
+//        if (auto *PN = dyn_cast<PHINode>(&I)) {
+//          Term *Phi = MakeTerm(PN, Env);
+//          Phis.push_back(*Phi);
+//          FnArgs.push_back(slv.mkVar(ToSort(PN->getType()),
+//                                     "lb_" + PN->getNameOrAsOperand()));
+//          FnArgs.push_back(slv.mkVar(ToSort(PN->getType()),
+//                                     "ub_" + PN->getNameOrAsOperand()));
+//          Bounds.push_back(slv.mkTerm(
+//              AND, {slv.mkTerm(LEQ, {FnArgs[FnArgs.size() - 2], *Phi}),
+//                    slv.mkTerm(LT, {*Phi, FnArgs[FnArgs.size() - 1]})}));
+//          Sorts.push_back(ToSort(PN->getType()));
+//          Sorts.push_back(ToSort(PN->getType()));
+//          FnVals.push_back(PN);
+//        } else
+//          break;
+//      }
+//      std::vector<Term> BodyList = Phis;
+//      BodyList.insert(BodyList.end(), slv.mkTerm(IMPLIES, {(Bounds.size() == 1 ? Bounds[0] : slv.mkTerm(AND, Bounds)), slv.mkTerm(EqKind, {*ToEq,*Chain})}));
+//      Term Body = slv.mkTerm(FORALL, BodyList);
+//      Sort FnSort = slv.mkFunctionSort(Sorts, Chain->getSort());
+//      Term FnDef = slv.defineFun(L->getName().str(), FnArgs, FnSort, *Chain);
+      return {{}, FunDef, FnVals};
     } else {
       assert(0 && "liveout must be described as a phi right now.");
     }
@@ -693,15 +774,18 @@ public:
 
   void MakeSynthFuns(std::vector<GrammarRecord> &Grammars) {
     std::vector<Term> BoundVars;
-    for (auto *T : NonTerminals) BoundVars.push_back(*T);
+    for (auto *T : NonTerminals)
+      BoundVars.push_back(*T);
 
     for (auto GR : Grammars)
-      SynthFuns[GR.Name] = slv.synthFun(GR.Name.str(), BoundVars, slv.getBooleanSort(), GR.G);
+      SynthFuns[GR.Name] =
+          slv.synthFun(GR.Name.str(), BoundVars, slv.getBooleanSort(), GR.G);
   }
 
   void MakeUniversalVars(std::vector<GrammarRecord> &Grammars) {
     for (auto *T : NonTerminals)
-      UniversalVars[T] = slv.declareSygusVar("sys_" + T->getSymbol(), T->getSort());
+      UniversalVars[T] =
+          slv.declareSygusVar("sys_" + T->getSymbol(), T->getSort());
   }
 
   void MakeSynthFunCalls() {
@@ -713,12 +797,14 @@ public:
     }
   }
 
-  void MakeVerificationConditions(Loop *L, DenseMap<Value *, Term> &Env, DenseMap<Loop*, Term> &Loop2PC) {
+  void MakeVerificationConditions(Loop *L, DenseMap<Value *, Term> &Env,
+                                  DenseMap<Loop *, Term> &Loop2PC) {
     // modify env to inject the universalvars where the previous values were
-    // TODO clean up this whole pointers mess, we need a better way to test equality
-//    for (auto &Elem : UniversalVars) {
-//      Env[Terms2Vals[Elem.first]] = Elem.second;
-//    }
+    // TODO clean up this whole pointers mess, we need a better way to test
+    // equality
+    //    for (auto &Elem : UniversalVars) {
+    //      Env[Terms2Vals[Elem.first]] = Elem.second;
+    //    }
     Term Precondition = slv.mkBoolean(false); // TODO fix this hack later
     Term &Postcondition = SynthFunCalls["pc"];
     Term &Invariant = SynthFunCalls["inv"];
@@ -738,32 +824,37 @@ public:
     Term NewInv = slv.mkTerm(APPLY_UF, NewArgs);
 
     // then add constraints
-    slv.addSygusAssume(slv.mkTerm(LT, {*MakeTerm(Terms2Vals[lb], SysEnv), *MakeTerm(Terms2Vals[ub], SysEnv)}));
+    slv.addSygusAssume(slv.mkTerm(LT, {*MakeTerm(Terms2Vals[lb], SysEnv),
+                                       *MakeTerm(Terms2Vals[ub], SysEnv)}));
     slv.addSygusConstraint(slv.mkTerm(IMPLIES, {Precondition, Invariant}));
-    slv.addSygusConstraint(slv.mkTerm(IMPLIES, {slv.mkTerm(AND, {Invariant, *LoopCond}), NewInv}));
-    slv.addSygusConstraint(slv.mkTerm(IMPLIES, {slv.mkTerm(AND, {Invariant, Exit}), Postcondition}));
+    slv.addSygusConstraint(
+        slv.mkTerm(IMPLIES, {slv.mkTerm(AND, {Invariant, *LoopCond}), NewInv}));
+    slv.addSygusConstraint(slv.mkTerm(
+        IMPLIES, {slv.mkTerm(AND, {Invariant, Exit}), Postcondition}));
     SynthResult res = slv.checkSynth();
     if (res.hasSolution()) {
       Loop2PC[L] = slv.getSynthSolution(SynthFuns["pc"]);
-      LLVM_DEBUG(dbgs() << "FOUND Postcondition:\n" << Loop2PC[L].toString() << "\n");
+      LLVM_DEBUG(dbgs() << "FOUND Postcondition:\n"
+                        << Loop2PC[L].toString() << "\n");
     } else {
       LLVM_DEBUG(dbgs() << "no solution.\n");
     }
-    slv.printStatisticsSafe( fileno(stdout));
+    slv.printStatisticsSafe(fileno(stdout));
   }
 
-  void ExecuteOneIteration(Loop *L, std::vector<Term> &InvArgs, DenseMap<Value *, Term> &Env) {
+  void ExecuteOneIteration(Loop *L, std::vector<Term> &InvArgs,
+                           DenseMap<Value *, Term> &Env) {
     for (auto *NT : NonTerminals) {
       Term &UniVal = UniversalVars[NT];
       Value *V = Terms2Vals[NT];
-//      if (V == nullptr) {
-//        LLVM_DEBUG(dbgs() << "WARNING: creating new term for " << NT->toString() << "\n");
-//        Term *NV = MakeTerm(V, Env);
-//        Terms2Vals[NT] = V;
-//      }
+      //      if (V == nullptr) {
+      //        LLVM_DEBUG(dbgs() << "WARNING: creating new term for " <<
+      //        NT->toString() << "\n"); Term *NV = MakeTerm(V, Env);
+      //        Terms2Vals[NT] = V;
+      //      }
       if (L->isLoopInvariant(V)) {
         InvArgs.push_back(UniVal);
-        continue ;
+        continue;
       }
       // otherwise, either Phi or load
       if (auto *PN = dyn_cast<PHINode>(V)) {
@@ -779,48 +870,51 @@ public:
     }
   }
 
-  void MakeNonTerminals(Loop *L, ScalarEvolution *SE, UFInfo &computechain, DenseMap<Value *, Term> &Env) {
-    SmallPtrSet<Term*, 8> NonTerms;
+  void MakeNonTerminals(Loop *L, ScalarEvolution *SE, UFInfo &computechain,
+                        DenseMap<Value *, Term> &Env) {
+    SmallPtrSet<Term *, 8> NonTerms;
 
     auto Bounds = L->getBounds(*SE);
     auto *UB = &Bounds->getFinalIVValue();
     auto *LB = &Bounds->getInitialIVValue();
     auto *INDVAR = L->getInductionVariable(*SE);
     // also visit all the phis
-//    for (auto &I : *L->getHeader()) {
-//      if (!isa<PHINode>(&I))
-//        break;
-//      MakeTerm(&I, Env);
-//      RetrieveLeaves(&I, Env, NonTerms);
-//    }
+    //    for (auto &I : *L->getHeader()) {
+    //      if (!isa<PHINode>(&I))
+    //        break;
+    //      MakeTerm(&I, Env);
+    //      RetrieveLeaves(&I, Env, NonTerms);
+    //    }
 
     RetrieveLeaves(UB, Env, NonTerms);
     RetrieveLeaves(LB, Env, NonTerms);
     RetrieveLeaves(INDVAR, Env, NonTerms);
     for (auto *Arg : computechain.ArgVals)
       RetrieveLeaves(Arg, Env, NonTerms);
-//    auto BoundsLeaves = Leaves;
-//    Leaves.clear();
+    //    auto BoundsLeaves = Leaves;
+    //    Leaves.clear();
     // inject the lb and indvar into a special env
-//    DenseMap<Value*, Term> SpecialEnv;
-//    std::vector<Term> PostArgs;
+    //    DenseMap<Value*, Term> SpecialEnv;
+    //    std::vector<Term> PostArgs;
 
-//    for (auto *V : computechain.ArgVals)
-//      PostArgs.push_back(*MakeTerm(V, Env));
-//    auto BoundVars = Leaves;
-//    // copy into non-ptr array
-//    for (auto T : BoundVars)
-//      if (T == indvar) continue ; // skip indvar
-//      else
-//        SumArgs.push_back(T);
-//    LLVM_DEBUG(dbgs() << "Created Sum Args:\n");
-//    for (auto &T : SumArgs)
-//      LLVM_DEBUG(dbgs() << T.toString() << "\n");
+    //    for (auto *V : computechain.ArgVals)
+    //      PostArgs.push_back(*MakeTerm(V, Env));
+    //    auto BoundVars = Leaves;
+    //    // copy into non-ptr array
+    //    for (auto T : BoundVars)
+    //      if (T == indvar) continue ; // skip indvar
+    //      else
+    //        SumArgs.push_back(T);
+    //    LLVM_DEBUG(dbgs() << "Created Sum Args:\n");
+    //    for (auto &T : SumArgs)
+    //      LLVM_DEBUG(dbgs() << T.toString() << "\n");
 
-    for (auto *T : NonTerms) NonTerminals.push_back(T);
-    NonTerminals.push_back(liveout);
-//    NonTerminals.push_back(indvar);
-//    for (auto *T : Leaves) NonTerminals.push_back(T);
+    NonTerms.insert(liveout);
+    for (auto *T : NonTerms)
+      NonTerminals.push_back(T);
+
+    //    NonTerminals.push_back(indvar);
+    //    for (auto *T : Leaves) NonTerminals.push_back(T);
 
     LLVM_DEBUG(dbgs() << "Created nonterminals:\n");
     for (auto &T : NonTerminals)
@@ -830,11 +924,10 @@ public:
     for (auto &Elem : Env)
       Terms2Vals[&Elem.second] = Elem.first;
 
-//    Leaves = LeavesBackup;
+    //    Leaves = LeavesBackup;
   }
 
   Grammar MakeInvGram(UFInfo &computechain) {
-
 
     Term start = slv.mkVar(slv.getBooleanSort(), "start");
     Term cmp = slv.mkVar(slv.getBooleanSort(), "cmp");
@@ -856,16 +949,15 @@ public:
     Term ComputeChain = slv.mkTerm(APPLY_UF, Args);
     Term equal = slv.mkTerm(EqKind, {*liveout, ComputeChain});
 
-
     std::vector<Term> BoundVars;
-    for (auto *T : NonTerminals) BoundVars.push_back(*T);
+    for (auto *T : NonTerminals)
+      BoundVars.push_back(*T);
     Grammar inv_gram = slv.mkGrammar(BoundVars, {start, cmp, expr, eq});
 
     inv_gram.addRules(start, {And});
     inv_gram.addRules(cmp, {Leq});
     inv_gram.addRules(expr, {*lb, *indvar, *ub});
     inv_gram.addRules(eq, {equal});
-
 
     LLVM_DEBUG(dbgs() << "INV GRAMMAR:\n");
     LLVM_DEBUG(dbgs() << inv_gram.toString() << "\n");
@@ -874,27 +966,27 @@ public:
   }
 
   Grammar MakePCGrammar(CVCConv::UFInfo compute_chain) {
-//    auto LeavesBackup = Leaves;
-//    Leaves.clear();
-//    DenseMap<Value*, Term> DummyEnv;
-////    Term *ub = MakeTerm(UB, Env);
-////    Term *lb = MakeTerm(LB, Env);
-//    auto BoundsLeaves = Leaves;
-//    Leaves.clear();
-//    // inject the lb and indvar into a special env
-//    DenseMap<Value*, Term> SpecialEnv;
-//    std::vector<Term> PostArgs;
-////    Term indvar = MakeTerm(INDVAR, SpecialEnv);
-//    for (auto *V : compute_chain.ArgVals)
-//      PostArgs.push_back(MakeTerm(V, SpecialEnv));
-//    auto BoundVars = Leaves;
-//    // copy into non-ptr array
-//    std::vector<Term> BoundVars2;
-//    for (auto T : BoundVars)
-//      if (T == indvar) continue ; // skip indvar
-//      else BoundVars2.push_back(T);
-//    for (auto &T : BoundVars2)
-//      LLVM_DEBUG(dbgs() << T.toString() << "\n");
+    //    auto LeavesBackup = Leaves;
+    //    Leaves.clear();
+    //    DenseMap<Value*, Term> DummyEnv;
+    ////    Term *ub = MakeTerm(UB, Env);
+    ////    Term *lb = MakeTerm(LB, Env);
+    //    auto BoundsLeaves = Leaves;
+    //    Leaves.clear();
+    //    // inject the lb and indvar into a special env
+    //    DenseMap<Value*, Term> SpecialEnv;
+    //    std::vector<Term> PostArgs;
+    ////    Term indvar = MakeTerm(INDVAR, SpecialEnv);
+    //    for (auto *V : compute_chain.ArgVals)
+    //      PostArgs.push_back(MakeTerm(V, SpecialEnv));
+    //    auto BoundVars = Leaves;
+    //    // copy into non-ptr array
+    //    std::vector<Term> BoundVars2;
+    //    for (auto T : BoundVars)
+    //      if (T == indvar) continue ; // skip indvar
+    //      else BoundVars2.push_back(T);
+    //    for (auto &T : BoundVars2)
+    //      LLVM_DEBUG(dbgs() << T.toString() << "\n");
 
     Term start_pc = slv.mkVar(slv.getBooleanSort(), "start_pc");
     std::vector<Term> Args;
@@ -912,20 +1004,21 @@ public:
     Term AndPC = slv.mkTerm(AND, {Eq1, Eq2});
     // TODO make this general to handle non-sum cases
 
-//    std::vector<Term> Leaves2;
-//    for (auto T : BoundsLeaves) Leaves2.push_back(T);
-//    Leaves2.push_back(liveout);
-//    Leaves2.push_back(indvar);
-//    for (auto T : Leaves) Leaves2.push_back(T);
+    //    std::vector<Term> Leaves2;
+    //    for (auto T : BoundsLeaves) Leaves2.push_back(T);
+    //    Leaves2.push_back(liveout);
+    //    Leaves2.push_back(indvar);
+    //    for (auto T : Leaves) Leaves2.push_back(T);
     std::vector<Term> BoundVars;
-    for (auto *T : NonTerminals) BoundVars.push_back(*T);
+    for (auto *T : NonTerminals)
+      BoundVars.push_back(*T);
     Grammar pc_gram = slv.mkGrammar(BoundVars, {start_pc});
     pc_gram.addRules(start_pc, {AndPC});
 
     LLVM_DEBUG(dbgs() << "PC GRAMMAR:\n");
     LLVM_DEBUG(dbgs() << pc_gram.toString() << "\n");
 
-//    Leaves = LeavesBackup;
+    //    Leaves = LeavesBackup;
     return pc_gram;
   }
 };
@@ -997,7 +1090,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   // TODO loop works for inner loop only right now, need to filter out the inner
   // loop BBs
-  DenseMap<Loop*, Term> Loop2PC;
+  DenseMap<Loop *, Term> Loop2PC;
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
     // get live ins and live outs
@@ -1019,20 +1112,20 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     slv.setOption("output", "sygus");
 
     // Invariant inputs are just the induction var, lb, ub, + live ins
-//    SmallPtrSet<Value *, 6> InvariantInputs;
-//    InvariantInputs.insert(IndVar);
-//    InvariantInputs.insert(LiveIns.begin(), LiveIns.end());
+    //    SmallPtrSet<Value *, 6> InvariantInputs;
+    //    InvariantInputs.insert(IndVar);
+    //    InvariantInputs.insert(LiveIns.begin(), LiveIns.end());
     DenseMap<Value *, Term> Ins2Terms;
-//    for (auto *V : InvariantInputs) {
-//      CConv.MakeTerm(V, Ins2Terms);
-//      LLVM_DEBUG(dbgs() << Ins2Terms[V].toString() << "\n");
-//    }
-//    LLVM_DEBUG(dbgs() << "LEAVES:\n");
-//    for (auto Leaf : CConv.Leaves) {
-//      LLVM_DEBUG(dbgs() << Leaf->toString() << "\n");
-//    }
+    //    for (auto *V : InvariantInputs) {
+    //      CConv.MakeTerm(V, Ins2Terms);
+    //      LLVM_DEBUG(dbgs() << Ins2Terms[V].toString() << "\n");
+    //    }
+    //    LLVM_DEBUG(dbgs() << "LEAVES:\n");
+    //    for (auto Leaf : CConv.Leaves) {
+    //      LLVM_DEBUG(dbgs() << Leaf->toString() << "\n");
+    //    }
     // check all the phis for reductions/inductions
-    DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>> RecDecs;
+    DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode *>> RecDecs;
     BasicBlock *Header = L->getHeader();
     for (auto &I : *Header) {
       if (auto *PN = dyn_cast<PHINode>(&I)) {
@@ -1054,13 +1147,15 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       if (RecDecs.count(LLVMLiveOut)) {
         RecurrenceDescriptor &RD = RecDecs[LLVMLiveOut].first;
         LLVMLiveOut = RecDecs[LLVMLiveOut].second;
-        LiveOutEnd = RD.getReductionOpChain(dyn_cast<PHINode>(LLVMLiveOut), L)[0];
+        LiveOutEnd =
+            RD.getReductionOpChain(dyn_cast<PHINode>(LLVMLiveOut), L)[0];
       }
       CConv.liveout = CConv.MakeTerm(LLVMLiveOut, Ins2Terms);
     } else // must be store
     {
       auto *Store = dyn_cast<StoreInst>(LLVMLiveOut);
-      auto *GEP = dyn_cast<GEPOperator>(Store->getPointerOperand()); // get the GEP
+      auto *GEP =
+          dyn_cast<GEPOperator>(Store->getPointerOperand()); // get the GEP
       LLVMLiveOut = GEP->getPointerOperand(); // then get the base ptr
       LiveOutEnd = Store;
       // make the GEP:
@@ -1069,22 +1164,21 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       CConv.liveout = &Ins2Terms[LLVMLiveOut];
     }
 
-
     // Now, have to define the sum function for any phis
     // let's use a generic version and store it in CConv
 
     // Then have to create the postcondition/invariant grammar:
     // INV GRAMMAR:
-    // start := {forall if eq is memory store} (and <cmp> <cmp> <eq>))
+    // start := (and <cmp> <cmp> <eq>))
     // cmp   := <expr> <= <expr>
     // expr  := lb | invariant | ub
-    // eq    := <single out> = <valid ops>
+    // eq    := {forall if eq is memory store} <single out> = <valid ops>
     // valid_ops :=
     //           | try to create sum from phi
     //           | + | - | * | ...
 
     // PC GRAMMAR:
-    // start := {forall if eq is memory store} (and <eq1> <eq2>)
+    // start :=  (and <eq1>  ({forall if eq is memory store} <eq2>))
     // eq1      := lb == ub
     // eq2      := eq {where all phis have exit val}
 
@@ -1098,7 +1192,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     CConv.indvar = CConv.MakeTerm(INDVAR, Ins2Terms);
 
     // translate the computation for the liveout
-    CVCConv::UFInfo liveout_compute_chain = CConv.MakeComputeChain(LiveOutEnd, L, Ins2Terms, RecDecs);
+    CVCConv::UFInfo liveout_compute_chain =
+        CConv.MakeComputeChain(LiveOutEnd, L, Ins2Terms, RecDecs);
     LLVM_DEBUG(dbgs() << "COMPUTE CHAIN:\n");
     LLVM_DEBUG(dbgs() << liveout_compute_chain.UF.toString() << "\n");
 
@@ -1109,7 +1204,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     // next, make the PC grammar
     Grammar pc_gram = CConv.MakePCGrammar(liveout_compute_chain);
 
-    std::vector<CVCConv::GrammarRecord> GR = {{inv_gram, "inv"}, {pc_gram, "pc"}};
+    std::vector<CVCConv::GrammarRecord> GR = {{inv_gram, "inv"},
+                                              {pc_gram, "pc"}};
     CConv.MakeSynthFuns(GR);
     CConv.MakeUniversalVars(GR);
     CConv.MakeSynthFunCalls();
