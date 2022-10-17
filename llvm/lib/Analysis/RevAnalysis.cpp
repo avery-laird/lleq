@@ -410,7 +410,7 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
 // after the mapping
 class CVCConv {
 public:
-  Solver &slv;
+  Solver slv;
   DenseMap<int, Sort> SpecialSorts;
   SmallSet<Term *, 16> Leaves;
   Term RoundingMode;
@@ -422,19 +422,29 @@ public:
   Term *ub;
   Term *indvar;
   Term *liveout;
+  Value *liveoutend;
   DenseMap<StringRef, Term> SynthFuns;
   DenseMap<Term *, Term> UniversalVars;
   DenseMap<StringRef, Term> SynthFunCalls;
+  Sort fpsort;
 
-  struct UFInfo {
+  class UFInfo {
+  public:
     std::vector<Term> BoundTerms;
     Term UF;
     std::vector<Value *> ArgVals;
+    UFInfo(std::vector<Term> BT, Term UF, std::vector<Value *> AV) : BoundTerms(BT), UF(UF), ArgVals(AV) {}
   };
 
-  CVCConv(Solver &slv) : slv(slv) {
+  CVCConv() {
+    slv.setOption("sygus", "true");
+    slv.setOption("incremental", "false");
+    slv.setOption("sygus-rec-fun", "true");
+    slv.setOption("fmf-fun", "true");
+    slv.setOption("output", "sygus");
+    fpsort = slv.mkFloatingPointSort(11, 53);
     // TODO assumes double, add float
-    SpecialSorts[Type::TypeID::DoubleTyID] = slv.mkFloatingPointSort(11, 53);
+    SpecialSorts[Type::TypeID::DoubleTyID] = fpsort;
     // TODO assume the same rounding mode for all operations
     RoundingMode = slv.mkRoundingMode(ROUND_NEAREST_TIES_TO_EVEN);
   };
@@ -797,8 +807,8 @@ public:
     }
   }
 
-  void MakeVerificationConditions(Loop *L, DenseMap<Value *, Term> &Env,
-                                  DenseMap<Loop *, Term> &Loop2PC) {
+  void MakeVerificationConditions(LoopNest *LN, Loop *L, DenseMap<Value *, Term> &Env,
+                                  DenseMap<Loop *, Term> &Loop2PC, DenseMap<Loop *, CVCConv*> &Loop2Converter) {
     // modify env to inject the universalvars where the previous values were
     // TODO clean up this whole pointers mess, we need a better way to test
     // equality
@@ -816,7 +826,7 @@ public:
     // sandbox everything in a totally new env
     for (auto *T : NonTerminals)
       SysEnv[Terms2Vals[T]] = UniversalVars[T];
-    ExecuteOneIteration(L, NewArgs, SysEnv);
+    ExecuteOneIteration(LN, L, NewArgs, SysEnv, Loop2PC, Loop2Converter);
     NewArgs.insert(NewArgs.begin(), SynthFuns["inv"]);
     LLVM_DEBUG(dbgs() << "NEW ARGS:\n");
     for (auto &A : NewArgs)
@@ -842,8 +852,8 @@ public:
     slv.printStatisticsSafe(fileno(stdout));
   }
 
-  void ExecuteOneIteration(Loop *L, std::vector<Term> &InvArgs,
-                           DenseMap<Value *, Term> &Env) {
+  void ExecuteOneIteration(LoopNest *LN, Loop *L, std::vector<Term> &InvArgs,
+                           DenseMap<Value *, Term> &Env, DenseMap<Loop *, Term> &Loop2PC, DenseMap<Loop *, CVCConv *> &Loop2Converter) {
     for (auto *NT : NonTerminals) {
       Term &UniVal = UniversalVars[NT];
       Value *V = Terms2Vals[NT];
@@ -858,10 +868,26 @@ public:
       }
       // otherwise, either Phi or load
       if (auto *PN = dyn_cast<PHINode>(V)) {
-        // for phi instructions, get the incoming (backedge) value
-        Value *NextIter = PN->getIncomingValueForBlock(L->getLoopLatch());
-        Term *NewVal = MakeTerm(NextIter, Env);
-        InvArgs.push_back(*NewVal);
+        if (PN->getParent() == L->getHeader()) {
+          // for phi instructions, get the incoming (backedge) value
+          Value *NextIter = PN->getIncomingValueForBlock(L->getLoopLatch());
+          Term *NewVal = MakeTerm(NextIter, Env);
+          InvArgs.push_back(*NewVal);
+        } else {
+          // Phi must be in separate latch block/somewhere else, and needs a value
+          // from the depth+1-th loop
+          // (1) find exit val for depth+1-th loop
+          auto *Inner = LN->getLoopsAtDepth(L->getLoopDepth()+1)[0];
+          CVCConv *InnerConv = Loop2Converter[Inner];
+          SmallVector<BasicBlock *> ExitBlocks;
+          Inner->getExitBlocks(ExitBlocks);
+          assert(ExitBlocks.size() == 1 && "only one liveout allowed");
+
+          // must be phi due to LCSSA form
+          PHINode *Incoming = dyn_cast<PHINode>(PN->getIncomingValueForBlock(ExitBlocks[0]));
+
+
+        }
       } else if (auto *Load = dyn_cast<LoadInst>(V)) {
         assert(0 && "loads not supported yet");
       } else {
@@ -1000,7 +1026,8 @@ public:
 
     Term sumpc = slv.mkTerm(APPLY_UF, Args);
     Term Eq1 = slv.mkTerm(EQUAL, {*indvar, *ub});
-    Term Eq2 = slv.mkTerm(FLOATINGPOINT_EQ, {*liveout, sumpc});
+    auto EqKind = liveout->getSort() == fpsort ? FLOATINGPOINT_EQ : EQUAL;
+    Term Eq2 = slv.mkTerm(EqKind, {*liveout, sumpc});
     Term AndPC = slv.mkTerm(AND, {Eq1, Eq2});
     // TODO make this general to handle non-sum cases
 
@@ -1091,6 +1118,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // TODO loop works for inner loop only right now, need to filter out the inner
   // loop BBs
   DenseMap<Loop *, Term> Loop2PC;
+  DenseMap<Loop *, CVCConv *> Loop2Converter;
+  DenseMap<CVCConv *, DenseMap<Value *, Term>> Ins2TermsMap;
+  DenseMap<Value *, Term> Ins2Terms;
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
     // get live ins and live outs
@@ -1102,20 +1132,17 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
     PHINode *IndVar = L->getInductionVariable(SE);
 
-    Solver slv;
-    CVCConv CConv(slv);
+//    Solver slv;
+    Loop2Converter[L] = new CVCConv;
+    CVCConv *CConv = Loop2Converter[L];
 
-    slv.setOption("sygus", "true");
-    slv.setOption("incremental", "false");
-    slv.setOption("sygus-rec-fun", "true");
-    slv.setOption("fmf-fun", "true");
-    slv.setOption("output", "sygus");
+//    Ins2TermsMap[CConv] = DenseMap<Value *, Term>();
 
     // Invariant inputs are just the induction var, lb, ub, + live ins
     //    SmallPtrSet<Value *, 6> InvariantInputs;
     //    InvariantInputs.insert(IndVar);
     //    InvariantInputs.insert(LiveIns.begin(), LiveIns.end());
-    DenseMap<Value *, Term> Ins2Terms;
+
     //    for (auto *V : InvariantInputs) {
     //      CConv.MakeTerm(V, Ins2Terms);
     //      LLVM_DEBUG(dbgs() << Ins2Terms[V].toString() << "\n");
@@ -1150,7 +1177,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         LiveOutEnd =
             RD.getReductionOpChain(dyn_cast<PHINode>(LLVMLiveOut), L)[0];
       }
-      CConv.liveout = CConv.MakeTerm(LLVMLiveOut, Ins2Terms);
+      CConv->liveout = CConv->MakeTerm(LLVMLiveOut, Ins2Terms);
     } else // must be store
     {
       auto *Store = dyn_cast<StoreInst>(LLVMLiveOut);
@@ -1159,10 +1186,11 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       LLVMLiveOut = GEP->getPointerOperand(); // then get the base ptr
       LiveOutEnd = Store;
       // make the GEP:
-      CConv.MakeTerm(GEP, Ins2Terms);
+      CConv->MakeTerm(GEP, Ins2Terms);
       // we only want the base
-      CConv.liveout = &Ins2Terms[LLVMLiveOut];
+      CConv->liveout = &Ins2Terms[LLVMLiveOut];
     }
+    CConv->liveoutend = LiveOutEnd;
 
     // Now, have to define the sum function for any phis
     // let's use a generic version and store it in CConv
@@ -1187,30 +1215,33 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     auto *UB = &Bounds->getFinalIVValue();
     auto *LB = &Bounds->getInitialIVValue();
     auto *INDVAR = L->getInductionVariable(SE);
-    CConv.ub = CConv.MakeTerm(UB, Ins2Terms);
-    CConv.lb = CConv.MakeTerm(LB, Ins2Terms);
-    CConv.indvar = CConv.MakeTerm(INDVAR, Ins2Terms);
+    CConv->ub = CConv->MakeTerm(UB, Ins2Terms);
+    CConv->lb = CConv->MakeTerm(LB, Ins2Terms);
+    CConv->indvar = CConv->MakeTerm(INDVAR, Ins2Terms);
 
     // translate the computation for the liveout
     CVCConv::UFInfo liveout_compute_chain =
-        CConv.MakeComputeChain(LiveOutEnd, L, Ins2Terms, RecDecs);
+        CConv->MakeComputeChain(LiveOutEnd, L, Ins2Terms, RecDecs);
     LLVM_DEBUG(dbgs() << "COMPUTE CHAIN:\n");
     LLVM_DEBUG(dbgs() << liveout_compute_chain.UF.toString() << "\n");
 
-    CConv.MakeNonTerminals(L, &SE, liveout_compute_chain, Ins2Terms);
+    CConv->MakeNonTerminals(L, &SE, liveout_compute_chain, Ins2Terms);
 
-    auto inv_gram = CConv.MakeInvGram(liveout_compute_chain);
+    auto inv_gram = CConv->MakeInvGram(liveout_compute_chain);
 
     // next, make the PC grammar
-    Grammar pc_gram = CConv.MakePCGrammar(liveout_compute_chain);
+    Grammar pc_gram = CConv->MakePCGrammar(liveout_compute_chain);
 
     std::vector<CVCConv::GrammarRecord> GR = {{inv_gram, "inv"},
                                               {pc_gram, "pc"}};
-    CConv.MakeSynthFuns(GR);
-    CConv.MakeUniversalVars(GR);
-    CConv.MakeSynthFunCalls();
-    CConv.MakeVerificationConditions(L, Ins2Terms, Loop2PC);
+    CConv->MakeSynthFuns(GR);
+    CConv->MakeUniversalVars(GR);
+    CConv->MakeSynthFunCalls();
+    CConv->MakeVerificationConditions(&LN, L, Ins2Terms, Loop2PC, Loop2Converter);
   }
+
+  for (auto C : Loop2Converter)
+    delete C.second;
 
   return PreservedAnalyses::all();
 
