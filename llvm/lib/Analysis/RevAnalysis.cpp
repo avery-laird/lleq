@@ -427,6 +427,11 @@ public:
   DenseMap<Term *, Term> UniversalVars;
   DenseMap<StringRef, Term> SynthFunCalls;
   Sort fpsort;
+  Term pc;
+  // TODO destroy this in CVCConv destructor
+  // this is really inefficient but DenseMap was mangling the stringrefs all the time,
+  // couldn't figure out why
+  std::vector<std::pair<std::string, Term>> PCRegister; // stores equality relationships from PC
 
   class UFInfo {
   public:
@@ -807,8 +812,7 @@ public:
     }
   }
 
-  void MakeVerificationConditions(LoopNest *LN, Loop *L, DenseMap<Value *, Term> &Env,
-                                  DenseMap<Loop *, Term> &Loop2PC, DenseMap<Loop *, CVCConv*> &Loop2Converter) {
+  void MakeVerificationConditions(LoopNest *LN, Loop *L, DenseMap<Value *, Term> &Env, DenseMap<Loop *, CVCConv*> &Loop2Converter) {
     // modify env to inject the universalvars where the previous values were
     // TODO clean up this whole pointers mess, we need a better way to test
     // equality
@@ -826,7 +830,7 @@ public:
     // sandbox everything in a totally new env
     for (auto *T : NonTerminals)
       SysEnv[Terms2Vals[T]] = UniversalVars[T];
-    ExecuteOneIteration(LN, L, NewArgs, SysEnv, Loop2PC, Loop2Converter);
+    ExecuteOneIteration(LN, L, NewArgs, SysEnv,Loop2Converter);
     NewArgs.insert(NewArgs.begin(), SynthFuns["inv"]);
     LLVM_DEBUG(dbgs() << "NEW ARGS:\n");
     for (auto &A : NewArgs)
@@ -843,17 +847,35 @@ public:
         IMPLIES, {slv.mkTerm(AND, {Invariant, Exit}), Postcondition}));
     SynthResult res = slv.checkSynth();
     if (res.hasSolution()) {
-      Loop2PC[L] = slv.getSynthSolution(SynthFuns["pc"]);
+      pc = slv.getSynthSolution(SynthFuns["pc"]);
       LLVM_DEBUG(dbgs() << "FOUND Postcondition:\n"
-                        << Loop2PC[L].toString() << "\n");
+                        << pc.toString() << "\n");
+      // also split all the equalities to a map, term* = term*
+      FindValFromPC();
     } else {
       LLVM_DEBUG(dbgs() << "no solution.\n");
     }
     slv.printStatisticsSafe(fileno(stdout));
   }
 
+  void FindValFromPC() {
+    std::function<void(Term&)> SearchTree;
+    SearchTree = [this, &SearchTree](Term &Node) -> void {
+      for (size_t i=0; i<Node.getNumChildren(); ++i) {
+        if (Node[i].getKind() == EQUAL || Node[i].getKind() == FLOATINGPOINT_EQ) {
+          assert(Node[i].getNumChildren() == 2 && "incorrect node type");
+          PCRegister.push_back({Node[i][0].toString(), Node[i][1]});
+        } else {
+          auto NextNode = Node[i];
+          SearchTree(NextNode);
+        }
+      }
+    };
+    SearchTree(pc);
+  }
+
   void ExecuteOneIteration(LoopNest *LN, Loop *L, std::vector<Term> &InvArgs,
-                           DenseMap<Value *, Term> &Env, DenseMap<Loop *, Term> &Loop2PC, DenseMap<Loop *, CVCConv *> &Loop2Converter) {
+                           DenseMap<Value *, Term> &Env, DenseMap<Loop *, CVCConv *> &Loop2Converter) {
     for (auto *NT : NonTerminals) {
       Term &UniVal = UniversalVars[NT];
       Value *V = Terms2Vals[NT];
@@ -886,7 +908,34 @@ public:
           // must be phi due to LCSSA form
           PHINode *Incoming = dyn_cast<PHINode>(PN->getIncomingValueForBlock(ExitBlocks[0]));
 
+          if (InnerConv->liveoutend == Incoming->getIncomingValue(0)) {
+            // (2) replace arg with matching PC of inner loop
+            Term EqualTo;
+            bool Found = false;
+            for (auto &P : InnerConv->PCRegister) {
+              if (P.first == InnerConv->liveout->toString()) {
+                EqualTo = P.second;
+                Found = true;
+                break;
+              }
+            }
+            assert(Found && "PC is missing from inner loop");
 
+            for (auto Elem : InnerConv->PCRegister)
+              LLVM_DEBUG(dbgs() << Elem.first << "\n" << Elem.second.toString() << "\n");
+            // (3) now have to convert all the parameters to the sygus vars
+            for (auto *NT2 : NonTerminals) {
+              Term &UV = UniversalVars[NT2];
+              EqualTo = EqualTo.substitute(*NT2, UV);
+            }
+            for (auto *NT2 : InnerConv->NonTerminals) {
+              Term &UV = InnerConv->UniversalVars[NT2];
+              EqualTo = EqualTo.substitute(*NT2, UV);
+            }
+            InvArgs.push_back(EqualTo);
+          } else {
+            assert(0 && "the phi instruction must match the inner loop PC");
+          }
         }
       } else if (auto *Load = dyn_cast<LoadInst>(V)) {
         assert(0 && "loads not supported yet");
@@ -1117,7 +1166,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   // TODO loop works for inner loop only right now, need to filter out the inner
   // loop BBs
-  DenseMap<Loop *, Term> Loop2PC;
+//  DenseMap<Loop *, Term> Loop2PC;
   DenseMap<Loop *, CVCConv *> Loop2Converter;
   DenseMap<CVCConv *, DenseMap<Value *, Term>> Ins2TermsMap;
   DenseMap<Value *, Term> Ins2Terms;
@@ -1237,7 +1286,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     CConv->MakeSynthFuns(GR);
     CConv->MakeUniversalVars(GR);
     CConv->MakeSynthFunCalls();
-    CConv->MakeVerificationConditions(&LN, L, Ins2Terms, Loop2PC, Loop2Converter);
+    CConv->MakeVerificationConditions(&LN, L, Ins2Terms,Loop2Converter);
   }
 
   for (auto C : Loop2Converter)
