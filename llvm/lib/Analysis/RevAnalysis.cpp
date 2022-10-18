@@ -433,7 +433,7 @@ public:
   // TODO destroy this in CVCConv destructor
   // this is really inefficient but DenseMap was mangling the stringrefs all the time,
   // couldn't figure out why
-  std::vector<std::pair<std::string, Term>> PCRegister; // stores equality relationships from PC
+  std::vector<std::pair<Term, Term>> PCRegister; // stores equality relationships from PC
 
   class UFInfo {
   public:
@@ -861,12 +861,15 @@ public:
   }
 
   void FindValFromPC() {
+    assert(PCRegister.size() == 0 && "should be empty");
     std::function<void(Term&)> SearchTree;
     SearchTree = [this, &SearchTree](Term &Node) -> void {
       for (size_t i=0; i<Node.getNumChildren(); ++i) {
-        if (Node[i].getKind() == EQUAL || Node[i].getKind() == FLOATINGPOINT_EQ) {
+        if ((Node[i].getKind() == EQUAL
+            || Node[i].getKind() == FLOATINGPOINT_EQ)
+            && Node[i][0] == *liveout) {
           assert(Node[i].getNumChildren() == 2 && "incorrect node type");
-          PCRegister.push_back({Node[i][0].toString(), Node[i][1]});
+          PCRegister.push_back({Node[i][0], Node[i][1]});
         } else {
           auto NextNode = Node[i];
           SearchTree(NextNode);
@@ -874,6 +877,7 @@ public:
       }
     };
     SearchTree(pc);
+    assert(PCRegister.size() == 1 && "only one value should be found");
   }
 
   void ExecuteOneIteration(LoopNest *LN, Loop *L, std::vector<Term> &InvArgs,
@@ -912,29 +916,29 @@ public:
 
           if (InnerConv->liveoutend == Incoming->getIncomingValue(0)) {
             // (2) replace arg with matching PC of inner loop
-            Term EqualTo;
-            bool Found = false;
-            for (auto &P : InnerConv->PCRegister) {
-              if (P.first == InnerConv->liveout->toString()) {
-                EqualTo = P.second;
-                Found = true;
-                break;
-              }
-            }
-            assert(Found && "PC is missing from inner loop");
-
-            for (auto Elem : InnerConv->PCRegister)
-              LLVM_DEBUG(dbgs() << Elem.first << "\n" << Elem.second.toString() << "\n");
-            // (3) now have to convert all the parameters to the sygus vars
-            for (auto *NT2 : NonTerminals) {
-              Term &UV = UniversalVars[NT2];
-              EqualTo = EqualTo.substitute(*NT2, UV);
-            }
-            for (auto *NT2 : InnerConv->NonTerminals) {
-              Term &UV = InnerConv->UniversalVars[NT2];
-              EqualTo = EqualTo.substitute(*NT2, UV);
-            }
-            InvArgs.push_back(EqualTo);
+//            Term EqualTo;
+//            bool Found = false;
+//            for (auto &P : InnerConv->PCRegister) {
+//              if (P.first == InnerConv->liveout->toString()) {
+//                EqualTo = P.second;
+//                Found = true;
+//                break;
+//              }
+//            }
+//            assert(Found && "PC is missing from inner loop");
+//
+//            for (auto Elem : InnerConv->PCRegister)
+//              LLVM_DEBUG(dbgs() << Elem.first << "\n" << Elem.second.toString() << "\n");
+//            // (3) now have to convert all the parameters to the sygus vars
+//            for (auto *NT2 : NonTerminals) {
+//              Term &UV = UniversalVars[NT2];
+//              EqualTo = EqualTo.substitute(*NT2, UV);
+//            }
+//            for (auto *NT2 : InnerConv->NonTerminals) {
+//              Term &UV = InnerConv->UniversalVars[NT2];
+//              EqualTo = EqualTo.substitute(*NT2, UV);
+//            }
+            InvArgs.push_back(*MakeTerm(PN, Env));
           } else {
             assert(0 && "the phi instruction must match the inner loop PC");
           }
@@ -1172,6 +1176,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   DenseMap<Loop *, CVCConv *> Loop2Converter;
   DenseMap<CVCConv *, DenseMap<Value *, Term>> Ins2TermsMap;
   DenseMap<Value *, Term> Ins2Terms;
+
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
     // get live ins and live outs
@@ -1298,6 +1303,33 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     CConv->MakeSynthFunCalls();
     CConv->MakeVerificationConditions(&LN, L, Ins2Terms,Loop2Converter);
   }
+
+  // make a forest of possible replacements
+  Term FinalPC;
+  for (int Depth = LN.getNestDepth()-1; Depth > 0; --Depth) {
+    Loop *Linner = LN.getLoopsAtDepth(Depth+1)[0];
+    auto *Cinner = Loop2Converter[Linner];
+    Loop *Louter = LN.getLoopsAtDepth(Depth)[0];
+    auto *Couter = Loop2Converter[Louter];
+    for (auto &P : Couter->PCRegister)
+      if (P.first == *Couter->liveout) {
+        FinalPC = P.second;
+        auto *Inst = dyn_cast<Instruction>(Couter->liveoutend);
+        SmallVector<BasicBlock*> ExitBlock;
+        Linner->getExitBlocks(ExitBlock);
+        for (auto &I : *ExitBlock[0]) {
+          auto *PN = dyn_cast<PHINode>(&I);
+          if (PN == nullptr || PN->getIncomingValue(0) != Cinner->liveoutend)
+            break;
+          for (auto *User : PN->users()) {
+            FinalPC = FinalPC.substitute(*Couter->MakeTerm(User, Ins2Terms), Cinner->PCRegister[0].second);
+          }
+        }
+        break;
+      }
+  }
+
+  LLVM_DEBUG(dbgs() << "Final PC: " << FinalPC.toString() << "\n");
 
   for (auto C : Loop2Converter)
     delete C.second;
