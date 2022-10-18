@@ -421,8 +421,10 @@ public:
   Term *lb;
   Term *ub;
   Term *indvar;
-  Term *liveout;
-  Value *liveoutend;
+
+  Term *liveout; // reduction phi in header section
+  Value *liveoutend;  // the end of reduction phi
+
   DenseMap<StringRef, Term> SynthFuns;
   DenseMap<Term *, Term> UniversalVars;
   DenseMap<StringRef, Term> SynthFunCalls;
@@ -1173,15 +1175,15 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
     // get live ins and live outs
-    SmallPtrSet<Value *, 4> LiveIns;
+//    SmallPtrSet<Value *, 4> LiveIns;
     SmallPtrSet<Value *, 4> LiveOuts;
-    GetLiveIns(L, LiveIns);
+//    GetLiveIns(L, LiveIns);
     GetLiveOuts(L, LiveOuts);
     assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
 
     PHINode *IndVar = L->getInductionVariable(SE);
-
-//    Solver slv;
+    LLVM_DEBUG(dbgs() << "Rev: Induction Variable is " << *IndVar << "\n");
+    //    Solver slv;
     Loop2Converter[L] = new CVCConv;
     CVCConv *CConv = Loop2Converter[L];
 
@@ -1208,6 +1210,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         RecurrenceDescriptor RecDec;
         if (RecurrenceDescriptor::isReductionPHI(PN, L, RecDec, &DB, &AC, &DT,
                                                  &SE)) {
+          LLVM_DEBUG(dbgs() << "Rev: Reduction Instruction is "
+                            << *(RecDec.getLoopExitInstr()) << "\n");
           RecDecs[RecDec.getLoopExitInstr()] = {RecDec, PN};
         }
       } else {
@@ -1217,6 +1221,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
     // Then also get the live out
     Value *LLVMLiveOut = (*LiveOuts.begin());
+    LLVM_DEBUG(dbgs() << "Rev: live out is " << *LLVMLiveOut << "\n");
     Value *LiveOutEnd = nullptr;
     if (isa<PHINode>(LLVMLiveOut)) {
       LLVMLiveOut = dyn_cast<PHINode>(LLVMLiveOut)->getOperand(0);
@@ -1240,6 +1245,11 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       CConv->liveout = &Ins2Terms[LLVMLiveOut];
     }
     CConv->liveoutend = LiveOutEnd;
+
+    LLVM_DEBUG(dbgs() << "Rev: live out is " << CConv->liveout->toString()
+                      << "\n");
+    LLVM_DEBUG(dbgs() << "Rev: live out end is " << *(CConv->liveoutend)
+                      << "\n");
 
     // Now, have to define the sum function for any phis
     // let's use a generic version and store it in CConv
