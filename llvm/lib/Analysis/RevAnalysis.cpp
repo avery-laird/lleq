@@ -410,7 +410,7 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
 // after the mapping
 class CVCConv {
 public:
-  Solver slv;
+  Solver &slv;
   DenseMap<int, Sort> SpecialSorts;
   SmallSet<Term *, 16> Leaves;
   Term RoundingMode;
@@ -441,12 +441,7 @@ public:
     UFInfo(std::vector<Term> BT, Term UF, std::vector<Value *> AV) : BoundTerms(BT), UF(UF), ArgVals(AV) {}
   };
 
-  CVCConv() {
-    slv.setOption("sygus", "true");
-    slv.setOption("incremental", "false");
-    slv.setOption("sygus-rec-fun", "true");
-    slv.setOption("fmf-fun", "true");
-    slv.setOption("output", "sygus");
+  CVCConv(Solver &slv) : slv(slv) {
     fpsort = slv.mkFloatingPointSort(11, 53);
     // TODO assumes double, add float
     SpecialSorts[Type::TypeID::DoubleTyID] = fpsort;
@@ -1170,6 +1165,12 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   DenseMap<Loop *, CVCConv *> Loop2Converter;
   DenseMap<CVCConv *, DenseMap<Value *, Term>> Ins2TermsMap;
   DenseMap<Value *, Term> Ins2Terms;
+  Solver slv;
+  slv.setOption("sygus", "true");
+  slv.setOption("incremental", "false");
+  slv.setOption("sygus-rec-fun", "true");
+  slv.setOption("fmf-fun", "true");
+  slv.setOption("output", "sygus");
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
     // get live ins and live outs
@@ -1182,7 +1183,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     PHINode *IndVar = L->getInductionVariable(SE);
 
 //    Solver slv;
-    Loop2Converter[L] = new CVCConv;
+    Loop2Converter[L] = new CVCConv(slv);
     CVCConv *CConv = Loop2Converter[L];
 
 //    Ins2TermsMap[CConv] = DenseMap<Value *, Term>();
@@ -1287,6 +1288,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     CConv->MakeUniversalVars(GR);
     CConv->MakeSynthFunCalls();
     CConv->MakeVerificationConditions(&LN, L, Ins2Terms,Loop2Converter);
+    CConv->slv.resetAssertions();
   }
 
   for (auto C : Loop2Converter)
