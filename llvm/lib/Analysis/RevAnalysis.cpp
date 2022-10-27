@@ -518,14 +518,16 @@ public:
   SmallSet<Term *, 16> Leaves;
   Term RoundingMode;
   std::vector<Term *> SumArgs;
-  std::vector<Term *> NonTerminals;
+  std::vector<Term *> Terminals;
   DenseMap<Term *, Value *> Terms2Vals;
   DenseMap<Term *, Value *> Uni2Vals;
   Term *lb;
   Term *ub;
   Term *indvar;
-  Term *liveout;
-  Value *liveoutend;
+
+  Term *liveout; // reduction phi in header section
+  Value *liveoutend;  // the end of reduction phi
+
   DenseMap<StringRef, Term> SynthFuns;
   DenseMap<Term *, Term> UniversalVars;
   DenseMap<StringRef, Term> SynthFunCalls;
@@ -894,7 +896,7 @@ public:
 
   void MakeSynthFuns(std::vector<GrammarRecord> &Grammars) {
     std::vector<Term> BoundVars;
-    for (auto *T : NonTerminals)
+    for (auto *T : Terminals)
       BoundVars.push_back(*T);
 
     for (auto GR : Grammars)
@@ -903,7 +905,7 @@ public:
   }
 
   void MakeUniversalVars(std::vector<GrammarRecord> &Grammars) {
-    for (auto *T : NonTerminals)
+    for (auto *T : Terminals)
       UniversalVars[T] =
           slv.declareSygusVar("sys_" + T->getSymbol(), T->getSort());
   }
@@ -911,7 +913,7 @@ public:
   void MakeSynthFunCalls() {
     for (auto Elem : SynthFuns) {
       std::vector<Term> Args = {Elem.second};
-      for (auto *T : NonTerminals)
+      for (auto *T : Terminals)
         Args.push_back(UniversalVars[T]);
       SynthFunCalls[Elem.first] = slv.mkTerm(APPLY_UF, Args);
     }
@@ -933,7 +935,7 @@ public:
     std::vector<Term> NewArgs;
     DenseMap<Value *, Term> SysEnv;
     // sandbox everything in a totally new env
-    for (auto *T : NonTerminals)
+    for (auto *T : Terminals)
       SysEnv[Terms2Vals[T]] = UniversalVars[T];
     ExecuteOneIteration(LN, L, NewArgs, SysEnv,Loop2Converter);
     NewArgs.insert(NewArgs.begin(), SynthFuns["inv"]);
@@ -987,7 +989,7 @@ public:
 
   void ExecuteOneIteration(LoopNest *LN, Loop *L, std::vector<Term> &InvArgs,
                            DenseMap<Value *, Term> &Env, DenseMap<Loop *, CVCConv *> &Loop2Converter) {
-    for (auto *NT : NonTerminals) {
+    for (auto *NT : Terminals) {
       Term &UniVal = UniversalVars[NT];
       Value *V = Terms2Vals[NT];
       //      if (V == nullptr) {
@@ -1056,7 +1058,7 @@ public:
     }
   }
 
-  void MakeNonTerminals(Loop *L, ScalarEvolution *SE, UFInfo &computechain,
+  void MakeTerminals(Loop *L, ScalarEvolution *SE, UFInfo &computechain,
                         DenseMap<Value *, Term> &Env) {
     SmallPtrSet<Term *, 8> NonTerms;
 
@@ -1097,13 +1099,13 @@ public:
 
     NonTerms.insert(liveout);
     for (auto *T : NonTerms)
-      NonTerminals.push_back(T);
+      Terminals.push_back(T);
 
     //    NonTerminals.push_back(indvar);
     //    for (auto *T : Leaves) NonTerminals.push_back(T);
 
     LLVM_DEBUG(dbgs() << "Created nonterminals:\n");
-    for (auto &T : NonTerminals)
+    for (auto &T : Terminals)
       LLVM_DEBUG(dbgs() << T->toString() << "\n");
 
     // create the reverse mapping
@@ -1136,7 +1138,7 @@ public:
     Term equal = slv.mkTerm(EqKind, {*liveout, ComputeChain});
 
     std::vector<Term> BoundVars;
-    for (auto *T : NonTerminals)
+    for (auto *T : Terminals)
       BoundVars.push_back(*T);
     Grammar inv_gram = slv.mkGrammar(BoundVars, {start, cmp, expr, eq});
 
@@ -1197,7 +1199,7 @@ public:
     //    Leaves2.push_back(indvar);
     //    for (auto T : Leaves) Leaves2.push_back(T);
     std::vector<Term> BoundVars;
-    for (auto *T : NonTerminals)
+    for (auto *T : Terminals)
       BoundVars.push_back(*T);
     Grammar pc_gram = slv.mkGrammar(BoundVars, {start_pc});
     pc_gram.addRules(start_pc, {AndPC});
@@ -1295,16 +1297,16 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
     // get live ins and live outs
-    SmallPtrSet<Value *, 4> LiveIns;
+//    SmallPtrSet<Value *, 4> LiveIns;
     SmallPtrSet<Value *, 4> LiveOuts;
-    GetLiveIns(L, LiveIns);
+//    GetLiveIns(L, LiveIns);
     GetLiveOuts(L, LiveOuts);
     assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
 
     PHINode *IndVar = L->getInductionVariable(SE);
-
-//    Solver slv;
-    Loop2Converter[L] = new CVCConv();
+    LLVM_DEBUG(dbgs() << "Rev: Induction Variable is " << *IndVar << "\n");
+    //    Solver slv;
+    Loop2Converter[L] = new CVCConv;
     CVCConv *CConv = Loop2Converter[L];
 
 //    Ins2TermsMap[CConv] = DenseMap<Value *, Term>();
@@ -1330,6 +1332,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         RecurrenceDescriptor RecDec;
         if (RecurrenceDescriptor::isReductionPHI(PN, L, RecDec, &DB, &AC, &DT,
                                                  &SE)) {
+          LLVM_DEBUG(dbgs() << "Rev: Reduction Instruction is "
+                            << *(RecDec.getLoopExitInstr()) << "\n");
           RecDecs[RecDec.getLoopExitInstr()] = {RecDec, PN};
         }
       } else {
@@ -1339,6 +1343,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
     // Then also get the live out
     Value *LLVMLiveOut = (*LiveOuts.begin());
+    LLVM_DEBUG(dbgs() << "Rev: live out is " << *LLVMLiveOut << "\n");
     Value *LiveOutEnd = nullptr;
     if (isa<PHINode>(LLVMLiveOut)) {
       LLVMLiveOut = dyn_cast<PHINode>(LLVMLiveOut)->getOperand(0);
@@ -1362,6 +1367,11 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       CConv->liveout = &Ins2Terms[LLVMLiveOut];
     }
     CConv->liveoutend = LiveOutEnd;
+
+    LLVM_DEBUG(dbgs() << "Rev: live out is " << CConv->liveout->toString()
+                      << "\n");
+    LLVM_DEBUG(dbgs() << "Rev: live out end is " << *(CConv->liveoutend)
+                      << "\n");
 
     // Now, have to define the sum function for any phis
     // let's use a generic version and store it in CConv
@@ -1396,7 +1406,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     LLVM_DEBUG(dbgs() << "COMPUTE CHAIN:\n");
     LLVM_DEBUG(dbgs() << liveout_compute_chain.UF.toString() << "\n");
 
-    CConv->MakeNonTerminals(L, &SE, liveout_compute_chain, Ins2Terms);
+    CConv->MakeTerminals(L, &SE, liveout_compute_chain, Ins2Terms);
 
     auto inv_gram = CConv->MakeInvGram(liveout_compute_chain);
 
