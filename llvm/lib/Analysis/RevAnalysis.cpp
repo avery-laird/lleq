@@ -16,6 +16,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <chrono>
 #include <cvc5/cvc5.h>
+#include <fstream>
 
 #define DEBUG_TYPE "rev-analysis"
 
@@ -218,6 +219,108 @@ bool RevAnalysisPass::LegalityAnalysis(Loop *TheLoop, LoopInfo *LI,
   // todo: check phi instructions and exclude the loops which we don't support
 
   return true;
+}
+
+static z3::sort CVCSort2Z3Sort(const Sort &s, context &c) {
+  if (s.isArray()) {
+    return c.array_sort(CVCSort2Z3Sort(s.getArrayIndexSort(), c), CVCSort2Z3Sort(s.getArrayElementSort(), c));
+  }
+  if (s.isInteger()) {
+    return c.int_sort();
+  }
+  if (s.isFloatingPoint()) {
+    return c.fpa_sort(s.getFloatingPointExponentSize(), s.getFloatingPointSignificandSize());
+  }
+  if (s.isFunction()) {
+
+  }
+  llvm_unreachable("unsupported sort");
+}
+
+class Z3Mapping {
+public:
+  context &c;
+  expr_vector Z3Symbols;
+  func_decl_vector Z3Functions;
+  std::map<std::string, int> SMapping;
+  std::map<std::string, int> FMapping;
+  Z3Mapping(context &c) : c(c), Z3Symbols(c), Z3Functions(c) {}
+  expr_vector &symbols() { return Z3Symbols; }
+  func_decl_vector &functions() { return Z3Functions; }
+  void MakeMaps() {
+    for (int i=0; i < Z3Symbols.size(); ++i)
+      SMapping[Z3Symbols[i].to_string()] = i;
+    for (int i=0; i < Z3Functions.size(); ++i)
+      FMapping[Z3Functions[i].name().str()] = i;
+  }
+  size_t count_sym(std::string s) { return SMapping.count(s); }
+  size_t count_f(std::string s) { return FMapping.count(s); }
+  expr get_sym(std::string s) { return Z3Symbols[SMapping[s]]; }
+  func_decl get_f(std::string s) { return Z3Functions[FMapping[s]]; }
+};
+// TODO: VERY MESSY BAD HACK!! this must be fixed FIRST once the demo is done
+static expr CVC2Z3(Z3Mapping &Mapping, context &c, const Term &InputTerm) {
+  auto Children = InputTerm.getNumChildren();
+  if (Children == 0) {
+    if (InputTerm.hasSymbol()) {
+      if (Mapping.count_sym(InputTerm.toString()))
+        return Mapping.get_sym(InputTerm.toString());
+      return c.constant(InputTerm.getSymbol().c_str(),
+                        CVCSort2Z3Sort(InputTerm.getSort(), c));
+    }
+    if (InputTerm.isFloatingPointValue()) {
+      std::bitset<64> fpval (std::get<2>(InputTerm.getFloatingPointValue()).getBitVectorValue());
+      return c.fpa_val((double)fpval.to_ullong());
+    }
+    if (InputTerm.isIntegerValue()) {
+      return c.int_val(InputTerm.getInt64Value());
+    }
+    if (InputTerm.isRoundingModeValue()) {
+      return c.fpa_rounding_mode();
+    }
+  }
+  // check root
+  if (!InputTerm.hasOp())
+    llvm_unreachable("the node needs an op");
+  expr_vector Z3Children(c);
+  // need to handle APPLY_UF specially
+  bool Skip = InputTerm.getOp().getKind() == APPLY_UF;
+  for (auto E : InputTerm) {
+    if (Skip) {
+      Skip = false;
+      continue;
+    }
+    Z3Children.push_back(CVC2Z3(Mapping, c, E));
+  }
+  switch (InputTerm.getOp().getKind()) {
+  case APPLY_UF:
+      // find definition
+      if (!Mapping.count_f(InputTerm[0].getSymbol()))
+        llvm_unreachable("must contain the definition");
+      return Mapping.get_f(InputTerm[0].getSymbol())(Z3Children);
+    break;
+  case ITE:
+    // three children, if - then - else
+    return ite(Z3Children[0], Z3Children[1], Z3Children[2]);
+  case LT:
+    return Z3Children[0] < Z3Children[1];
+  case SUB:
+    return Z3Children[0] - Z3Children[1];
+  case FLOATINGPOINT_ADD:
+    return Z3Children[1] + Z3Children[2];
+  case ADD:
+    return Z3Children[0] + Z3Children[1];
+  case SELECT:
+    return Z3Children[0][Z3Children[1]];
+  case FLOATINGPOINT_MULT:
+    return Z3Children[1] * Z3Children[2];
+  case MULT:
+    return Z3Children[0] * Z3Children[1];
+  case STORE:
+    return store(Z3Children[0], Z3Children[1], Z3Children[2]);
+  default:
+    llvm_unreachable("unhandled node kind");
+  }
 }
 
 class LiveInOut {
@@ -606,6 +709,7 @@ public:
   }
 
   UFInfo MakeComputeChain(
+      std::vector<std::tuple<Term, std::vector<Term>, Term>> &FunctionBodies,
       Value *V, Loop *L, DenseMap<Value *, Term> &Env,
       DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode *>> &RecDecs) {
     // Everything is uninterpreted functions.
@@ -692,6 +796,7 @@ public:
             TotalVars.insert(TotalVars.end(), SumArgsLocal.begin(),
                              SumArgsLocal.end());
             Term SumFunc = slv.defineFunRec(SumDec, TotalVars, SumBody);
+            FunctionBodies.push_back({SumFunc, TotalVars, SumBody});
             //            Leaves = LeavesBackup;
 
             //            // finally, specialize to the loop bounds
@@ -745,7 +850,7 @@ public:
       for (int i = 0; i < Store->getNumOperands(); ++i)
         FnVals.push_back(Store->getOperand(i));
 
-
+      FunctionBodies.push_back({FunDef, BoundVars, *Chain});
 //
 //      Term *ToEq = MakeTerm(Store->getValueOperand(), Env);
 //      // collect all the phis, these are args to the loop UF
@@ -852,6 +957,8 @@ public:
                         << pc.toString() << "\n");
       // also split all the equalities to a map, term* = term*
       FindValFromPC();
+      // PC register should have one entry
+      assert(PCRegister.size() == 1 && "expected one entry only");
     } else {
       LLVM_DEBUG(dbgs() << "no solution.\n");
     }
@@ -1103,6 +1210,15 @@ public:
   }
 };
 
+//class Compression {
+//  enum CType {
+//      DENSE,
+//      COMPRESSED
+//  };
+//  static isCompressed(Loop *L)
+//};
+
+
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
   errs() << F.getName() << "\n";
@@ -1142,8 +1258,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // live in/out: any scalars used outside the loop, or memory writes in the
   // loop
   LoopAnnotations Annotate;
-  context c;
-  Z3Converter Conv(&c);
+//  context c;
+//  Z3Converter Conv(&c);
   LoopNest LN(*LI.getTopLevelLoops()[0], SE);
   DenseMap<Value *, std::string> LiveOutMap;
 
@@ -1174,6 +1290,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   DenseMap<Loop *, CVCConv *> Loop2Converter;
   DenseMap<CVCConv *, DenseMap<Value *, Term>> Ins2TermsMap;
   DenseMap<Value *, Term> Ins2Terms;
+  std::vector<std::tuple<Term, std::vector<Term>, Term>> FunctionBodies;
 
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
@@ -1275,7 +1392,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
     // translate the computation for the liveout
     CVCConv::UFInfo liveout_compute_chain =
-        CConv->MakeComputeChain(LiveOutEnd, L, Ins2Terms, RecDecs);
+        CConv->MakeComputeChain(FunctionBodies, LiveOutEnd, L, Ins2Terms, RecDecs);
     LLVM_DEBUG(dbgs() << "COMPUTE CHAIN:\n");
     LLVM_DEBUG(dbgs() << liveout_compute_chain.UF.toString() << "\n");
 
@@ -1292,6 +1409,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     CConv->MakeUniversalVars(GR);
     CConv->MakeSynthFunCalls();
     CConv->MakeVerificationConditions(&LN, L, Ins2Terms,Loop2Converter);
+
+    // at this point, also need to figure out the mapping
+
   }
 
   // make a forest of possible replacements
@@ -1320,63 +1440,97 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   }
 
   LLVM_DEBUG(dbgs() << "Final PC: " << FinalPC.toString() << "\n");
+  // for now, just convert to z3
+  // build a symbol table
+  DenseMap<StringRef, Term> SymbolTable;
+  for (auto &P : FunctionBodies)
+    SymbolTable[std::get<0>(P).toString()] = std::get<2>(P);
+  context c;
+  // first convert all the functions
+  Z3Mapping Mapping(c);
+  for (auto &P : FunctionBodies) {
+    std::vector<z3::sort> Domain;
+    expr_vector &Args = Mapping.symbols();
+    for (auto &E : std::get<1>(P))
+      Domain.push_back(CVCSort2Z3Sort(E.getSort(), c));
+    for (auto &E : std::get<1>(P)) {
+      Args.push_back(CVC2Z3(Mapping, c, E));
+    }
+    z3::sort Range = CVCSort2Z3Sort(std::get<2>(P).getSort(), c);
+    // make the signature
+    Mapping.functions().push_back(c.recfun(
+        std::get<0>(P).toString().c_str(),
+        Domain.size(),
+        Domain.data(),
+        Range));
+    LLVM_DEBUG(dbgs() << Mapping.functions().back().to_string() << "\n");
+    Mapping.MakeMaps();
+    auto Body = CVC2Z3(Mapping, c, std::get<2>(P));
+    c.recdef(Mapping.functions().back(), Args, Body);
+    LLVM_DEBUG(dbgs() << Body.to_string() << "\n");
+  }
+
+  expr Z3PC = CVC2Z3(Mapping, c, FinalPC);
+  LLVM_DEBUG(dbgs() << Z3PC.to_string() << "\n");
 
   for (auto C : Loop2Converter)
     delete C.second;
 
+
+
   return PreservedAnalyses::all();
 
-  auto Depth = LN.getNestDepth();
-  for (; Depth > 0; --Depth) {
-    // first make partial Inv by equating all Phis
-    Loop *L = LN.getLoopsAtDepth(Depth)[0];
-    Optional<Loop::LoopBounds> Bounds = L->getBounds(SE);
-    for (auto &I : *L->getHeader()) {
-      auto *P = dyn_cast<PHINode>(&I);
-      if (P == nullptr)
-        break;
-      if (L->getInductionVariable(SE) == P) {
-        // Handle induction specially
-        //        Bounds->getInitialIVValue().printAsOperand(os);
-        auto lb = Conv.to_Z3(&Bounds->getInitialIVValue());
-        auto ub = Conv.to_Z3(&Bounds->getFinalIVValue());
-        auto indvar = Conv.to_Z3(P);
-        auto inv = (lb <= indvar) && (indvar <= ub);
-        //        Bounds->getFinalIVValue().printAsOperand(os);
-        Annotate.Loop2Inv[L].push_back(inv.to_string());
-        continue;
-      }
-      // otherwise, try to detect a recurrence
-      RecurrenceDescriptor Rec;
-      if (RecurrenceDescriptor::isReductionPHI(P, L, Rec, &DB, &AC, &DT, &SE)) {
-        // then describe in terms of the indvar and operation
-        auto *Result = Rec.getLoopExitInstr();
-        SmallVector<Instruction *> OpChain = Rec.getReductionOpChain(P, L);
-        // constraint: P == Result
-        //        expr Ps = c.real_const(P->getName().data());
-        //        expr Res = c.real_const(Result->getName().data());
-        std::string str;
-        std::string rstring;
-        raw_string_ostream resos(rstring);
-        raw_string_ostream os(str);
-        P->printAsOperand(os);
-        os << " == ";
-        resos << "Sum(";
-        Bounds->getInitialIVValue().printAsOperand(resos);
-        resos << ", " << L->getInductionVariable(SE)->getName() << " - 1, ";
-        OpChain[0]->print(resos);
-        resos << ")";
-        Annotate.Loop2Inv[L].push_back(str + rstring);
-        LiveOutMap[Result] = rstring;
-      } else {
-        // try another fallback method
-      }
-    }
-    LLVM_DEBUG(dbgs() << "Loop Invariants for " << L->getHeader()->getName()
-                      << "\n");
-    for (auto I : Annotate.Loop2Inv[L]) {
-      LLVM_DEBUG(dbgs() << "\t" << I << "\n");
-    }
+//  auto Depth = LN.getNestDepth();
+//  for (; Depth > 0; --Depth) {
+//    // first make partial Inv by equating all Phis
+//    Loop *L = LN.getLoopsAtDepth(Depth)[0];
+//    Optional<Loop::LoopBounds> Bounds = L->getBounds(SE);
+//    for (auto &I : *L->getHeader()) {
+//      auto *P = dyn_cast<PHINode>(&I);
+//      if (P == nullptr)
+//        break;
+//      if (L->getInductionVariable(SE) == P) {
+//        // Handle induction specially
+//        //        Bounds->getInitialIVValue().printAsOperand(os);
+//        auto lb = Conv.to_Z3(&Bounds->getInitialIVValue());
+//        auto ub = Conv.to_Z3(&Bounds->getFinalIVValue());
+//        auto indvar = Conv.to_Z3(P);
+//        auto inv = (lb <= indvar) && (indvar <= ub);
+//        //        Bounds->getFinalIVValue().printAsOperand(os);
+//        Annotate.Loop2Inv[L].push_back(inv.to_string());
+//        continue;
+//      }
+//      // otherwise, try to detect a recurrence
+//      RecurrenceDescriptor Rec;
+//      if (RecurrenceDescriptor::isReductionPHI(P, L, Rec, &DB, &AC, &DT, &SE)) {
+//        // then describe in terms of the indvar and operation
+//        auto *Result = Rec.getLoopExitInstr();
+//        SmallVector<Instruction *> OpChain = Rec.getReductionOpChain(P, L);
+//        // constraint: P == Result
+//        //        expr Ps = c.real_const(P->getName().data());
+//        //        expr Res = c.real_const(Result->getName().data());
+//        std::string str;
+//        std::string rstring;
+//        raw_string_ostream resos(rstring);
+//        raw_string_ostream os(str);
+//        P->printAsOperand(os);
+//        os << " == ";
+//        resos << "Sum(";
+//        Bounds->getInitialIVValue().printAsOperand(resos);
+//        resos << ", " << L->getInductionVariable(SE)->getName() << " - 1, ";
+//        OpChain[0]->print(resos);
+//        resos << ")";
+//        Annotate.Loop2Inv[L].push_back(str + rstring);
+//        LiveOutMap[Result] = rstring;
+//      } else {
+//        // try another fallback method
+//      }
+//    }
+//    LLVM_DEBUG(dbgs() << "Loop Invariants for " << L->getHeader()->getName()
+//                      << "\n");
+//    for (auto I : Annotate.Loop2Inv[L]) {
+//      LLVM_DEBUG(dbgs() << "\t" << I << "\n");
+//    }
 
     //    LiveInOut InOut(L);
     //    InOut.CollectLiveInOut();
@@ -1409,7 +1563,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     //        }
     //      }
     //    }
-  }
+//  }
   // next find the post condition for the outer loop
   LiveInOut InOut(&LN.getOutermostLoop());
   InOut.CollectLiveInOut();
