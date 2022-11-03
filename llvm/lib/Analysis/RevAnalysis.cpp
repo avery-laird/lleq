@@ -17,6 +17,8 @@
 #include <chrono>
 #include <cvc5/cvc5.h>
 #include <fstream>
+#include "llvm/IR/InstVisitor.h"
+#include "llvm/Analysis/Delinearization.h"
 
 #define DEBUG_TYPE "rev-analysis"
 
@@ -265,8 +267,11 @@ static expr CVC2Z3(Z3Mapping &Mapping, context &c, const Term &InputTerm) {
     if (InputTerm.hasSymbol()) {
       if (Mapping.count_sym(InputTerm.toString()))
         return Mapping.get_sym(InputTerm.toString());
-      return c.constant(InputTerm.getSymbol().c_str(),
+      expr constant =  c.constant(InputTerm.getSymbol().c_str(),
                         CVCSort2Z3Sort(InputTerm.getSort(), c));
+      LLVM_DEBUG(dbgs() << "CVC2Z3: add symbol " << InputTerm.getSymbol() << " to map\n");
+      Mapping.symbols().push_back(constant);
+      return Mapping.symbols().back();
     }
     if (InputTerm.isFloatingPointValue()) {
       std::bitset<64> fpval (std::get<2>(InputTerm.getFloatingPointValue()).getBitVectorValue());
@@ -1212,13 +1217,283 @@ public:
   }
 };
 
-//class Compression {
-//  enum CType {
-//      DENSE,
-//      COMPRESSED
-//  };
-//  static isCompressed(Loop *L)
-//};
+class Compression {
+public:
+  enum CType {
+    CRD,
+    POS,
+    VAL,
+    IGNORE,
+    UNKNOWN,
+  };
+
+  Value *Crd, *Pos, *Val;
+  std::vector<CType> CTypes;
+
+  Compression(Value *Crd, Value *Pos, Value *Val, std::vector<CType> CTypes)
+      : Crd(Crd), Pos(Pos), Val(Val), CTypes(CTypes) {};
+
+  static CType CompressionType(LLVMContext &C, Value *V) {
+    if (isa<Constant>(V))
+      return IGNORE;
+    if (isa<PHINode>(V))
+      return IGNORE;
+    Type *VType = V->getType();
+    if (VType == Type::getInt64Ty(C))
+      return IGNORE;
+    if (VType == Type::getInt32Ty(C))
+      return IGNORE;
+    return UNKNOWN;
+  }
+};
+
+
+class Dense {
+public:
+  context &c;
+
+  static func_decl Expand(context &c, expr &rptr, expr &col, expr &vals) {
+    std::vector<z3::sort> Domain = {c.int_sort(), c.int_sort()};
+    auto Range = c.fpa_sort(11, 53);
+    auto Expand = c.recfun("expand", Domain.size(), Domain.data(), Range);
+    expr_vector args(c);
+    auto Er = c.int_const("Er");
+    auto Ec = c.int_const("Ec");
+    args.push_back(Er);
+    args.push_back(Ec);
+    expr T = c.int_const("T");
+    c.recdef(Expand, args,
+             ite(
+                 exists(T, rptr[Er] <= T && T < rptr[Er + 1] && col[T] == Ec),
+                 c.fpa_val(1.0), c.fpa_val(0.0)));
+    return Expand;
+  }
+};
+
+class Tensor {
+  class Dim {
+    expr n;
+    expr m;
+    expr nnz;
+  };
+};
+
+
+struct DepChain {
+  Value *Root;
+  std::vector<DepChain> Children;
+};
+
+struct FindInputTensors : public InstVisitor<FindInputTensors, std::vector<DepChain>> {
+  using RetTy = std::vector<DepChain>;
+  SmallVector<Value *> InputTensors;
+  ScalarEvolution &SE;
+  LoopInfo *LI;
+  SmallVector<SmallVector<Value *>> DepStacks;
+  SmallPtrSet<Value *, 12> Visited;
+  DepChain DC;
+
+  FindInputTensors(ScalarEvolution &SE, LoopInfo *LI) : SE(SE), LI(LI) {};
+
+  RetTy visitLoadInst(LoadInst &LI) {
+    // find the GEP instruction:
+    GEPOperator *GEP = dyn_cast<GEPOperator>(getPointerOperand(&LI));
+    auto *Basepointer = GEP->getPointerOperand();
+    DepChain Current = {Basepointer, {}};
+    for (auto &Idx : GEP->indices()) {
+      auto NewChildren = visit(dyn_cast<Instruction>(&Idx));
+      Current.Children.insert(Current.Children.begin(), NewChildren.begin(), NewChildren.end());
+    }
+    return {Current};
+  }
+
+  RetTy visitStoreInst(StoreInst &SI) {
+    Value *Array = dyn_cast<GEPOperator>(SI.getPointerOperand())->getPointerOperand();
+    DepChain Chain = {Array, {}};
+    if (auto *Inst = dyn_cast<Instruction>(SI.getValueOperand())) {
+      auto Children = visit(Inst);
+      Chain.Children.insert(Chain.Children.begin(), Children.begin(), Children.end());
+    }
+    return {Chain};
+  }
+
+  RetTy visitInstruction(Instruction &I) {
+    if (Visited.contains(&I))
+      return {};
+    Visited.insert(&I);
+    RetTy ToReturn;
+    for (auto &Op : I.operands()) {
+      if (auto *Inst = dyn_cast<Instruction>(&Op)) {
+        auto Siblings = visit(Inst);
+        ToReturn.insert(ToReturn.begin(), Siblings.begin(), Siblings.end());
+      }
+    }
+    return ToReturn;
+  }
+
+  RetTy visitTopLevel(Instruction &I) {
+    auto Chain = visit(I);
+    assert(Chain.size() == 1 && "only one liveout supported right now");
+    DC = Chain[0];
+    return Chain;
+  }
+  void visitTopLevel(Instruction *I) { visitTopLevel(*I); }
+
+  void ConstructDenseTensors(Z3Mapping &M, context &c, DenseMap<Value *, Term> &Ins2Terms, Term *LiveOut, expr &FinalPC) {
+    // DepStacks tells us what arrays need to be tested
+    // all heads of the list are val arrays (store some computation value)
+    // the remaining elements are coordinate arrays (store some index)
+    // any expansion function needs some coord arrays and some val arrays
+    // a val array might store more coordinates in higher order tensors
+    auto YSparse = CVC2Z3(M, c, *LiveOut);
+    // make up a dense version
+    auto YDense = c.constant((YSparse.to_string() + "_dense").data(), YSparse.get_sort());
+    auto Em = c.int_const("M");
+    enum CType {
+      DENSE, COMPRESSED
+    };
+    SmallPtrSet<Value *, 10> ValArrays;
+    SmallPtrSet<Value *, 10> CrdArrays;
+    for (auto &E : DepStacks) {
+      ValArrays.insert(E[0]);
+      for (int i=1; i < E.size(); ++i) {
+        CrdArrays.insert(E[i]);
+      }
+    }
+    // TODO just choose the right permutation for now, later we have to search
+    DenseMap<unsigned, CType> CMap;
+    auto Rptr = CVC2Z3(M, c, Ins2Terms[DC.Children[1].Children[0].Root]);
+    auto Col = CVC2Z3(M, c, Ins2Terms[DC.Children[0].Children[0].Root]);
+    auto Vals = CVC2Z3(M, c, Ins2Terms[DC.Children[1].Root]);
+    func_decl expand = Dense::Expand(c, Rptr, Col, Vals);
+    // TODO we'll have a list of kernels later, for now we just support GEMV
+
+
+    std::vector<z3::sort> Domain = {c.int_sort(), c.int_sort()};
+    auto SumDense = c.recfun("SumDense", Domain.size(), Domain.data(), c.fpa_sort(11, 53));
+    auto Indvar = c.int_const("indvar");
+    auto UB = c.int_const("UB");
+    expr_vector Args(c);
+    Args.push_back(Indvar);
+    Args.push_back(UB);
+    c.recdef(SumDense, Args,
+             ite(
+                 UB < 0, c.fpa_val(0.0),
+                 SumDense(Indvar, UB-1) + expand(Indvar, UB) * Vals[Indvar]
+                 ));
+    // now make the gemv
+    std::vector<z3::sort> GArgs = {c.int_sort(), c.int_sort()};
+    auto GEMV = c.recfun("GEMV", GArgs.size(), GArgs.data(), c.array_sort(c.int_sort(), c.fpa_sort(11, 53)));
+    expr_vector EArgs(c);
+    EArgs.push_back(UB);
+    c.recdef(GEMV, EArgs,
+             ite(
+                 UB < 0,
+                 YDense,
+                 store(GEMV(0, UB-1), UB, SumDense(UB, Em-1))
+                 ));
+
+    // make problem bounds
+    auto N = CVC2Z3(M, c, Ins2Terms[&(LI->getTopLevelLoops()[0]->getBounds(SE)->getFinalIVValue())]);
+    auto NNZ = c.int_const("NNZ");
+    auto S = c.int_const("S"); // quantified var
+    auto T = c.int_const("T"); // quantified var
+    // add constraints
+    // (1) monotonic
+    auto Monotonic = forall(S, implies(0 <= S && S <= NNZ, Rptr[S] <= Rptr[S+1] && Rptr[S] >= 0));
+    auto PMonotonic = forall(S, implies(0 <= S && S < N, forall(T, implies(Rptr[S] <= T && T < Rptr[S+1], Col[T] < Col[T+1]))));
+    // (3) extra
+    auto CBounds = forall(S, implies(0 <= S && S < NNZ, Col[S] >= 0 && Col[S] < Em));
+    auto ValConstraint = forall(S, implies(0 <= S && S < NNZ, Vals[S] == 1.0));
+    auto RptrConstraint1 = Rptr[c.int_val(0)] == 0;
+    auto RptrConstraint2 = Rptr[N] == NNZ;
+    auto NNZConstraint = NNZ <= N*Em;
+
+    solver s(c);
+    s.add(N > 0);
+    s.add(Em > 0);
+    s.add(NNZ > 0);
+    s.add(Monotonic);
+    s.add(PMonotonic);
+    s.add(CBounds);
+    s.add(ValConstraint);
+    s.add(RptrConstraint1);
+    s.add(RptrConstraint2);
+    s.add(NNZConstraint);
+    s.add(YDense == YSparse);
+    s.add(GEMV(0, N-1) != FinalPC);
+
+    LLVM_DEBUG(dbgs() << FinalPC.get_sort().to_string() << "\n");
+
+    check_result result = s.check();
+    if (result == unsat) {
+      LLVM_DEBUG(dbgs() << "no counterexample\n");
+    } else {
+      LLVM_DEBUG({
+          dbgs() << "counterexample:\n";
+          dbgs() << s.get_model().to_string() << "\n";
+      });
+    }
+
+
+//    while (true) {
+//      WorkList = Permutation;
+//      DenseMap<unsigned, CType> CMap;
+//      while (!WorkList.empty()) {
+//        // compressed takes one val array, two coord arrays
+//        // dense takes one val array, and a possible coord array
+//        // TODO make these into classes, for now just hardcoded
+//        unsigned idx = WorkList.pop_back_val();
+//        auto &DepChain = DepStacks[idx];
+//        if (DepChain.size() != 3)
+//          CMap[idx] = DENSE;
+//        else
+//          CMap[idx] = COMPRESSED;
+//      }
+//      // now, the depchain arrays can be any permutation of crd or pos
+//
+////      for (auto &E : CMap) {
+////        std::vector<unsigned> IdxPermutation;
+////        for (unsigned i=1; i < DepStacks[E.first].size(); ++i) IdxPermutation.push_back(i);
+////        while (true) {
+////          switch (E.second) {
+////          case DENSE:
+////
+////          }
+////          if (!std::next_permutation(IdxPermutation.begin(), IdxPermutation.end()))
+////            break;
+////        }
+////      }
+//      if (!std::next_permutation(Permutation.begin(), Permutation.end()))
+//        break;
+//    }
+
+  }
+
+};
+
+
+
+raw_ostream &operator<<(raw_ostream &OS, const Compression::CType &c) {
+  switch (c) {
+  case Compression::IGNORE:
+    OS << "-";
+    break;
+  case Compression::CRD:
+    OS << "CRD";
+    break;
+  case Compression::POS:
+    OS << "POS";
+    break;
+  case Compression::VAL:
+    OS << "VAL";
+    break;
+  case Compression::UNKNOWN:
+    OS << "?";
+    break;
+  }
+  return OS;
+}
 
 
 PreservedAnalyses RevAnalysisPass::run(Function &F,
@@ -1458,6 +1733,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   context c;
   // first convert all the functions
   Z3Mapping Mapping(c);
+  // TODO this will need to be split into two loops,
+  // first make all symbols, then make maps, then make all functions
   for (auto &P : FunctionBodies) {
     std::vector<z3::sort> Domain;
     expr_vector &Args = Mapping.symbols();
@@ -1482,6 +1759,47 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   expr Z3PC = CVC2Z3(Mapping, c, FinalPC);
   LLVM_DEBUG(dbgs() << Z3PC.to_string() << "\n");
+
+  LLVM_DEBUG(dbgs() << "----------\nMAPPING START\n----------\n");
+
+  auto *ConvOuter = Loop2Converter[&LN.getOutermostLoop()];
+  auto *FinalLiveOut = dyn_cast<Instruction>(ConvOuter->liveoutend);
+
+  // try to inspect arrays
+  FindInputTensors FT(SE, &LI);
+  FT.visitTopLevel(FinalLiveOut);
+  FT.ConstructDenseTensors(Mapping, c, Ins2Terms, ConvOuter->liveout, Z3PC);
+
+  // now figure out the mapping for each liveout
+//  for (int Depth=LN.getNestDepth(); Depth > 0; --Depth) {
+//    Loop *L = LN.getLoopsAtDepth(Depth)[0];
+//    auto &Conv = Loop2Converter[L];
+//    Instruction *LO = dyn_cast<Instruction>(Conv->liveoutend);
+//    DenseMap<Value *, Compression::CType> CMap;
+//    for (auto *T : Conv->Terminals) {
+//      LLVM_DEBUG(dbgs() << T->toString() << " -> ?\n");
+//    }
+//
+//    // after trivial analysis:
+//    for (auto *T : Conv->Terminals) {
+//      Value *V = Conv->Terms2Vals[T];
+//      CMap[V] = Compression::CompressionType(C, V);
+//
+//    }
+//
+//    LLVM_DEBUG(dbgs() << "----------\nAfter IR analysis Pass #1\n");
+//    for (auto *T : Conv->Terminals) {
+//      LLVM_DEBUG(dbgs() << T->toString() << " -> " << CMap[Conv->Terms2Vals[T]] << "\n");
+//    }
+//    LLVM_DEBUG(dbgs() << "----------\n");
+//
+//    // filter out ignored vals
+//    expr_vector ArgVals(c);
+//    for (auto &E : CMap) {
+//      if (E.second == Compression::CType::UNKNOWN)
+//        ArgVals.push_back(CVC2Z3(Mapping, c, Ins2Terms[E.first]));
+//    }
+//  }
 
   for (auto C : Loop2Converter)
     delete C.second;
