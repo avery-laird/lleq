@@ -634,6 +634,10 @@ public:
         return &(Env[V] =
                      slv.mkTerm(ADD, {*MakeTerm(BinOp->getOperand(0), Env),
                                       *MakeTerm(BinOp->getOperand(1), Env)}));
+      case BinaryOperator::BinaryOps::Mul:
+        return &(Env[V] =
+                     slv.mkTerm(MULT, {*MakeTerm(BinOp->getOperand(0), Env),
+                                      *MakeTerm(BinOp->getOperand(1), Env)}));
       default:
         assert(0 && "unsupported binop type.");
         break;
@@ -693,6 +697,10 @@ public:
         RetrieveLeaves(BinOp->getOperand(0), Env, LocalLeaves);
         RetrieveLeaves(BinOp->getOperand(1), Env, LocalLeaves);
         break;
+      case BinaryOperator::BinaryOps::Mul:
+        RetrieveLeaves(BinOp->getOperand(0), Env, LocalLeaves);
+        RetrieveLeaves(BinOp->getOperand(1), Env, LocalLeaves);
+        break;
       default:
         assert(0 && "unsupported binop type.");
         break;
@@ -709,7 +717,16 @@ public:
         break;
       }
       return;
+    }else if(auto *CI = dyn_cast<CallInst>(V)){
+      auto *F = CI->getCalledFunction();
+      if(F && F->getIntrinsicID() == Intrinsic::fmuladd){
+        RetrieveLeaves(CI->getOperand(0), Env, LocalLeaves);
+        RetrieveLeaves(CI->getOperand(1), Env, LocalLeaves);
+        RetrieveLeaves(CI->getOperand(2), Env, LocalLeaves);
+      }
+      return;
     }
+
 
     assert(0 && ("unsupported value " + V->getNameOrAsOperand()).data());
     return;
@@ -829,8 +846,11 @@ public:
           } else {
             assert(0 && "arbitrary function calls are not supported");
           }
+        } else {
+          assert(0 && "reduction is not in intrinsic function");
         }
       } else {
+        assert(0 && "reduction with chain>1");
       }
     } else if (auto *Store = dyn_cast<StoreInst>(V)) {
       // calculate compute chain for a store.
@@ -838,6 +858,9 @@ public:
       // if so, it is the PC for that loop.
       Term *Chain = MakeTerm(Store, Env); // (STORE base offset val)
       Term Probe = slv.mkTerm(SELECT, {Chain->operator[](0), Chain->operator[](1)});
+      LLVM_DEBUG(dbgs() << "Rev: Chain is " << Chain->toString() << "\n");
+
+      LLVM_DEBUG(dbgs() << "Rev: Probe is " << Probe.toString() << "\n");
       SmallPtrSet<Term *, 8> LLeaves;
       RetrieveLeaves(Store, Env, LLeaves);
       SumArgs.insert(SumArgs.begin(), LLeaves.begin(), LLeaves.end());
@@ -1623,10 +1646,14 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     if (isa<PHINode>(LLVMLiveOut)) {
       LLVMLiveOut = dyn_cast<PHINode>(LLVMLiveOut)->getOperand(0);
       if (RecDecs.count(LLVMLiveOut)) {
+        // TODO: here there is one assumption about reduction, all the
+        // computation are performed using one single instruction
         RecurrenceDescriptor &RD = RecDecs[LLVMLiveOut].first;
         LLVMLiveOut = RecDecs[LLVMLiveOut].second;
         LiveOutEnd =
             RD.getReductionOpChain(dyn_cast<PHINode>(LLVMLiveOut), L)[0];
+
+        LLVM_DEBUG(dbgs() << "Rev: LiveOutEnd is " << *LiveOutEnd << "\n");
       }
       CConv->liveout = CConv->MakeTerm(LLVMLiveOut, Ins2Terms);
     } else // must be store
