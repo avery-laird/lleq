@@ -1,5 +1,6 @@
 #include "llvm/Analysis/RevAnalysis.h"
 #include "z3++.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/Analysis/AliasAnalysis.h"
@@ -558,7 +559,7 @@ protected:
 
   virtual unsigned count(Value *V) = 0;
   virtual ExprTy get(Value *V) = 0;
-  virtual ExprTy set(Value *V, ExprTy) = 0;
+  virtual ExprTy set(Value *V, const ExprTy &) = 0;
 
   ExprTy FromVal(Value *V) {
     if (count(V))
@@ -611,13 +612,21 @@ protected:
   virtual ExprTy FromCmpInst(CmpInst *V) = 0;
   virtual ExprTy FromCallInst(CallInst *V) = 0;
 
-  virtual SortTy ToSort(Type *T) const = 0;
+  virtual SortTy ToSort(Type *T) = 0;
 };
 
 class MakeZ3 : public MakeSMT<expr, z3::sort> {
-
-  context &c;
+public:
   MakeZ3(TerminalMap &Map, context &c) : MakeSMT(Map), c(c) {}
+
+protected:
+  context &c;
+
+  unsigned count(Value *V) override { return Map.countZ3(V); }
+
+  expr get(Value *V) override { return Map.getZ3(V); }
+
+  expr set(Value *V, const expr &Expr) override { return Map.setZ3(V, Expr); }
 
   expr FromConst(Constant *V) override {
     switch (V->getType()->getTypeID()) {
@@ -700,14 +709,28 @@ class MakeZ3 : public MakeSMT<expr, z3::sort> {
     return {Base, Offset};
   }
 
+  expr FromPHIorArg(Value *V) {
+    return c.constant(V->getNameOrAsOperand().c_str(), ToSort(V->getType()));
+  }
+
+  z3::sort ToSort(Type *T) {
+    switch(T->getTypeID()) {
+    case Type::TypeID::IntegerTyID:
+      return c.int_sort();
+    case Type::TypeID::DoubleTyID:
+      unsigned Mantissa = APFloat::semanticsPrecision(T->getFltSemantics());
+      unsigned Exponent = APFloat::semanticsSizeInBits(T->getFltSemantics()) - Mantissa;
+      return c.fpa_sort(Exponent, Mantissa);
+    }
+  }
 };
 
-template<typename BackendT>
+template<typename ExprTy>
 class VerificationConditions {
 public:
   VerificationConditions(Loop *L, Value *LiveOut) : L(L), LiveOut(LiveOut) {}
 
-  BackendT MakeInvariant() {
+  ExprTy MakeInvariant() {
     // (1) trace compute chain
   }
 private:
@@ -1774,7 +1797,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     auto *LiveOut = (*LiveOuts.begin());
 
     // (3) Try to make the VCs from the live out
-
+    TerminalMap Map(c);
+    MakeZ3 Converter(Map, c);
 
 
 
