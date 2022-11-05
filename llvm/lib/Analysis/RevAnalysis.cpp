@@ -523,6 +523,19 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
 class TerminalMap {
 public:
   TerminalMap(context &c) : c(c), Z3Symbols(c) {}
+
+  expr setZ3(Value *V, expr const& Expr) {
+    Z3Symbols.push_back(Expr);
+    Z3Map[V] = Z3Symbols.size()-1;
+    return getZ3(V);
+  }
+
+  expr getZ3(Value *V) { return Z3Symbols[Z3Map[V]]; }
+
+  bool countZ3(Value *V) { return Z3Map.count(V); }
+
+  context &ctxt() { return c; }
+
 private:
   context &c;
   expr_vector Z3Symbols;
@@ -531,11 +544,175 @@ private:
   DenseMap<Value *, int> CVC5Map;
 };
 
-class Terminal {
+template<typename ExprTy, typename SortTy>
+class MakeSMT {
 public:
-  Terminal(Value *V) : V(V) {}
+  MakeSMT(TerminalMap &Map) : Map(Map) {}
+
+protected:
+  TerminalMap &Map;
+  struct GEPTy {
+    ExprTy Base;
+    ExprTy Offset;
+  };
+
+  virtual unsigned count(Value *V) = 0;
+  virtual ExprTy get(Value *V) = 0;
+  virtual ExprTy set(Value *V, ExprTy) = 0;
+
+  ExprTy FromVal(Value *V) {
+    if (count(V))
+      return get(V);
+    // either a constant, or an instruction.
+    auto Dispatch = [&](Value *V) {
+      if (auto *Const = dyn_cast<Constant>(V))
+        return FromConst(Const);
+      if (isa<Argument>(V))
+        return FromPHIorArg(V);
+
+      Instruction *I = dyn_cast<Instruction>(V);
+      if (I == nullptr)
+        llvm_unreachable("unsupported value type.");
+
+      switch (I->getOpcode()) {
+      case Instruction::Load:
+      case Instruction::Store:
+        return FromLoadStore(I);
+      case Instruction::PHI:
+        return FromPHIorArg(I);
+      case Instruction::FCmp:
+      case Instruction::ICmp:
+        return FromCmpInst(static_cast<CmpInst*>(I));
+      case Instruction::Call:
+        return FromCallInst(static_cast<CallInst*>(I));
+
+#define HANDLE_CAST_INST(NUM, OPCODE, CLASS) \
+    case Instruction::OPCODE: \
+      return FromCastInst(static_cast<CastInst*>(I));
+#define HANDLE_BINARY_INST(NUM, OPCODE, CLASS) \
+    case Instruction::OPCODE: \
+      return FromBinOp(static_cast<BinaryOperator*>(I));
+#include "llvm/IR/Instruction.def"
+
+      default:
+        llvm_unreachable("unsupported opcode.");
+      }
+    };
+
+    return set(V, Dispatch(V));
+  }
+
+  virtual ExprTy FromConst(Constant *V) = 0;
+  virtual ExprTy FromLoadStore(Value *V) = 0;
+  virtual GEPTy FromGEP(GEPOperator *V) = 0;
+  virtual ExprTy FromCastInst(CastInst *V) = 0;
+  virtual ExprTy FromPHIorArg(Value *V) = 0;
+  virtual ExprTy FromBinOp(BinaryOperator *V) = 0;
+  virtual ExprTy FromCmpInst(CmpInst *V) = 0;
+  virtual ExprTy FromCallInst(CallInst *V) = 0;
+
+  virtual SortTy ToSort(Type *T) const = 0;
+};
+
+class MakeZ3 : public MakeSMT<expr, z3::sort> {
+
+  context &c;
+  MakeZ3(TerminalMap &Map, context &c) : MakeSMT(Map), c(c) {}
+
+  expr FromConst(Constant *V) override {
+    switch (V->getType()->getTypeID()) {
+    case Type::TypeID::IntegerTyID:
+      return c.int_val(dyn_cast<ConstantInt>(V)->getSExtValue());
+    case Type::TypeID::DoubleTyID:
+      return c.fpa_val(dyn_cast<ConstantFP>(V)->getValue().convertToDouble());
+    default:
+      llvm_unreachable("unsupported constant type");
+    }
+  }
+
+  expr FromLoadStore(Value *V) override {
+    auto *GEP = dyn_cast<GEPOperator>(getLoadStorePointerOperand(V));
+    // eg. y[i]
+    GEPTy ArrayAddr = FromGEP(GEP); // (tuple base offset)
+    // if store, y[i] = ...  (store)
+    // if load %0 = y[i]     (select)
+    expr Expr(c);
+    if (auto *Store = dyn_cast<StoreInst>(V))
+      return store(
+          ArrayAddr.Base,
+          ArrayAddr.Offset,
+          FromVal(Store->getValueOperand()));
+    return ArrayAddr.Base[ArrayAddr.Offset];
+  }
+
+  expr FromCastInst(CastInst *C) override { return FromVal(C->getOperand(0)); }
+
+  expr FromBinOp(BinaryOperator *BinOp) override {
+    auto Left = FromVal(BinOp->getOperand(0));
+    auto Right = FromVal(BinOp->getOperand(0));
+    switch (BinOp->getOpcode()) {
+    case BinaryOperator::BinaryOps::Add:
+      return Left + Right;
+    case BinaryOperator::BinaryOps::Mul:
+      return Left * Right;
+    default:
+      llvm_unreachable("unsupported binop type.");
+    }
+  }
+
+  expr FromCmpInst(CmpInst *Cmp) override {
+    auto Left = FromVal(Cmp->getOperand(0));
+    auto Right = FromVal(Cmp->getOperand(0));
+    switch (Cmp->getPredicate()) {
+    case CmpInst::ICMP_SLT:
+      return Left < Right;
+    default:
+      llvm_unreachable("unsupported predicate type.");
+    }
+  }
+
+  expr FromCallInst(CallInst *CI) override {
+    auto *F = CI->getCalledFunction();
+    if (F && F->getIntrinsicID() == Intrinsic::fmuladd) {
+      // a*b + c
+      expr A = FromVal(CI->getOperand(0));
+      expr B = FromVal(CI->getOperand(1));
+      expr C = FromVal(CI->getOperand(2));
+      return A * B + C;
+    }
+    llvm_unreachable("arbitrary functions aren't supported.");
+  }
+
+  GEPTy FromGEP(GEPOperator *GEP) override {
+    assert(GEP->getNumIndices() == 1);
+    // make the array if it doesn't exist
+    if (!count(GEP->getPointerOperand())) {
+      // TODO assume 1d memory accesses
+      z3::sort ArraySort = c.array_sort(
+          ToSort(GEP->getOperand(1)->getType()),
+          ToSort(GEP->getResultElementType()));
+      set(
+          GEP->getPointerOperand(),
+          c.constant(GEP->getPointerOperand()->getName().data(), ArraySort));
+    }
+    expr Base = get(GEP->getPointerOperand());
+    expr Offset = FromVal(GEP->getOperand(1));
+    return {Base, Offset};
+  }
+
+};
+
+template<typename BackendT>
+class VerificationConditions {
+public:
+  VerificationConditions(Loop *L, Value *LiveOut) : L(L), LiveOut(LiveOut) {}
+
+  BackendT MakeInvariant() {
+    // (1) trace compute chain
+  }
 private:
-  Value *V;
+  Loop *L;
+  Value *LiveOut;
 };
 
 class CVCConv {
@@ -1563,28 +1740,18 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // TODO loop works for inner loop only right now, need to filter out the inner
   // loop BBs
 //  DenseMap<Loop *, Term> Loop2PC;
+  context c;
   DenseMap<Loop *, CVCConv *> Loop2Converter;
   DenseMap<CVCConv *, DenseMap<Value *, Term>> Ins2TermsMap;
   DenseMap<Value *, Term> Ins2Terms;
   std::vector<std::tuple<Term, std::vector<Term>, Term>> FunctionBodies;
+  TerminalMap TMap(c);
 
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
-    // get live ins and live outs
-//    SmallPtrSet<Value *, 4> LiveIns;
-    SmallPtrSet<Value *, 4> LiveOuts;
-//    GetLiveIns(L, LiveIns);
-    GetLiveOuts(L, LiveOuts);
-    assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
 
-    PHINode *IndVar = L->getInductionVariable(SE);
-    LLVM_DEBUG(dbgs() << "Rev: Induction Variable is " << *IndVar << "\n");
-    //    Solver slv;
-    Loop2Converter[L] = new CVCConv;
-    CVCConv *CConv = Loop2Converter[L];
-
-    // check all the phis for reductions/inductions
-    DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode *>> RecDecs;
+    // (1) check all the phis for reductions/inductions
+    DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>> RecDecs;
     BasicBlock *Header = L->getHeader();
     for (auto &I : *Header) {
       if (auto *PN = dyn_cast<PHINode>(&I)) {
@@ -1599,6 +1766,26 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         break;
       }
     }
+
+    // (2) Figure out the liveout
+    SmallPtrSet<Value *, 4> LiveOuts;
+    GetLiveOuts(L, LiveOuts);
+    assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
+    auto *LiveOut = (*LiveOuts.begin());
+
+    // (3) Try to make the VCs from the live out
+
+
+
+
+
+    PHINode *IndVar = L->getInductionVariable(SE);
+    LLVM_DEBUG(dbgs() << "Rev: Induction Variable is " << *IndVar << "\n");
+    //    Solver slv;
+    Loop2Converter[L] = new CVCConv;
+    CVCConv *CConv = Loop2Converter[L];
+
+
 
     // Then also get the live out
     Value *LLVMLiveOut = (*LiveOuts.begin());
@@ -1717,7 +1904,6 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   DenseMap<StringRef, Term> SymbolTable;
   for (auto &P : FunctionBodies)
     SymbolTable[std::get<0>(P).toString()] = std::get<2>(P);
-  context c;
   // first convert all the functions
   Z3Mapping Mapping(c);
   // TODO this will need to be split into two loops,
