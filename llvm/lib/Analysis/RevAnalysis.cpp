@@ -523,7 +523,7 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
 // with any terminal.
 class TerminalMap {
 public:
-  TerminalMap(context &c) : c(c), Z3Symbols(c) {}
+  TerminalMap(context &c) : c(c), Z3Symbols(c), Z3Functions(c) {}
 
   expr setZ3(Value *V, expr const& Expr) {
     Z3Symbols.push_back(Expr);
@@ -531,7 +531,14 @@ public:
     return getZ3(V);
   }
 
+  func_decl setZ3Fun(Value *V, func_decl const& Fun) {
+    Z3Functions.push_back(Fun);
+    Z3FunMap[V] = Z3Functions.size()-1;
+    return Z3Functions.back();
+  }
+
   expr getZ3(Value *V) { return Z3Symbols[Z3Map[V]]; }
+  func_decl getZ3Fun(Value *V) { return Z3Functions[Z3FunMap[V]]; }
 
   bool countZ3(Value *V) { return Z3Map.count(V); }
 
@@ -540,32 +547,32 @@ public:
 private:
   context &c;
   expr_vector Z3Symbols;
+  func_decl_vector Z3Functions;
   std::vector<Term> CVCSymbols;
-  DenseMap<Value *, int> Z3Map;
-  DenseMap<Value *, int> CVC5Map;
+
+  DenseMap<Value *, unsigned> Z3Map;
+  DenseMap<Value *, unsigned> Z3FunMap;
+  DenseMap<Value *, unsigned> CVC5Map;
 };
 
 template<typename ExprTy, typename SortTy>
 class MakeSMT {
-public:
-  MakeSMT(TerminalMap &Map) : Map(Map) {}
-
 protected:
-  TerminalMap &Map;
-  struct GEPTy {
-    ExprTy Base;
-    ExprTy Offset;
-  };
+  using RMapTy = DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>>;
+  Loop *L = nullptr;
+  ScalarEvolution &SE;
+public:
+  MakeSMT(TerminalMap &Map, RMapTy &RM, ScalarEvolution &SE) : Map(Map), ReductionMap(RM), SE(SE) {}
 
-  virtual unsigned count(Value *V) = 0;
-  virtual ExprTy get(Value *V) = 0;
-  virtual ExprTy set(Value *V, const ExprTy &) = 0;
+  void setLoop(Loop *NewLoop) { L = NewLoop; }
 
   ExprTy FromVal(Value *V) {
     if (count(V))
       return get(V);
     // either a constant, or an instruction.
     auto Dispatch = [&](Value *V) {
+      if (ReductionMap.count(V))
+        return FromReduction(V);
       if (auto *Const = dyn_cast<Constant>(V))
         return FromConst(Const);
       if (isa<Argument>(V))
@@ -603,6 +610,18 @@ protected:
     return set(V, Dispatch(V));
   }
 
+protected:
+  TerminalMap &Map;
+  RMapTy &ReductionMap;
+  struct GEPTy {
+    ExprTy Base;
+    ExprTy Offset;
+  };
+
+  virtual unsigned count(Value *V) = 0;
+  virtual ExprTy get(Value *V) = 0;
+  virtual ExprTy set(Value *V, const ExprTy &) = 0;
+
   virtual ExprTy FromConst(Constant *V) = 0;
   virtual ExprTy FromLoadStore(Value *V) = 0;
   virtual GEPTy FromGEP(GEPOperator *V) = 0;
@@ -611,13 +630,14 @@ protected:
   virtual ExprTy FromBinOp(BinaryOperator *V) = 0;
   virtual ExprTy FromCmpInst(CmpInst *V) = 0;
   virtual ExprTy FromCallInst(CallInst *V) = 0;
+  virtual ExprTy FromReduction(Value *V) = 0;
 
   virtual SortTy ToSort(Type *T) = 0;
 };
 
 class MakeZ3 : public MakeSMT<expr, z3::sort> {
 public:
-  MakeZ3(TerminalMap &Map, context &c) : MakeSMT(Map), c(c) {}
+  MakeZ3(TerminalMap &Map, RMapTy &RM, ScalarEvolution &SE, context &c) : MakeSMT(Map, RM, SE), c(c) {}
 
 protected:
   context &c;
@@ -713,6 +733,37 @@ protected:
     return c.constant(V->getNameOrAsOperand().c_str(), ToSort(V->getType()));
   }
 
+  expr FromReduction(Value *V) {
+    // V is a reduction, we need to construct the corresponding *recursive* definition
+    // this function still returns an *expr*, not a func_decl, because the end
+    // result is a recursive call
+    if (auto *Inst = dyn_cast<Instruction>(V)) {
+      RecurrenceDescriptor &RD = ReductionMap[V].first;
+      switch(RD.getRecurrenceKind()) {
+      default:
+      llvm_unreachable("unsupported recurrence type!");
+      case llvm::RecurKind::FMulAdd:
+        z3::sort IVSort = ToSort(L->getInductionVariable(SE)->getType());
+        std::vector<z3::sort> Domain = { IVSort, IVSort };
+        z3::sort Range = ToSort(Inst->getType());
+        func_decl Reduction = c.recfun(V->getNameOrAsOperand().c_str(), Domain.size(), Domain.data(), Range);
+
+        expr_vector Args(c);
+        auto Bounds = L->getBounds(SE);
+        auto Initial = FromVal(&Bounds->getInitialIVValue());
+        auto Final = FromVal(&Bounds->getFinalIVValue());
+        Args.push_back(Initial);
+        Args.push_back(Final);
+//        c.recdef(Reduction, Args,
+//                 ite(Final < 0,
+//                     FromVal(RD.getRecurrenceStartValue().getValPtr()),
+//                     Reduction(Initial, Final-1) + ))
+        break;
+      }
+    }
+    llvm_unreachable("must be an instruction type!");
+  }
+
   z3::sort ToSort(Type *T) {
     switch(T->getTypeID()) {
     case Type::TypeID::IntegerTyID:
@@ -723,6 +774,30 @@ protected:
       return c.fpa_sort(Exponent, Mantissa);
     }
   }
+};
+
+
+template<typename ExprTy, typename SortTy>
+class PostConditionBuilder {
+  using Backend = MakeSMT<ExprTy, SortTy>;
+  using RMapTy = DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>>;
+public:
+  PostConditionBuilder(Backend &C, RMapTy &RM) : Converter(C), ReductionMap(RM) {}
+
+  ExprTy FromVal(Value *V) {
+    // visit all leaves first, replace any special computation
+    if (auto *Inst = dyn_cast<Instruction>(V)) {
+      for (auto &Op : Inst->operands()) {
+        if (ReductionMap.count(Op.get()))
+
+        ExprTy Expr = Converter.FromVal(&Op);
+      }
+    }
+  }
+
+private:
+  Backend &Converter;
+  RMapTy &ReductionMap;
 };
 
 template<typename ExprTy>
@@ -1763,18 +1838,12 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // TODO loop works for inner loop only right now, need to filter out the inner
   // loop BBs
 //  DenseMap<Loop *, Term> Loop2PC;
-  context c;
-  DenseMap<Loop *, CVCConv *> Loop2Converter;
-  DenseMap<CVCConv *, DenseMap<Value *, Term>> Ins2TermsMap;
-  DenseMap<Value *, Term> Ins2Terms;
-  std::vector<std::tuple<Term, std::vector<Term>, Term>> FunctionBodies;
-  TerminalMap TMap(c);
 
+  DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>> RecDecs;
+  // (1) check all the phis for reductions/inductions
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
 
-    // (1) check all the phis for reductions/inductions
-    DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>> RecDecs;
     BasicBlock *Header = L->getHeader();
     for (auto &I : *Header) {
       if (auto *PN = dyn_cast<PHINode>(&I)) {
@@ -1789,6 +1858,20 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         break;
       }
     }
+  }
+
+
+  context c;
+  DenseMap<Loop *, CVCConv *> Loop2Converter;
+  DenseMap<CVCConv *, DenseMap<Value *, Term>> Ins2TermsMap;
+  DenseMap<Value *, Term> Ins2Terms;
+  std::vector<std::tuple<Term, std::vector<Term>, Term>> FunctionBodies;
+  TerminalMap Map(c);
+  MakeZ3 Converter(Map, RecDecs, SE, c);
+
+  for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
+    Loop *L = LN.getLoopsAtDepth(Depth)[0];
+    Converter.setLoop(L);
 
     // (2) Figure out the liveout
     SmallPtrSet<Value *, 4> LiveOuts;
@@ -1797,8 +1880,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     auto *LiveOut = (*LiveOuts.begin());
 
     // (3) Try to make the VCs from the live out
-    TerminalMap Map(c);
-    MakeZ3 Converter(Map, c);
+
+//    PostConditionBuilder<expr, z3::sort> Z3PC(Converter);
 
 
 
