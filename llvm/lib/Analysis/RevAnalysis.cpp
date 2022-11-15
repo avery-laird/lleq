@@ -560,27 +560,30 @@ class MakeSMT {
 protected:
   using RMapTy = DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>>;
   Loop *L = nullptr;
+  LoopInfo *LI = nullptr;
   ScalarEvolution &SE;
 public:
   MakeSMT(TerminalMap &Map, RMapTy &RM, ScalarEvolution &SE) : Map(Map), ReductionMap(RM), SE(SE) {}
 
   void setLoop(Loop *NewLoop) { L = NewLoop; }
+  void setLoopInfo(LoopInfo *_LI) { LI = _LI; }
 
   ExprTy FromVal(Value *V) {
+    // update the current loop
     if (count(V))
       return get(V);
     // either a constant, or an instruction.
     auto Dispatch = [&](Value *V) {
-      if (ReductionMap.count(V))
-        return FromReduction(V);
       if (auto *Const = dyn_cast<Constant>(V))
         return FromConst(Const);
-      if (isa<Argument>(V))
-        return FromPHIorArg(V);
 
       Instruction *I = dyn_cast<Instruction>(V);
       if (I == nullptr)
         llvm_unreachable("unsupported value type.");
+      setLoop(LI->getLoopFor(I->getParent()));
+
+      if (isa<Argument>(V))
+        return FromPHIorArg(V);
 
       switch (I->getOpcode()) {
       case Instruction::Load:
@@ -607,7 +610,10 @@ public:
       }
     };
 
-    return set(V, Dispatch(V));
+    expr Result = set(V, Dispatch(V));
+    if (ReductionMap.count(V))
+      Result = FromReduction(V);
+    return set(V, Result);
   }
 
 protected:
@@ -678,7 +684,7 @@ protected:
 
   expr FromBinOp(BinaryOperator *BinOp) override {
     auto Left = FromVal(BinOp->getOperand(0));
-    auto Right = FromVal(BinOp->getOperand(0));
+    auto Right = FromVal(BinOp->getOperand(1));
     switch (BinOp->getOpcode()) {
     case BinaryOperator::BinaryOps::Add:
       return Left + Right;
@@ -730,6 +736,28 @@ protected:
   }
 
   expr FromPHIorArg(Value *V) {
+    // check if it's a phi:
+    if (auto *PHI = dyn_cast<PHINode>(V)) {
+      // check whether there are two values and one is NOT from the header
+      BasicBlock *Header = L->getHeader();
+      // TODO should be any indvar, not just the current
+      if (L->getInductionVariable(SE) != PHI) {
+        Value *NextVal = nullptr;
+        for (auto &Use : PHI->incoming_values()) {
+          if (PHI->getIncomingBlock(Use) == PHI->getParent())
+            continue ; // avoid infinite loops
+          if (auto *Inst = dyn_cast<Instruction>(&Use)) {
+            assert(NextVal == nullptr && "only one non-const allowed!");
+            NextVal = Inst;
+          }
+        }
+        if (NextVal) {
+          // assume the loop will execute at least once,
+          // so base the liveout off the non-header value
+          return FromVal(NextVal);
+        }
+      }
+    }
     return c.constant(V->getNameOrAsOperand().c_str(), ToSort(V->getType()));
   }
 
@@ -746,7 +774,7 @@ protected:
         z3::sort IVSort = ToSort(L->getInductionVariable(SE)->getType());
         std::vector<z3::sort> Domain = { IVSort, IVSort };
         z3::sort Range = ToSort(Inst->getType());
-        func_decl Reduction = c.recfun(V->getNameOrAsOperand().c_str(), Domain.size(), Domain.data(), Range);
+        func_decl Reduction = c.recfun(("reduce_" + V->getNameOrAsOperand()).c_str(), Domain.size(), Domain.data(), Range);
 
         expr_vector Args(c);
         auto Bounds = L->getBounds(SE);
@@ -754,11 +782,11 @@ protected:
         auto Final = FromVal(&Bounds->getFinalIVValue());
         Args.push_back(Initial);
         Args.push_back(Final);
-//        c.recdef(Reduction, Args,
-//                 ite(Final < 0,
-//                     FromVal(RD.getRecurrenceStartValue().getValPtr()),
-//                     Reduction(Initial, Final-1) + ))
-        break;
+        c.recdef(Reduction, Args,
+                 ite(Final < 0,
+                     FromVal(RD.getRecurrenceStartValue().getValPtr()),
+                     Reduction(Initial, Final-1) + FromVal(RD.getReductionOpChain(ReductionMap[V].second, L)[0])));
+        return Reduction(Initial, Final);
       }
     }
     llvm_unreachable("must be an instruction type!");
@@ -1868,6 +1896,15 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   std::vector<std::tuple<Term, std::vector<Term>, Term>> FunctionBodies;
   TerminalMap Map(c);
   MakeZ3 Converter(Map, RecDecs, SE, c);
+  Converter.setLoopInfo(&LI);
+  Loop *OuterLoop = &LN.getOutermostLoop();
+  Converter.setLoop(OuterLoop);
+  SmallPtrSet<Value *, 4> LiveOuts;
+  GetLiveOuts(OuterLoop, LiveOuts);
+  assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
+  auto *LiveOut = (*LiveOuts.begin());
+  expr TestPC = Converter.FromVal(LiveOut);
+  // TODO now this result gets the PC directly, no need for synthesis
 
   for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
     Loop *L = LN.getLoopsAtDepth(Depth)[0];
@@ -1880,6 +1917,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     auto *LiveOut = (*LiveOuts.begin());
 
     // (3) Try to make the VCs from the live out
+
 
 //    PostConditionBuilder<expr, z3::sort> Z3PC(Converter);
 
