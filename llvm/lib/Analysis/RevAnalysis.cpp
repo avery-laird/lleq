@@ -562,11 +562,15 @@ protected:
   Loop *L = nullptr;
   LoopInfo *LI = nullptr;
   ScalarEvolution &SE;
+  LoopNest *LN = nullptr;
+  SmallPtrSet<Value *, 5> BuildRecursive;
+  bool LockRecursion = false;
 public:
   MakeSMT(TerminalMap &Map, RMapTy &RM, ScalarEvolution &SE) : Map(Map), ReductionMap(RM), SE(SE) {}
 
   void setLoop(Loop *NewLoop) { L = NewLoop; }
   void setLoopInfo(LoopInfo *_LI) { LI = _LI; }
+  void setLoopNest(LoopNest *_LN) { LN = _LN; }
 
   ExprTy FromVal(Value *V) {
     // update the current loop
@@ -576,14 +580,23 @@ public:
     auto Dispatch = [&](Value *V) {
       if (auto *Const = dyn_cast<Constant>(V))
         return FromConst(Const);
+      if (isa<Argument>(V))
+        return FromPHIorArg(V);
 
       Instruction *I = dyn_cast<Instruction>(V);
       if (I == nullptr)
         llvm_unreachable("unsupported value type.");
-      setLoop(LI->getLoopFor(I->getParent()));
-
-      if (isa<Argument>(V))
-        return FromPHIorArg(V);
+      // imaginary "0th" loop to force the outermost loop as also recursive
+      unsigned Depth = L == nullptr ? 0 : L->getLoopDepth();
+      Loop *CurrentLoop = LI->getLoopFor(I->getParent());
+      if (CurrentLoop != L &&
+          CurrentLoop->getLoopDepth() > Depth &&
+          (I->getParent() == CurrentLoop->getLoopLatch()) &&
+          !LockRecursion) {
+        BuildRecursive.insert(V);
+        LockRecursion = CurrentLoop->getLoopDepth() == LN->getNestDepth();
+      }
+      setLoop(CurrentLoop);
 
       switch (I->getOpcode()) {
       case Instruction::Load:
@@ -611,8 +624,10 @@ public:
     };
 
     expr Result = set(V, Dispatch(V));
-    if (ReductionMap.count(V))
+    if (ReductionMap.count(V)) // TODO guarantee that reductions describe the loop!
       Result = FromReduction(V);
+    else if (BuildRecursive.count(V))
+      Result = WrapRecursiveCall(Result);
     return set(V, Result);
   }
 
@@ -637,6 +652,7 @@ protected:
   virtual ExprTy FromCmpInst(CmpInst *V) = 0;
   virtual ExprTy FromCallInst(CallInst *V) = 0;
   virtual ExprTy FromReduction(Value *V) = 0;
+  virtual ExprTy WrapRecursiveCall(const ExprTy &) = 0;
 
   virtual SortTy ToSort(Type *T) = 0;
 };
@@ -735,7 +751,7 @@ protected:
     return {Base, Offset};
   }
 
-  expr FromPHIorArg(Value *V) {
+  expr FromPHIorArg(Value *V) override {
     // check if it's a phi:
     if (auto *PHI = dyn_cast<PHINode>(V)) {
       // check whether there are two values and one is NOT from the header
@@ -761,7 +777,7 @@ protected:
     return c.constant(V->getNameOrAsOperand().c_str(), ToSort(V->getType()));
   }
 
-  expr FromReduction(Value *V) {
+  expr FromReduction(Value *V) override {
     // V is a reduction, we need to construct the corresponding *recursive* definition
     // this function still returns an *expr*, not a func_decl, because the end
     // result is a recursive call
@@ -783,7 +799,7 @@ protected:
         Args.push_back(Initial);
         Args.push_back(Final);
         c.recdef(Reduction, Args,
-                 ite(Final < 0,
+                 ite(Final < Initial,
                      FromVal(RD.getRecurrenceStartValue().getValPtr()),
                      Reduction(Initial, Final-1) + FromVal(RD.getReductionOpChain(ReductionMap[V].second, L)[0])));
         return Reduction(Initial, Final);
@@ -792,7 +808,32 @@ protected:
     llvm_unreachable("must be an instruction type!");
   }
 
-  z3::sort ToSort(Type *T) {
+  expr WrapRecursiveCall(const expr &Expr) override {
+    // get loop bounds
+    auto Bounds = L->getBounds(SE);
+    auto Initial = FromVal(&Bounds->getInitialIVValue());
+    auto Final = FromVal(&Bounds->getFinalIVValue());
+    func_decl RecLoop = c.recfun(L->getName().str().c_str(), Initial.get_sort(), Final.get_sort(), Expr.get_sort());
+    expr_vector Args(c);
+    Args.push_back(Initial);
+    Args.push_back(Final);
+    // base case has to be from either store or liveout initial val
+    expr BaseCase(c);
+    if (Expr.is_app() && Expr.decl().name().str() == "store") {
+      BaseCase = Expr.arg(0);
+      expr Val = Expr.arg(2);
+      c.recdef(RecLoop, Args,
+               ite(Final < Initial,
+                   BaseCase,
+                   store(RecLoop(Initial, Final-1), Final, Val)));
+      return RecLoop(Initial, Final);
+    } else {
+      // TODO extend for scalar cases
+      llvm_unreachable("unsupported liveout type");
+    }
+  }
+
+  z3::sort ToSort(Type *T) override {
     switch(T->getTypeID()) {
     case Type::TypeID::IntegerTyID:
       return c.int_sort();
@@ -1897,8 +1938,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   TerminalMap Map(c);
   MakeZ3 Converter(Map, RecDecs, SE, c);
   Converter.setLoopInfo(&LI);
+  Converter.setLoopNest(&LN);
   Loop *OuterLoop = &LN.getOutermostLoop();
-  Converter.setLoop(OuterLoop);
+
   SmallPtrSet<Value *, 4> LiveOuts;
   GetLiveOuts(OuterLoop, LiveOuts);
   assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
@@ -1906,192 +1948,197 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   expr TestPC = Converter.FromVal(LiveOut);
   // TODO now this result gets the PC directly, no need for synthesis
 
-  for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
-    Loop *L = LN.getLoopsAtDepth(Depth)[0];
-    Converter.setLoop(L);
-
-    // (2) Figure out the liveout
-    SmallPtrSet<Value *, 4> LiveOuts;
-    GetLiveOuts(L, LiveOuts);
-    assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
-    auto *LiveOut = (*LiveOuts.begin());
-
-    // (3) Try to make the VCs from the live out
-
-
-//    PostConditionBuilder<expr, z3::sort> Z3PC(Converter);
-
-
-
-
-    PHINode *IndVar = L->getInductionVariable(SE);
-    LLVM_DEBUG(dbgs() << "Rev: Induction Variable is " << *IndVar << "\n");
-    //    Solver slv;
-    Loop2Converter[L] = new CVCConv;
-    CVCConv *CConv = Loop2Converter[L];
-
-
-
-    // Then also get the live out
-    Value *LLVMLiveOut = (*LiveOuts.begin());
-    LLVM_DEBUG(dbgs() << "Rev: live out is " << *LLVMLiveOut << "\n");
-    Value *LiveOutEnd = nullptr;
-    if (isa<PHINode>(LLVMLiveOut)) {
-      LLVMLiveOut = dyn_cast<PHINode>(LLVMLiveOut)->getOperand(0);
-      if (RecDecs.count(LLVMLiveOut)) {
-        // TODO: here there is one assumption about reduction, all the
-        // computation are performed using one single instruction
-        RecurrenceDescriptor &RD = RecDecs[LLVMLiveOut].first;
-        LLVMLiveOut = RecDecs[LLVMLiveOut].second;
-        LiveOutEnd =
-            RD.getReductionOpChain(dyn_cast<PHINode>(LLVMLiveOut), L)[0];
-
-        LLVM_DEBUG(dbgs() << "Rev: LiveOutEnd is " << *LiveOutEnd << "\n");
-      }
-      CConv->liveout = CConv->MakeTerm(LLVMLiveOut, Ins2Terms);
-    } else { // must be store
-      auto *Store = dyn_cast<StoreInst>(LLVMLiveOut);
-      auto *GEP =
-          dyn_cast<GEPOperator>(Store->getPointerOperand()); // get the GEP
-      LLVMLiveOut = GEP->getPointerOperand(); // then get the base ptr
-      LiveOutEnd = Store;
-      // make the GEP:
-      CConv->MakeTerm(GEP, Ins2Terms);
-      // we only want the base
-      CConv->liveout = &Ins2Terms[LLVMLiveOut];
-    }
-    CConv->liveoutend = LiveOutEnd;
-
-    LLVM_DEBUG(dbgs() << "Rev: live out is " << CConv->liveout->toString()
-                      << "\n");
-    LLVM_DEBUG(dbgs() << "Rev: live out end is " << *(CConv->liveoutend)
-                      << "\n");
-
-    // Now, have to define the sum function for any phis
-    // let's use a generic version and store it in CConv
-
-    // Then have to create the postcondition/invariant grammar:
-    // INV GRAMMAR:
-    // start := (and <cmp> <cmp> <eq>))
-    // cmp   := <expr> <= <expr>
-    // expr  := lb | invariant | ub
-    // eq    := {forall if eq is memory store} <single out> = <valid ops>
-    // valid_ops :=
-    //           | try to create sum from phi
-    //           | + | - | * | ...
-
-    // PC GRAMMAR:
-    // start :=  (and <eq1>  ({forall if eq is memory store} <eq2>))
-    // eq1      := lb == ub
-    // eq2      := eq {where all phis have exit val}
-
-    // find the loop bounds
-    auto Bounds = L->getBounds(SE);
-    auto *UB = &Bounds->getFinalIVValue();
-    auto *LB = &Bounds->getInitialIVValue();
-    auto *INDVAR = L->getInductionVariable(SE);
-    CConv->ub = CConv->MakeTerm(UB, Ins2Terms);
-    CConv->lb = CConv->MakeTerm(LB, Ins2Terms);
-    CConv->indvar = CConv->MakeTerm(INDVAR, Ins2Terms);
-
-    // translate the computation for the liveout
-    CVCConv::UFInfo liveout_compute_chain =
-        CConv->MakeComputeChain(FunctionBodies, LiveOutEnd, L, Ins2Terms, RecDecs);
-    LLVM_DEBUG(dbgs() << "COMPUTE CHAIN:\n");
-    LLVM_DEBUG(dbgs() << liveout_compute_chain.UF.toString() << "\n");
-
-    CConv->MakeTerminals(L, &SE, liveout_compute_chain, Ins2Terms);
-
-    auto inv_gram = CConv->MakeInvGram(liveout_compute_chain);
-
-    // next, make the PC grammar
-    Grammar pc_gram = CConv->MakePCGrammar(liveout_compute_chain);
-
-    std::vector<CVCConv::GrammarRecord> GR = {{inv_gram, "inv"},
-                                              {pc_gram, "pc"}};
-    CConv->MakeSynthFuns(GR);
-    CConv->MakeUniversalVars(GR);
-    CConv->MakeSynthFunCalls();
-    CConv->MakeVerificationConditions(&LN, L, Ins2Terms,Loop2Converter);
-
-    // at this point, also need to figure out the mapping
-
-  }
-
-  // make a forest of possible replacements
-  Term FinalPC;
-  for (int Depth = LN.getNestDepth()-1; Depth > 0; --Depth) {
-    Loop *Linner = LN.getLoopsAtDepth(Depth+1)[0];
-    auto *Cinner = Loop2Converter[Linner];
-    Loop *Louter = LN.getLoopsAtDepth(Depth)[0];
-    auto *Couter = Loop2Converter[Louter];
-    for (auto &P : Couter->PCRegister)
-      if (P.first == *Couter->liveout) {
-        FinalPC = P.second;
-        auto *Inst = dyn_cast<Instruction>(Couter->liveoutend);
-        SmallVector<BasicBlock*> ExitBlock;
-        Linner->getExitBlocks(ExitBlock);
-        for (auto &I : *ExitBlock[0]) {
-          auto *PN = dyn_cast<PHINode>(&I);
-          if (PN == nullptr || PN->getIncomingValue(0) != Cinner->liveoutend)
-            break;
-          for (auto *User : PN->users()) {
-            FinalPC = FinalPC.substitute(*Couter->MakeTerm(User, Ins2Terms), Cinner->PCRegister[0].second);
-          }
-        }
-        break;
-      }
-  }
-
-  LLVM_DEBUG(dbgs() << "Final PC: " << FinalPC.toString() << "\n");
-  // for now, just convert to z3
-  // build a symbol table
-  DenseMap<StringRef, Term> SymbolTable;
-  for (auto &P : FunctionBodies)
-    SymbolTable[std::get<0>(P).toString()] = std::get<2>(P);
-  // first convert all the functions
-  Z3Mapping Mapping(c);
-  // TODO this will need to be split into two loops,
-  // first make all symbols, then make maps, then make all functions
-  for (auto &P : FunctionBodies) {
-    std::vector<z3::sort> Domain;
-    expr_vector &Args = Mapping.symbols();
-    for (auto &E : std::get<1>(P))
-      Domain.push_back(CVCSort2Z3Sort(E.getSort(), c));
-    for (auto &E : std::get<1>(P)) {
-      Args.push_back(CVC2Z3(Mapping, c, E));
-    }
-    z3::sort Range = CVCSort2Z3Sort(std::get<2>(P).getSort(), c);
-    // make the signature
-    Mapping.functions().push_back(c.recfun(
-        std::get<0>(P).toString().c_str(),
-        Domain.size(),
-        Domain.data(),
-        Range));
-    LLVM_DEBUG(dbgs() << Mapping.functions().back().to_string() << "\n");
-    Mapping.MakeMaps();
-    auto Body = CVC2Z3(Mapping, c, std::get<2>(P));
-    c.recdef(Mapping.functions().back(), Args, Body);
-    LLVM_DEBUG(dbgs() << Body.to_string() << "\n");
-  }
-
-  expr Z3PC = CVC2Z3(Mapping, c, FinalPC);
-  LLVM_DEBUG(dbgs() << Z3PC.to_string() << "\n");
-
-  LLVM_DEBUG(dbgs() << "----------\nMAPPING START\n----------\n");
-
-  auto *ConvOuter = Loop2Converter[&LN.getOutermostLoop()];
-  auto *FinalLiveOut = dyn_cast<Instruction>(ConvOuter->liveoutend);
-
-  // try to inspect arrays
-  FindInputTensors FT(SE, &LI);
-  FT.visitTopLevel(FinalLiveOut);
-  FT.ConstructDenseTensors(Mapping, c, Ins2Terms, ConvOuter->liveout, Z3PC);
-
-  for (auto C : Loop2Converter)
-    delete C.second;
-
+  LLVM_DEBUG(dbgs() << "Computation found: " << TestPC.to_string() << "\n");
 
 
   return PreservedAnalyses::all();
+
+//  for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
+//    Loop *L = LN.getLoopsAtDepth(Depth)[0];
+//    Converter.setLoop(L);
+//
+//    // (2) Figure out the liveout
+//    SmallPtrSet<Value *, 4> LiveOuts;
+//    GetLiveOuts(L, LiveOuts);
+//    assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
+//    auto *LiveOut = (*LiveOuts.begin());
+//
+//    // (3) Try to make the VCs from the live out
+//
+//
+////    PostConditionBuilder<expr, z3::sort> Z3PC(Converter);
+//
+//
+//
+//
+//    PHINode *IndVar = L->getInductionVariable(SE);
+//    LLVM_DEBUG(dbgs() << "Rev: Induction Variable is " << *IndVar << "\n");
+//    //    Solver slv;
+//    Loop2Converter[L] = new CVCConv;
+//    CVCConv *CConv = Loop2Converter[L];
+//
+//
+//
+//    // Then also get the live out
+//    Value *LLVMLiveOut = (*LiveOuts.begin());
+//    LLVM_DEBUG(dbgs() << "Rev: live out is " << *LLVMLiveOut << "\n");
+//    Value *LiveOutEnd = nullptr;
+//    if (isa<PHINode>(LLVMLiveOut)) {
+//      LLVMLiveOut = dyn_cast<PHINode>(LLVMLiveOut)->getOperand(0);
+//      if (RecDecs.count(LLVMLiveOut)) {
+//        // TODO: here there is one assumption about reduction, all the
+//        // computation are performed using one single instruction
+//        RecurrenceDescriptor &RD = RecDecs[LLVMLiveOut].first;
+//        LLVMLiveOut = RecDecs[LLVMLiveOut].second;
+//        LiveOutEnd =
+//            RD.getReductionOpChain(dyn_cast<PHINode>(LLVMLiveOut), L)[0];
+//
+//        LLVM_DEBUG(dbgs() << "Rev: LiveOutEnd is " << *LiveOutEnd << "\n");
+//      }
+//      CConv->liveout = CConv->MakeTerm(LLVMLiveOut, Ins2Terms);
+//    } else { // must be store
+//      auto *Store = dyn_cast<StoreInst>(LLVMLiveOut);
+//      auto *GEP =
+//          dyn_cast<GEPOperator>(Store->getPointerOperand()); // get the GEP
+//      LLVMLiveOut = GEP->getPointerOperand(); // then get the base ptr
+//      LiveOutEnd = Store;
+//      // make the GEP:
+//      CConv->MakeTerm(GEP, Ins2Terms);
+//      // we only want the base
+//      CConv->liveout = &Ins2Terms[LLVMLiveOut];
+//    }
+//    CConv->liveoutend = LiveOutEnd;
+//
+//    LLVM_DEBUG(dbgs() << "Rev: live out is " << CConv->liveout->toString()
+//                      << "\n");
+//    LLVM_DEBUG(dbgs() << "Rev: live out end is " << *(CConv->liveoutend)
+//                      << "\n");
+//
+//    // Now, have to define the sum function for any phis
+//    // let's use a generic version and store it in CConv
+//
+//    // Then have to create the postcondition/invariant grammar:
+//    // INV GRAMMAR:
+//    // start := (and <cmp> <cmp> <eq>))
+//    // cmp   := <expr> <= <expr>
+//    // expr  := lb | invariant | ub
+//    // eq    := {forall if eq is memory store} <single out> = <valid ops>
+//    // valid_ops :=
+//    //           | try to create sum from phi
+//    //           | + | - | * | ...
+//
+//    // PC GRAMMAR:
+//    // start :=  (and <eq1>  ({forall if eq is memory store} <eq2>))
+//    // eq1      := lb == ub
+//    // eq2      := eq {where all phis have exit val}
+//
+//    // find the loop bounds
+//    auto Bounds = L->getBounds(SE);
+//    auto *UB = &Bounds->getFinalIVValue();
+//    auto *LB = &Bounds->getInitialIVValue();
+//    auto *INDVAR = L->getInductionVariable(SE);
+//    CConv->ub = CConv->MakeTerm(UB, Ins2Terms);
+//    CConv->lb = CConv->MakeTerm(LB, Ins2Terms);
+//    CConv->indvar = CConv->MakeTerm(INDVAR, Ins2Terms);
+//
+//    // translate the computation for the liveout
+//    CVCConv::UFInfo liveout_compute_chain =
+//        CConv->MakeComputeChain(FunctionBodies, LiveOutEnd, L, Ins2Terms, RecDecs);
+//    LLVM_DEBUG(dbgs() << "COMPUTE CHAIN:\n");
+//    LLVM_DEBUG(dbgs() << liveout_compute_chain.UF.toString() << "\n");
+//
+//    CConv->MakeTerminals(L, &SE, liveout_compute_chain, Ins2Terms);
+//
+//    auto inv_gram = CConv->MakeInvGram(liveout_compute_chain);
+//
+//    // next, make the PC grammar
+//    Grammar pc_gram = CConv->MakePCGrammar(liveout_compute_chain);
+//
+//    std::vector<CVCConv::GrammarRecord> GR = {{inv_gram, "inv"},
+//                                              {pc_gram, "pc"}};
+//    CConv->MakeSynthFuns(GR);
+//    CConv->MakeUniversalVars(GR);
+//    CConv->MakeSynthFunCalls();
+//    CConv->MakeVerificationConditions(&LN, L, Ins2Terms,Loop2Converter);
+//
+//    // at this point, also need to figure out the mapping
+//
+//  }
+//
+//  // make a forest of possible replacements
+//  Term FinalPC;
+//  for (int Depth = LN.getNestDepth()-1; Depth > 0; --Depth) {
+//    Loop *Linner = LN.getLoopsAtDepth(Depth+1)[0];
+//    auto *Cinner = Loop2Converter[Linner];
+//    Loop *Louter = LN.getLoopsAtDepth(Depth)[0];
+//    auto *Couter = Loop2Converter[Louter];
+//    for (auto &P : Couter->PCRegister)
+//      if (P.first == *Couter->liveout) {
+//        FinalPC = P.second;
+//        auto *Inst = dyn_cast<Instruction>(Couter->liveoutend);
+//        SmallVector<BasicBlock*> ExitBlock;
+//        Linner->getExitBlocks(ExitBlock);
+//        for (auto &I : *ExitBlock[0]) {
+//          auto *PN = dyn_cast<PHINode>(&I);
+//          if (PN == nullptr || PN->getIncomingValue(0) != Cinner->liveoutend)
+//            break;
+//          for (auto *User : PN->users()) {
+//            FinalPC = FinalPC.substitute(*Couter->MakeTerm(User, Ins2Terms), Cinner->PCRegister[0].second);
+//          }
+//        }
+//        break;
+//      }
+//  }
+//
+//  LLVM_DEBUG(dbgs() << "Final PC: " << FinalPC.toString() << "\n");
+//  // for now, just convert to z3
+//  // build a symbol table
+//  DenseMap<StringRef, Term> SymbolTable;
+//  for (auto &P : FunctionBodies)
+//    SymbolTable[std::get<0>(P).toString()] = std::get<2>(P);
+//  // first convert all the functions
+//  Z3Mapping Mapping(c);
+//  // TODO this will need to be split into two loops,
+//  // first make all symbols, then make maps, then make all functions
+//  for (auto &P : FunctionBodies) {
+//    std::vector<z3::sort> Domain;
+//    expr_vector &Args = Mapping.symbols();
+//    for (auto &E : std::get<1>(P))
+//      Domain.push_back(CVCSort2Z3Sort(E.getSort(), c));
+//    for (auto &E : std::get<1>(P)) {
+//      Args.push_back(CVC2Z3(Mapping, c, E));
+//    }
+//    z3::sort Range = CVCSort2Z3Sort(std::get<2>(P).getSort(), c);
+//    // make the signature
+//    Mapping.functions().push_back(c.recfun(
+//        std::get<0>(P).toString().c_str(),
+//        Domain.size(),
+//        Domain.data(),
+//        Range));
+//    LLVM_DEBUG(dbgs() << Mapping.functions().back().to_string() << "\n");
+//    Mapping.MakeMaps();
+//    auto Body = CVC2Z3(Mapping, c, std::get<2>(P));
+//    c.recdef(Mapping.functions().back(), Args, Body);
+//    LLVM_DEBUG(dbgs() << Body.to_string() << "\n");
+//  }
+//
+//  expr Z3PC = CVC2Z3(Mapping, c, FinalPC);
+//  LLVM_DEBUG(dbgs() << Z3PC.to_string() << "\n");
+//
+//  LLVM_DEBUG(dbgs() << "----------\nMAPPING START\n----------\n");
+//
+//  auto *ConvOuter = Loop2Converter[&LN.getOutermostLoop()];
+//  auto *FinalLiveOut = dyn_cast<Instruction>(ConvOuter->liveoutend);
+//
+//  // try to inspect arrays
+//  FindInputTensors FT(SE, &LI);
+//  FT.visitTopLevel(FinalLiveOut);
+//  FT.ConstructDenseTensors(Mapping, c, Ins2Terms, ConvOuter->liveout, Z3PC);
+//
+//  for (auto C : Loop2Converter)
+//    delete C.second;
+//
+//
+//
+//  return PreservedAnalyses::all();
 }
