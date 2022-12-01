@@ -531,6 +531,12 @@ public:
     return getZ3(V);
   }
 
+//  func_decl const& operator[](Value *V) {
+//    Z3Functions.resize(Z3Functions.size() + 1);
+//    Z3Map[V] = Z3Symbols.size()-1;
+//    return Z3Functions[Z3Symbols.size()-1];
+//  }
+
   func_decl setZ3Fun(Value *V, func_decl const& Fun) {
     Z3Functions.push_back(Fun);
     Z3FunMap[V] = Z3Functions.size()-1;
@@ -566,7 +572,7 @@ protected:
   SmallPtrSet<Value *, 5> BuildRecursive;
   bool LockRecursion = false;
 public:
-  MakeSMT(TerminalMap &Map, RMapTy &RM, ScalarEvolution &SE) : Map(Map), ReductionMap(RM), SE(SE) {}
+  MakeSMT(TerminalMap &Map, ScalarEvolution &SE) : Map(Map), SE(SE) {}
 
   void setLoop(Loop *NewLoop) { L = NewLoop; }
   void setLoopInfo(LoopInfo *_LI) { LI = _LI; }
@@ -623,17 +629,11 @@ public:
       }
     };
 
-    expr Result = set(V, Dispatch(V));
-    if (ReductionMap.count(V)) // TODO guarantee that reductions describe the loop!
-      Result = FromReduction(V);
-    else if (BuildRecursive.count(V))
-      Result = WrapRecursiveCall(Result);
-    return set(V, Result);
+    return set(V, Dispatch(V));
   }
 
 protected:
   TerminalMap &Map;
-  RMapTy &ReductionMap;
   struct GEPTy {
     ExprTy Base;
     ExprTy Offset;
@@ -651,15 +651,43 @@ protected:
   virtual ExprTy FromBinOp(BinaryOperator *V) = 0;
   virtual ExprTy FromCmpInst(CmpInst *V) = 0;
   virtual ExprTy FromCallInst(CallInst *V) = 0;
-  virtual ExprTy FromReduction(Value *V) = 0;
-  virtual ExprTy WrapRecursiveCall(const ExprTy &) = 0;
 
   virtual SortTy ToSort(Type *T) = 0;
 };
 
 class MakeZ3 : public MakeSMT<expr, z3::sort> {
 public:
-  MakeZ3(TerminalMap &Map, RMapTy &RM, ScalarEvolution &SE, context &c) : MakeSMT(Map, RM, SE), c(c) {}
+  MakeZ3(TerminalMap &Map, ScalarEvolution &SE, context &c) : MakeSMT(Map, SE), c(c) {}
+
+  z3::sort ToSort(Type *T) override {
+    switch(T->getTypeID()) {
+    default:
+      llvm_unreachable("unsupported LLVM type.");
+    case Type::TypeID::IntegerTyID:
+      return c.int_sort();
+    case Type::TypeID::DoubleTyID:
+      unsigned Mantissa = APFloat::semanticsPrecision(T->getFltSemantics());
+      unsigned Exponent = APFloat::semanticsSizeInBits(T->getFltSemantics()) - Mantissa;
+      return c.fpa_sort(Exponent, Mantissa);
+    }
+  }
+
+  GEPTy FromGEP(GEPOperator *GEP) override {
+    assert(GEP->getNumIndices() == 1);
+    // make the array if it doesn't exist
+    if (!count(GEP->getPointerOperand())) {
+      // TODO assume 1d memory accesses
+      z3::sort ArraySort = c.array_sort(
+          ToSort(GEP->getOperand(1)->getType()),
+          ToSort(GEP->getResultElementType()));
+      set(
+          GEP->getPointerOperand(),
+          c.constant(GEP->getPointerOperand()->getName().data(), ArraySort));
+    }
+    expr Base = get(GEP->getPointerOperand());
+    expr Offset = FromVal(GEP->getOperand(1));
+    return {Base, Offset};
+  }
 
 protected:
   context &c;
@@ -713,7 +741,7 @@ protected:
 
   expr FromCmpInst(CmpInst *Cmp) override {
     auto Left = FromVal(Cmp->getOperand(0));
-    auto Right = FromVal(Cmp->getOperand(0));
+    auto Right = FromVal(Cmp->getOperand(1));
     switch (Cmp->getPredicate()) {
     case CmpInst::ICMP_SLT:
       return Left < Right;
@@ -734,114 +762,30 @@ protected:
     llvm_unreachable("arbitrary functions aren't supported.");
   }
 
-  GEPTy FromGEP(GEPOperator *GEP) override {
-    assert(GEP->getNumIndices() == 1);
-    // make the array if it doesn't exist
-    if (!count(GEP->getPointerOperand())) {
-      // TODO assume 1d memory accesses
-      z3::sort ArraySort = c.array_sort(
-          ToSort(GEP->getOperand(1)->getType()),
-          ToSort(GEP->getResultElementType()));
-      set(
-          GEP->getPointerOperand(),
-          c.constant(GEP->getPointerOperand()->getName().data(), ArraySort));
-    }
-    expr Base = get(GEP->getPointerOperand());
-    expr Offset = FromVal(GEP->getOperand(1));
-    return {Base, Offset};
-  }
-
   expr FromPHIorArg(Value *V) override {
     // check if it's a phi:
-    if (auto *PHI = dyn_cast<PHINode>(V)) {
-      // check whether there are two values and one is NOT from the header
-      BasicBlock *Header = L->getHeader();
-      // TODO should be any indvar, not just the current
-      if (L->getInductionVariable(SE) != PHI) {
-        Value *NextVal = nullptr;
-        for (auto &Use : PHI->incoming_values()) {
-          if (PHI->getIncomingBlock(Use) == PHI->getParent())
-            continue ; // avoid infinite loops
-          if (auto *Inst = dyn_cast<Instruction>(&Use)) {
-            assert(NextVal == nullptr && "only one non-const allowed!");
-            NextVal = Inst;
-          }
-        }
-        if (NextVal) {
-          // assume the loop will execute at least once,
-          // so base the liveout off the non-header value
-          return FromVal(NextVal);
-        }
-      }
-    }
+//    if (auto *PHI = dyn_cast<PHINode>(V)) {
+//      // check whether there are two values and one is NOT from the header
+//      BasicBlock *Header = L->getHeader();
+//      // TODO should be any indvar, not just the current
+//      if (L->getInductionVariable(SE) != PHI) {
+//        Value *NextVal = nullptr;
+//        for (auto &Use : PHI->incoming_values()) {
+//          if (PHI->getIncomingBlock(Use) == PHI->getParent())
+//            continue ; // avoid infinite loops
+//          if (auto *Inst = dyn_cast<Instruction>(&Use)) {
+//            assert(NextVal == nullptr && "only one non-const allowed!");
+//            NextVal = Inst;
+//          }
+//        }
+//        if (NextVal) {
+//          // assume the loop will execute at least once,
+//          // so base the liveout off the non-header value
+//          return FromVal(NextVal);
+//        }
+//      }
+//    }
     return c.constant(V->getNameOrAsOperand().c_str(), ToSort(V->getType()));
-  }
-
-  expr FromReduction(Value *V) override {
-    // V is a reduction, we need to construct the corresponding *recursive* definition
-    // this function still returns an *expr*, not a func_decl, because the end
-    // result is a recursive call
-    if (auto *Inst = dyn_cast<Instruction>(V)) {
-      RecurrenceDescriptor &RD = ReductionMap[V].first;
-      switch(RD.getRecurrenceKind()) {
-      default:
-      llvm_unreachable("unsupported recurrence type!");
-      case llvm::RecurKind::FMulAdd:
-        z3::sort IVSort = ToSort(L->getInductionVariable(SE)->getType());
-        std::vector<z3::sort> Domain = { IVSort, IVSort };
-        z3::sort Range = ToSort(Inst->getType());
-        func_decl Reduction = c.recfun(("reduce_" + V->getNameOrAsOperand()).c_str(), Domain.size(), Domain.data(), Range);
-
-        expr_vector Args(c);
-        auto Bounds = L->getBounds(SE);
-        auto Initial = FromVal(&Bounds->getInitialIVValue());
-        auto Final = FromVal(&Bounds->getFinalIVValue());
-        Args.push_back(Initial);
-        Args.push_back(Final);
-        c.recdef(Reduction, Args,
-                 ite(Final < Initial,
-                     FromVal(RD.getRecurrenceStartValue().getValPtr()),
-                     Reduction(Initial, Final-1) + FromVal(RD.getReductionOpChain(ReductionMap[V].second, L)[0])));
-        return Reduction(Initial, Final);
-      }
-    }
-    llvm_unreachable("must be an instruction type!");
-  }
-
-  expr WrapRecursiveCall(const expr &Expr) override {
-    // get loop bounds
-    auto Bounds = L->getBounds(SE);
-    auto Initial = FromVal(&Bounds->getInitialIVValue());
-    auto Final = FromVal(&Bounds->getFinalIVValue());
-    func_decl RecLoop = c.recfun(L->getName().str().c_str(), Initial.get_sort(), Final.get_sort(), Expr.get_sort());
-    expr_vector Args(c);
-    Args.push_back(Initial);
-    Args.push_back(Final);
-    // base case has to be from either store or liveout initial val
-    expr BaseCase(c);
-    if (Expr.is_app() && Expr.decl().name().str() == "store") {
-      BaseCase = Expr.arg(0);
-      expr Val = Expr.arg(2);
-      c.recdef(RecLoop, Args,
-               ite(Final < Initial,
-                   BaseCase,
-                   store(RecLoop(Initial, Final-1), Final, Val)));
-      return RecLoop(Initial, Final);
-    } else {
-      // TODO extend for scalar cases
-      llvm_unreachable("unsupported liveout type");
-    }
-  }
-
-  z3::sort ToSort(Type *T) override {
-    switch(T->getTypeID()) {
-    case Type::TypeID::IntegerTyID:
-      return c.int_sort();
-    case Type::TypeID::DoubleTyID:
-      unsigned Mantissa = APFloat::semanticsPrecision(T->getFltSemantics());
-      unsigned Exponent = APFloat::semanticsSizeInBits(T->getFltSemantics()) - Mantissa;
-      return c.fpa_sort(Exponent, Mantissa);
-    }
   }
 };
 
@@ -1848,7 +1792,6 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   auto start = high_resolution_clock::now();
 
-  RecurrenceDescriptor RedDes;
   AssumptionCache AC = AM.getResult<AssumptionAnalysis>(F);
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
   DemandedBits DB(F, AC, DT);
@@ -1883,60 +1826,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   LoopNest LN(*LI.getTopLevelLoops()[0], SE);
 
-  // for each loop in the nest, inner to outer:
-  //    1. find all liveins and liveouts
-  //    2. create postcondition template: PC(liveins) = indvar = ub && liveout =
-  //    <phi exit value or op_hole>
-  //    3. create invariant template:     INV(liveins) = lb <= indvar <= ub &&
-  //    liveout.store_target_or_phi = liveout.store_val_or_phi_exit
-  //    4. are the templates complete?
-  //        4.1 yes: map liveout to PC and go to next loop
-  //        4.2 no : synthesize PC then map liveout to PC and go to next loop
 
-  // PC grammar:
-  // pc       := <indvar> == <ub> && <liveout> == <phi exit or op_hole>
-  // indvar   := {any register in loop}
-  // ub       := {any register in loop or int constant}
-  // liveout  := {any register in exit blocks or store in loop}
-  // lb       := {any register in loop or int constant}
-  // op_hole  := sum(lb, ub, op_hole)
-  //           | add(<op_hole>, <op_hole>) | sub | ...
-  //           | cast(<op_hole>) | load(gep(<op_hole>, <op_hole>)) | ...
-  //           | any register in loop | int constant | fp constant
-
-  // TODO loop works for inner loop only right now, need to filter out the inner
-  // loop BBs
-//  DenseMap<Loop *, Term> Loop2PC;
-
-  DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>> RecDecs;
-  // (1) check all the phis for reductions/inductions
-  for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
-    Loop *L = LN.getLoopsAtDepth(Depth)[0];
-
-    BasicBlock *Header = L->getHeader();
-    for (auto &I : *Header) {
-      if (auto *PN = dyn_cast<PHINode>(&I)) {
-        RecurrenceDescriptor RecDec;
-        if (RecurrenceDescriptor::isReductionPHI(PN, L, RecDec, &DB, &AC, &DT,
-                                                 &SE)) {
-          LLVM_DEBUG(dbgs() << "Rev: Reduction Instruction is "
-                            << *(RecDec.getLoopExitInstr()) << "\n");
-          RecDecs[RecDec.getLoopExitInstr()] = {RecDec, PN};
-        }
-      } else {
-        break;
-      }
-    }
-  }
-
-
-  context c;
-  DenseMap<Loop *, CVCConv *> Loop2Converter;
-  DenseMap<CVCConv *, DenseMap<Value *, Term>> Ins2TermsMap;
-  DenseMap<Value *, Term> Ins2Terms;
-  std::vector<std::tuple<Term, std::vector<Term>, Term>> FunctionBodies;
-  TerminalMap Map(c);
-  MakeZ3 Converter(Map, RecDecs, SE, c);
+  context Ctx;
+  TerminalMap BB2Func(Ctx), Env(Ctx);
+  MakeZ3 Converter(Env, SE, Ctx);
   Converter.setLoopInfo(&LI);
   Converter.setLoopNest(&LN);
   Loop *OuterLoop = &LN.getOutermostLoop();
@@ -1945,10 +1838,165 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   GetLiveOuts(OuterLoop, LiveOuts);
   assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
   auto *LiveOut = (*LiveOuts.begin());
-  expr TestPC = Converter.FromVal(LiveOut);
-  // TODO now this result gets the PC directly, no need for synthesis
 
-  LLVM_DEBUG(dbgs() << "Computation found: " << TestPC.to_string() << "\n");
+  expr_vector Arguments(Ctx);
+  Value *LiveOutBase = nullptr;
+  if (auto *GEP = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LiveOut))) {
+    auto Tuple = Converter.FromGEP(GEP);
+    Arguments.push_back(Tuple.Base);
+    LiveOutBase = GEP->getPointerOperand();
+  } else {
+    llvm_unreachable("other liveout types aren't supported right now.");
+  }
+
+  std::vector<z3::sort> Domain = {Arguments[0].get_sort()};
+
+  // TODO make iterative (maybe using df_begin) later
+  z3::sort Range = Arguments[0].get_sort();
+  std::function<void(SmallVector<Value *>, std::vector<z3::sort>, BasicBlock *)> DFS1;
+  DenseMap<Value *, SmallVector<Value *>> Scopes;
+  DFS1 = [&Scopes, &Converter, &Range, &BB2Func, &Ctx, &DT, &DFS1](
+            SmallVector<Value *> Scope,
+            std::vector<z3::sort> Domain,
+            BasicBlock *BB) {
+    for (auto &Inst : *BB) {
+      if (auto *Phi = dyn_cast<PHINode>(&Inst)) {
+        Domain.push_back(Converter.FromVal(Phi).get_sort());
+        Scope.push_back(Phi);
+      } else
+        break;
+    }
+    BB2Func.setZ3Fun(BB, Ctx.recfun(BB->getNameOrAsOperand().c_str(), Domain.size(), Domain.data(), Range));
+    Scopes[BB] = Scope;
+    LLVM_DEBUG({
+       dbgs() << BB->getNameOrAsOperand() << ": ";
+       for (auto S : Domain)
+         dbgs() << S.to_string() << " -> ";
+       dbgs() << Range.to_string() << "\n";
+    });
+    auto *Node = DT.getNode(BB);
+    for (auto *N : *Node) {
+      auto *NewBB = N->getBlock();
+      DFS1(Scope, Domain, NewBB);
+    }
+  };
+
+  DFS1({LiveOutBase}, {Arguments[0].get_sort()}, OuterLoop->getHeader());
+
+  std::function<void(BasicBlock *)> DFS2;
+
+  DFS2 = [&OuterLoop, &Scopes, &Converter, &BB2Func, &Ctx, &DT, &DFS2](
+             BasicBlock *BB) {
+    auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+    assert(Br != nullptr && "only basic blocks terminating in a branch instruction are supported");
+
+
+
+    expr_vector Calls(Ctx);
+
+    for (auto *Block : Br->successors()) {
+      expr_vector Scope(Ctx);
+      for (auto *V : Scopes[Block]) {
+        if (auto *Phi = dyn_cast<PHINode>(V)) {
+          if (Phi->getBasicBlockIndex(BB) > -1) {
+            Scope.push_back(
+                Converter.FromVal(Phi->getIncomingValueForBlock(BB)));
+            continue;
+          }
+        }
+        // otherwise, it MUST be a memory operation.
+        // find the corresponding store (in this block):
+        bool Found = false;
+        for (auto &Inst : *BB) {
+          if (auto *Store = dyn_cast<StoreInst>(&Inst)) {
+            if (getPointerOperand(getLoadStorePointerOperand(Store)) == V) {
+              Scope.push_back(Converter.FromVal(Store));
+              Found = true;
+              break;
+            }
+          }
+        }
+        if (!Found)
+          Scope.push_back(Converter.FromVal(V));
+      }
+      Calls.push_back(BB2Func.getZ3Fun(Block)(Scope));
+    }
+
+    // add to the current scope
+    expr_vector Scope(Ctx);
+    for (auto *V : Scopes[BB])
+      Scope.push_back(Converter.FromVal(V));
+
+    expr Body(Ctx);
+    if (OuterLoop->getUniqueExitBlock() == BB)
+      Body = Scope[0];
+    else if (Br->isUnconditional())
+      Body = Calls[0];
+    else
+      Body = ite(Converter.FromVal(Br->getCondition()), Calls[1], Calls[0]);
+
+    Ctx.recdef(BB2Func.getZ3Fun(BB), Scope, Body);
+
+    LLVM_DEBUG({
+      dbgs() << BB->getNameOrAsOperand() << ", [";
+      for (unsigned i=0; i < Scope.size()-1; ++i)
+        dbgs() << Scope[i].to_string() << ", ";
+      dbgs() << Scope.back().to_string() << "]\n";
+      dbgs() << Body.to_string() << "\n";
+    });
+
+    auto *Node = DT.getNode(BB);
+    for (auto *N : *Node) {
+      auto *NewBB = N->getBlock();
+      DFS2(NewBB);
+    }
+  };
+
+
+  DFS2(OuterLoop->getHeader());
+
+//  DFS2 = [&Converter, &BB2Func, &Ctx, &DFS2](
+//             expr_vector Params,
+//             expr_vector Arguments,
+//             BasicBlock *Pred,
+//             BasicBlock *BB) {
+//    auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+//    assert(Br != nullptr && "only basic blocks terminating in a branch instruction are supported");
+//    // I add to the arguments of my Predecessor
+//    for (auto &Inst : *BB) {
+//      if (auto *Phi = dyn_cast<PHINode>(&Inst)) {
+//        Arguments.push_back(
+//            Converter.FromVal(Phi->getIncomingValueForBlock(Pred)));
+//        Params.push_back(Converter.FromVal(Phi));
+//      } else
+//        break;
+//    }
+//    // I add my own definition
+//    expr Body(Ctx);
+//    if (Br->isUnconditional()) {
+//      Body = DFS2(Params, Params, BB, Br->getSuccessor(1));
+//    } else {
+//      Body = ite(Converter.FromVal(Br->getCondition()),
+//                 DFS2(Params, Params, BB, Br->getSuccessor(0)),
+//                 DFS2(Params, Params, BB, Br->getSuccessor(1)));
+//    }
+//    Ctx.recdef(BB2Func.getZ3Fun(BB), Params, Body);
+//
+//    LLVM_DEBUG({
+//      dbgs() << BB->getNameOrAsOperand() << ", [";
+//      for (int i=0; i < Params.size()-1; ++i)
+//        dbgs() << Params[i].to_string() << ", ";
+//      dbgs() << Params.back().to_string() << "]\n";
+//      dbgs() << Body.to_string() << "\n";
+//    });
+//    // I return myself as a call
+//    return BB2Func.getZ3Fun(BB)(Arguments);
+//  };
+//
+//  expr_vector Params(Ctx), Args(Ctx);
+//  Params.push_back(Arguments[0]);
+//  Args.push_back(Arguments[0]);
+//  DFS2(Params, Args, OuterLoop->getLoopPreheader(), OuterLoop->getHeader());
 
 
   return PreservedAnalyses::all();
