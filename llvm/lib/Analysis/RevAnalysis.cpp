@@ -1955,48 +1955,50 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   DFS2(OuterLoop->getHeader());
 
-//  DFS2 = [&Converter, &BB2Func, &Ctx, &DFS2](
-//             expr_vector Params,
-//             expr_vector Arguments,
-//             BasicBlock *Pred,
-//             BasicBlock *BB) {
-//    auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
-//    assert(Br != nullptr && "only basic blocks terminating in a branch instruction are supported");
-//    // I add to the arguments of my Predecessor
-//    for (auto &Inst : *BB) {
-//      if (auto *Phi = dyn_cast<PHINode>(&Inst)) {
-//        Arguments.push_back(
-//            Converter.FromVal(Phi->getIncomingValueForBlock(Pred)));
-//        Params.push_back(Converter.FromVal(Phi));
-//      } else
-//        break;
-//    }
-//    // I add my own definition
-//    expr Body(Ctx);
-//    if (Br->isUnconditional()) {
-//      Body = DFS2(Params, Params, BB, Br->getSuccessor(1));
-//    } else {
-//      Body = ite(Converter.FromVal(Br->getCondition()),
-//                 DFS2(Params, Params, BB, Br->getSuccessor(0)),
-//                 DFS2(Params, Params, BB, Br->getSuccessor(1)));
-//    }
-//    Ctx.recdef(BB2Func.getZ3Fun(BB), Params, Body);
+  solver Slv(Ctx);
+  Value *N = F.getArg(0);
+  Value *Rptr = F.getArg(1);
+  Value *Col = F.getArg(2);
+  Value *Val = F.getArg(3);
+  Value *X = F.getArg(4);
+  Value *Y = F.getArg(5);
+
+  expr n = Converter.FromVal(N);
+  expr rptr = Converter.FromVal(Rptr);
+  expr val = Converter.FromVal(Val);
+  expr col = Converter.FromVal(Col);
+  expr x = Converter.FromVal(X);
+  expr y = Converter.FromVal(Y);
+  expr zero = Ctx.int_val(0);
+  expr one = Ctx.int_val(1);
+  expr two = Ctx.int_val(2);
+  Slv.add(n == 2);
+//  Slv.add(val[zero] == 1);
+//  Slv.add(val[one] == 1);
 //
-//    LLVM_DEBUG({
-//      dbgs() << BB->getNameOrAsOperand() << ", [";
-//      for (int i=0; i < Params.size()-1; ++i)
-//        dbgs() << Params[i].to_string() << ", ";
-//      dbgs() << Params.back().to_string() << "]\n";
-//      dbgs() << Body.to_string() << "\n";
-//    });
-//    // I return myself as a call
-//    return BB2Func.getZ3Fun(BB)(Arguments);
-//  };
+  Slv.add(rptr[zero] == 0);
+//  Slv.add(rptr[one] == 1);
+//  Slv.add(rptr[two] == 2);
 //
-//  expr_vector Params(Ctx), Args(Ctx);
-//  Params.push_back(Arguments[0]);
-//  Args.push_back(Arguments[0]);
-//  DFS2(Params, Args, OuterLoop->getLoopPreheader(), OuterLoop->getHeader());
+//  Slv.add(col[zero] == 1);
+//  Slv.add(col[one] == 0);
+//
+//  Slv.add(y[zero] == 0);
+//  Slv.add(y[one] == 0);
+//
+//  Slv.add(x[zero] == 1);
+//  Slv.add(x[one] == 2);
+
+  auto result = Slv.check();
+  if (result == z3::sat) {
+    auto model = Slv.get_model();
+    auto output = BB2Func.getZ3Fun(OuterLoop->getHeader())(y, n);
+    LLVM_DEBUG({
+      for (int i=0; i < model.eval(n).as_int64(); ++i)
+        dbgs() << model.eval(output[Ctx.int_val(i)]).to_string() << " ";
+      dbgs() << "\n";
+    });
+  }
 
 
   return PreservedAnalyses::all();
