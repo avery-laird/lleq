@@ -1973,29 +1973,31 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   expr one = Ctx.int_val(1);
   expr two = Ctx.int_val(2);
   Slv.add(n == 2);
-//  Slv.add(val[zero] == 1);
-//  Slv.add(val[one] == 1);
-//
+  Slv.add(val[zero] == 1);
+  Slv.add(val[one] == 1);
+
   Slv.add(rptr[zero] == 0);
-//  Slv.add(rptr[one] == 1);
-//  Slv.add(rptr[two] == 2);
-//
-//  Slv.add(col[zero] == 1);
-//  Slv.add(col[one] == 0);
-//
-//  Slv.add(y[zero] == 0);
-//  Slv.add(y[one] == 0);
-//
-//  Slv.add(x[zero] == 1);
-//  Slv.add(x[one] == 2);
+  Slv.add(rptr[one] == 1);
+  Slv.add(rptr[two] == 2);
+
+  Slv.add(col[zero] == 1);
+  Slv.add(col[one] == 0);
+
+  Slv.add(y[zero] == 0);
+  Slv.add(y[one] == 0);
+
+  Slv.add(x[zero] == 1);
+  Slv.add(x[one] == 2);
+
+//  LLVM_DEBUG(dbgs() << "\n\n" <<  Slv.to_smt2());
 
   auto result = Slv.check();
   if (result == z3::sat) {
     auto model = Slv.get_model();
-    auto output = BB2Func.getZ3Fun(OuterLoop->getHeader())(y, n);
+    auto output = BB2Func.getZ3Fun(LN.getLoopsAtDepth(2)[0]->getHeader())(y, zero, Ctx.fpa_val(0.0), rptr[zero]);
     LLVM_DEBUG({
       for (int i=0; i < model.eval(n).as_int64(); ++i)
-        dbgs() << model.eval(output[Ctx.int_val(i)]).to_string() << " ";
+        dbgs() << model.eval(output[Ctx.int_val(i)]).as_double() << " ";
       dbgs() << "\n";
     });
   }
