@@ -666,9 +666,12 @@ public:
     case Type::TypeID::IntegerTyID:
       return c.int_sort();
     case Type::TypeID::DoubleTyID:
+      // TODO remove this debug
+//      return c.int_sort();
       unsigned Mantissa = APFloat::semanticsPrecision(T->getFltSemantics());
       unsigned Exponent = APFloat::semanticsSizeInBits(T->getFltSemantics()) - Mantissa;
       return c.fpa_sort(Exponent, Mantissa);
+//      return c.fpa_sort<64>();
     }
   }
 
@@ -699,10 +702,16 @@ protected:
   expr set(Value *V, const expr &Expr) override { return Map.setZ3(V, Expr); }
 
   expr FromConst(Constant *V) override {
+    APSInt Result;
+    bool isExact;
+
     switch (V->getType()->getTypeID()) {
     case Type::TypeID::IntegerTyID:
       return c.int_val(dyn_cast<ConstantInt>(V)->getSExtValue());
     case Type::TypeID::DoubleTyID:
+      // TODO remove this debug hack
+//      dyn_cast<ConstantFP>(V)->getValue().convertToInteger(Result, APFloatBase::rmNearestTiesToEven, &isExact);
+//      return c.int_val(Result.getSExtValue());
       return c.fpa_val(dyn_cast<ConstantFP>(V)->getValue().convertToDouble());
     default:
       llvm_unreachable("unsupported constant type");
@@ -757,7 +766,7 @@ protected:
       expr A = FromVal(CI->getOperand(0));
       expr B = FromVal(CI->getOperand(1));
       expr C = FromVal(CI->getOperand(2));
-      return A * B + C;
+      return fma(A, B, C, c.fpa_rounding_mode());
     }
     llvm_unreachable("arbitrary functions aren't supported.");
   }
@@ -1966,6 +1975,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   expr n = Converter.FromVal(N);
   expr rptr = Converter.FromVal(Rptr);
   expr val = Converter.FromVal(Val);
+  LLVM_DEBUG(dbgs() << val.to_string() << ": " << val.get_sort().to_string() << "\n");
   expr col = Converter.FromVal(Col);
   expr x = Converter.FromVal(X);
   expr y = Converter.FromVal(Y);
@@ -1991,13 +2001,16 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
 //  LLVM_DEBUG(dbgs() << "\n\n" <<  Slv.to_smt2());
 
-  auto result = Slv.check();
-  if (result == z3::sat) {
-    auto model = Slv.get_model();
-    auto output = BB2Func.getZ3Fun(LN.getLoopsAtDepth(2)[0]->getHeader())(y, zero, Ctx.fpa_val(0.0), rptr[zero]);
+  auto Result = Slv.check();
+  if (Result == z3::sat) {
+    auto Model = Slv.get_model();
+    auto Output = BB2Func.getZ3Fun(OuterLoop->getHeader())(y, 0);
     LLVM_DEBUG({
-      for (int i=0; i < model.eval(n).as_int64(); ++i)
-        dbgs() << model.eval(output[Ctx.int_val(i)]).as_double() << " ";
+      dbgs() << "Concrete Test output: \n";
+      for (int i=0; i < Model.eval(n).as_int64(); ++i) {
+        auto elem = Model.eval(Output[Ctx.int_val(i)]);
+        dbgs() << Z3_get_numeral_string(Ctx, elem) << " ";
+      }
       dbgs() << "\n";
     });
   }
