@@ -1964,56 +1964,71 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   DFS2(OuterLoop->getHeader());
 
-  solver Slv(Ctx);
-  Value *N = F.getArg(0);
-  Value *Rptr = F.getArg(1);
-  Value *Col = F.getArg(2);
-  Value *Val = F.getArg(3);
-  Value *X = F.getArg(4);
-  Value *Y = F.getArg(5);
+//  func_decl_vector Kernels(Ctx);
+//  struct KernelRecord {
+//    unsigned Idx;
+//    std::string Path;
+//  };
+//  std::vector<KernelRecord> KRecords = {
+//      {0, "gemv_opt.ll"}
+//  };
+//
+//  func_decl_vector StorageFormats(Ctx);
+//
+//  for (auto &R : KRecords) {
+//
+//  }
 
-  expr n = Converter.FromVal(N);
-  expr rptr = Converter.FromVal(Rptr);
-  expr val = Converter.FromVal(Val);
-  LLVM_DEBUG(dbgs() << val.to_string() << ": " << val.get_sort().to_string() << "\n");
-  expr col = Converter.FromVal(Col);
-  expr x = Converter.FromVal(X);
-  expr y = Converter.FromVal(Y);
-  expr zero = Ctx.int_val(0);
-  expr one = Ctx.int_val(1);
-  expr two = Ctx.int_val(2);
-  Slv.add(n == 2);
-  Slv.add(val[zero] == 1);
-  Slv.add(val[one] == 1);
 
-  Slv.add(rptr[zero] == 0);
-  Slv.add(rptr[one] == 1);
-  Slv.add(rptr[two] == 2);
 
-  Slv.add(col[zero] == 1);
-  Slv.add(col[one] == 0);
-
-  Slv.add(y[zero] == 0);
-  Slv.add(y[one] == 0);
-
-  Slv.add(x[zero] == 1);
-  Slv.add(x[one] == 2);
-
-//  LLVM_DEBUG(dbgs() << "\n\n" <<  Slv.to_smt2());
-
-  auto Result = Slv.check();
-  if (Result == z3::sat) {
-    auto Model = Slv.get_model();
-    auto Output = BB2Func.getZ3Fun(OuterLoop->getHeader())(y, 0);
-    LLVM_DEBUG({
-      dbgs() << "Concrete Test output: \n";
-      for (int i=0; i < Model.eval(n).as_int64(); ++i) {
-        auto elem = Model.eval(Output[Ctx.int_val(i)]);
-        dbgs() << Z3_get_numeral_string(Ctx, elem) << " ";
-      }
-      dbgs() << "\n";
-    });
-  }
+//  solver Slv(Ctx);
+//  Value *N = F.getArg(0);
+//  Value *Rptr = F.getArg(1);
+//  Value *Col = F.getArg(2);
+//  Value *Val = F.getArg(3);
+//  Value *X = F.getArg(4);
+//  Value *Y = F.getArg(5);
+//
+//  expr n = Converter.FromVal(N);
+//  expr rptr = Converter.FromVal(Rptr);
+//  expr val = Converter.FromVal(Val);
+//  LLVM_DEBUG(dbgs() << val.to_string() << ": " << val.get_sort().to_string() << "\n");
+//  expr col = Converter.FromVal(Col);
+//  expr x = Converter.FromVal(X);
+//  expr y = Converter.FromVal(Y);
+//  expr zero = Ctx.int_val(0);
+//  expr one = Ctx.int_val(1);
+//  expr two = Ctx.int_val(2);
+//  Slv.add(n == 2);
+//  Slv.add(val[zero] == 1);
+//  Slv.add(val[one] == 1);
+//
+//  Slv.add(rptr[zero] == 0);
+//  Slv.add(rptr[one] == 1);
+//  Slv.add(rptr[two] == 2);
+//
+//  Slv.add(col[zero] == 1);
+//  Slv.add(col[one] == 0);
+//
+//  Slv.add(y[zero] == 0);
+//  Slv.add(y[one] == 0);
+//
+//  Slv.add(x[zero] == 1);
+//  Slv.add(x[one] == 2);
+//
+//  auto Result = Slv.check();
+//  if (Result == z3::sat) {
+//    auto Model = Slv.get_model();
+//    auto Output = BB2Func.getZ3Fun(OuterLoop->getHeader())(y, 0);
+//    LLVM_DEBUG({
+//      dbgs() << "Concrete Test output: \n";
+//      for (int i=0; i < Model.eval(n).as_int64(); ++i) {
+//        auto elem = Model.eval(Output[Ctx.int_val(i)]);
+//        dbgs() << Z3_get_numeral_string(Ctx, elem) << " ";
+//      }
+//      dbgs() << "\n";
+//    });
+//  }
 
 
   return PreservedAnalyses::all();
