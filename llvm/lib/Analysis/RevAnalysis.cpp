@@ -572,11 +572,7 @@ protected:
   SmallPtrSet<Value *, 5> BuildRecursive;
   bool LockRecursion = false;
 public:
-  MakeSMT(TerminalMap &Map, ScalarEvolution &SE) : Map(Map), SE(SE) {}
-
-  void setLoop(Loop *NewLoop) { L = NewLoop; }
-  void setLoopInfo(LoopInfo *_LI) { LI = _LI; }
-  void setLoopNest(LoopNest *_LN) { LN = _LN; }
+  MakeSMT(TerminalMap &Map, ScalarEvolution &SE) : SE(SE), Map(Map) {}
 
   ExprTy FromVal(Value *V) {
     // update the current loop
@@ -592,17 +588,6 @@ public:
       Instruction *I = dyn_cast<Instruction>(V);
       if (I == nullptr)
         llvm_unreachable("unsupported value type.");
-      // imaginary "0th" loop to force the outermost loop as also recursive
-      unsigned Depth = L == nullptr ? 0 : L->getLoopDepth();
-      Loop *CurrentLoop = LI->getLoopFor(I->getParent());
-      if (CurrentLoop != L &&
-          CurrentLoop->getLoopDepth() > Depth &&
-          (I->getParent() == CurrentLoop->getLoopLatch()) &&
-          !LockRecursion) {
-        BuildRecursive.insert(V);
-        LockRecursion = CurrentLoop->getLoopDepth() == LN->getNestDepth();
-      }
-      setLoop(CurrentLoop);
 
       switch (I->getOpcode()) {
       case Instruction::Load:
@@ -652,6 +637,7 @@ protected:
   virtual ExprTy FromCmpInst(CmpInst *V) = 0;
   virtual ExprTy FromCallInst(CallInst *V) = 0;
 
+  virtual SortTy ToSort(Value *V) = 0;
   virtual SortTy ToSort(Type *T) = 0;
 };
 
@@ -659,7 +645,28 @@ class MakeZ3 : public MakeSMT<expr, z3::sort> {
 public:
   MakeZ3(TerminalMap &Map, ScalarEvolution &SE, context &c) : MakeSMT(Map, SE), c(c) {}
 
+  z3::sort ToSort(Value *V) override {
+    auto *T = V->getType();
+    switch(T->getTypeID()) {
+    default:
+      llvm_unreachable("unsupported LLVM type.");
+    case Type::TypeID::IntegerTyID:
+    case Type::TypeID::DoubleTyID:
+      return ToSort(T);
+    case Type::TypeID::PointerTyID:
+      // try to find a use that we can infer the type from
+      for (auto *Use : V->users()) {
+        if ((isa<LoadInst>(Use) || isa<StoreInst>(Use)))
+          return c.array_sort(c.int_sort(), ToSort(getLoadStoreType(Use)));
+        if (auto *GEP = dyn_cast<GEPOperator>(Use))
+          return c.array_sort(c.int_sort(), ToSort(GEP->getSourceElementType()));
+      }
+      llvm_unreachable("couldn't infer the type of the pointer.");
+    }
+  }
+
   z3::sort ToSort(Type *T) override {
+    unsigned Mantissa, Exponent;
     switch(T->getTypeID()) {
     default:
       llvm_unreachable("unsupported LLVM type.");
@@ -667,11 +674,11 @@ public:
       return c.int_sort();
     case Type::TypeID::DoubleTyID:
       // TODO remove this debug
-//      return c.int_sort();
-      unsigned Mantissa = APFloat::semanticsPrecision(T->getFltSemantics());
-      unsigned Exponent = APFloat::semanticsSizeInBits(T->getFltSemantics()) - Mantissa;
+      //      return c.int_sort();
+      Mantissa = APFloat::semanticsPrecision(T->getFltSemantics());
+      Exponent = APFloat::semanticsSizeInBits(T->getFltSemantics()) - Mantissa;
       return c.fpa_sort(Exponent, Mantissa);
-//      return c.fpa_sort<64>();
+      //      return c.fpa_sort<64>();
     }
   }
 
@@ -681,7 +688,7 @@ public:
     if (!count(GEP->getPointerOperand())) {
       // TODO assume 1d memory accesses
       z3::sort ArraySort = c.array_sort(
-          ToSort(GEP->getOperand(1)->getType()),
+          ToSort(GEP->getOperand(1)),
           ToSort(GEP->getResultElementType()));
       set(
           GEP->getPointerOperand(),
@@ -753,7 +760,11 @@ protected:
     auto Right = FromVal(Cmp->getOperand(1));
     switch (Cmp->getPredicate()) {
     case CmpInst::ICMP_SLT:
+    case CmpInst::ICMP_ULT:
       return Left < Right;
+    case CmpInst::ICMP_SGT:
+    case CmpInst::ICMP_UGT:
+      return Left > Right;
     default:
       llvm_unreachable("unsupported predicate type.");
     }
@@ -794,7 +805,7 @@ protected:
 //        }
 //      }
 //    }
-    return c.constant(V->getNameOrAsOperand().c_str(), ToSort(V->getType()));
+    return c.constant(V->getNameOrAsOperand().c_str(), ToSort(V));
   }
 };
 
@@ -803,7 +814,15 @@ protected:
 class SSA2Func {
   using ConverterTy = MakeZ3;
 public:
-  SSA2Func(context &Ctx, DominatorTree &DT, ConverterTy &Converter, z3::sort &Range) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Range) {}
+  SSA2Func(context &Ctx, DominatorTree &DT, ConverterTy &Converter, Value *LiveOut) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Ctx), Output(Ctx) {
+    if (auto *GEP = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LiveOut))) {
+      auto Tuple = Converter.FromGEP(GEP);
+      Range = Tuple.Base.get_sort();
+      Output = Tuple.Base;
+    } else {
+      llvm_unreachable("other liveout types aren't supported right now.");
+    }
+  }
 
   func_decl fromFunction(Function *F) {
     BasicBlock *BB = &F->getEntryBlock();
@@ -811,7 +830,8 @@ public:
     for (auto &Use : F->args()) FArgs.push_back(&Use);
     Scopes[BB] = makeScope(BB, FArgs);
     makeScopes(BB);
-    makeCalls(BB);
+    for (auto &NewBB : *F)
+      makeCall(&NewBB);
     return BB2Func.getZ3Fun(BB);
   }
 
@@ -830,22 +850,21 @@ public:
     auto *Node = DT.getNode(BB);
     for (auto *N : *Node) {
       auto *NewBB = N->getBlock();
-      Scopes[NewBB] = makeScope(BB, Scope);
-      makeScopes(BB);
+      Scopes[NewBB] = makeScope(NewBB, Scope);
+      makeScopes(NewBB);
     }
   }
 
-  void makeCalls(BasicBlock *BB) {
-    expr_vector ExprScope(Ctx);
+  void makeCall(BasicBlock *BB) {
+    expr_vector Scope(Ctx);
     // add to the current scope
     for (auto *V : Scopes[BB])
-      ExprScope.push_back(Converter.FromVal(V));
+      Scope.push_back(Converter.FromVal(V));
 
     if (auto *Ret = dyn_cast<ReturnInst>(BB->getTerminator())) {
-      Ctx.recdef(BB2Func.getZ3Fun(BB), ExprScope, ExprScope[0]);
+      Ctx.recdef(BB2Func.getZ3Fun(BB), Scope, Output);
       return;
     }
-
 
     // after setting scopes, start wiring functions together
     auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
@@ -885,15 +904,19 @@ public:
     else
       Body = ite(Converter.FromVal(Br->getCondition()), Calls[1], Calls[0]);
 
-    Ctx.recdef(BB2Func.getZ3Fun(BB), ExprScope, Body);
+    Ctx.recdef(BB2Func.getZ3Fun(BB), Scope, Body);
 
     LLVM_DEBUG({
       dbgs() << BB->getNameOrAsOperand() << ", [";
-      for (unsigned i=0; i < ExprScope.size()-1; ++i)
-        dbgs() << ExprScope[i].to_string() << ", ";
-      dbgs() << ExprScope.back().to_string() << "]\n";
+      for (unsigned i=0; i < Scope.size()-1; ++i)
+        dbgs() << Scope[i].to_string() << ", ";
+      dbgs() << Scope.back().to_string() << "]\n";
       dbgs() << Body.to_string() << "\n";
     });
+  }
+
+  func_decl operator[](Value *V) {
+    return BB2Func.getZ3Fun(V);
   }
 
 private:
@@ -911,7 +934,8 @@ private:
   TerminalMap BB2Func;
   DominatorTree &DT;
   ConverterTy &Converter;
-  z3::sort &Range;
+  z3::sort Range;
+  expr Output;
 };
 
 PreservedAnalyses RevAnalysisPass::run(Function &F,
@@ -958,8 +982,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   context Ctx;
   TerminalMap BB2Func(Ctx), Env(Ctx);
   MakeZ3 Converter(Env, SE, Ctx);
-  Converter.setLoopInfo(&LI);
-  Converter.setLoopNest(&LN);
+//  Converter.setLoopInfo(&LI);
+//  Converter.setLoopNest(&LN);
   Loop *OuterLoop = &LN.getOutermostLoop();
 
   SmallPtrSet<Value *, 4> LiveOuts;
@@ -977,111 +1001,115 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     llvm_unreachable("other liveout types aren't supported right now.");
   }
 
-  std::vector<z3::sort> Domain = {Arguments[0].get_sort()};
-
-  // TODO make iterative (maybe using df_begin) later
   z3::sort Range = Arguments[0].get_sort();
-  std::function<void(SmallVector<Value *>, std::vector<z3::sort>, BasicBlock *)> DFS1;
-  DenseMap<Value *, SmallVector<Value *>> Scopes;
-  DFS1 = [&Scopes, &Converter, &Range, &BB2Func, &Ctx, &DT, &DFS1](
-            SmallVector<Value *> Scope,
-            std::vector<z3::sort> Domain,
-            BasicBlock *BB) {
-    for (auto &Inst : *BB) {
-      if (auto *Phi = dyn_cast<PHINode>(&Inst)) {
-        Domain.push_back(Converter.FromVal(Phi).get_sort());
-        Scope.push_back(Phi);
-      } else
-        break;
-    }
-    BB2Func.setZ3Fun(BB, Ctx.recfun(BB->getNameOrAsOperand().c_str(), Domain.size(), Domain.data(), Range));
-    Scopes[BB] = Scope;
-    LLVM_DEBUG({
-       dbgs() << BB->getNameOrAsOperand() << ": ";
-       for (auto S : Domain)
-         dbgs() << S.to_string() << " -> ";
-       dbgs() << Range.to_string() << "\n";
-    });
-    auto *Node = DT.getNode(BB);
-    for (auto *N : *Node) {
-      auto *NewBB = N->getBlock();
-      DFS1(Scope, Domain, NewBB);
-    }
-  };
+  SSA2Func Translate(Ctx, DT, Converter, LiveOut);
+  Translate.fromFunction(&F);
 
-  DFS1({LiveOutBase}, {Arguments[0].get_sort()}, OuterLoop->getHeader());
-
-  std::function<void(BasicBlock *)> DFS2;
-
-  DFS2 = [&OuterLoop, &Scopes, &Converter, &BB2Func, &Ctx, &DT, &DFS2](
-             BasicBlock *BB) {
-    auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
-    assert(Br != nullptr && "only basic blocks terminating in a branch instruction are supported");
-
-
-
-    expr_vector Calls(Ctx);
-
-    for (auto *Block : Br->successors()) {
-      expr_vector Scope(Ctx);
-      for (auto *V : Scopes[Block]) {
-        if (auto *Phi = dyn_cast<PHINode>(V)) {
-          if (Phi->getBasicBlockIndex(BB) > -1) {
-            Scope.push_back(
-                Converter.FromVal(Phi->getIncomingValueForBlock(BB)));
-            continue;
-          }
-        }
-        // otherwise, it MUST be a memory operation.
-        // find the corresponding store (in this block):
-        bool Found = false;
-        for (auto &Inst : *BB) {
-          if (auto *Store = dyn_cast<StoreInst>(&Inst)) {
-            if (getPointerOperand(getLoadStorePointerOperand(Store)) == V) {
-              Scope.push_back(Converter.FromVal(Store));
-              Found = true;
-              break;
-            }
-          }
-        }
-        if (!Found)
-          Scope.push_back(Converter.FromVal(V));
-      }
-      Calls.push_back(BB2Func.getZ3Fun(Block)(Scope));
-    }
-
-    // add to the current scope
-    expr_vector Scope(Ctx);
-    for (auto *V : Scopes[BB])
-      Scope.push_back(Converter.FromVal(V));
-
-    expr Body(Ctx);
-    if (OuterLoop->getUniqueExitBlock() == BB)
-      Body = Scope[0];
-    else if (Br->isUnconditional())
-      Body = Calls[0];
-    else
-      Body = ite(Converter.FromVal(Br->getCondition()), Calls[1], Calls[0]);
-
-    Ctx.recdef(BB2Func.getZ3Fun(BB), Scope, Body);
-
-    LLVM_DEBUG({
-      dbgs() << BB->getNameOrAsOperand() << ", [";
-      for (unsigned i=0; i < Scope.size()-1; ++i)
-        dbgs() << Scope[i].to_string() << ", ";
-      dbgs() << Scope.back().to_string() << "]\n";
-      dbgs() << Body.to_string() << "\n";
-    });
-
-    auto *Node = DT.getNode(BB);
-    for (auto *N : *Node) {
-      auto *NewBB = N->getBlock();
-      DFS2(NewBB);
-    }
-  };
-
-
-  DFS2(OuterLoop->getHeader());
+//  std::vector<z3::sort> Domain = {Arguments[0].get_sort()};
+//
+//  // TODO make iterative (maybe using df_begin) later
+//  z3::sort Range = Arguments[0].get_sort();
+//  std::function<void(SmallVector<Value *>, std::vector<z3::sort>, BasicBlock *)> DFS1;
+//  DenseMap<Value *, SmallVector<Value *>> Scopes;
+//  DFS1 = [&Scopes, &Converter, &Range, &BB2Func, &Ctx, &DT, &DFS1](
+//            SmallVector<Value *> Scope,
+//            std::vector<z3::sort> Domain,
+//            BasicBlock *BB) {
+//    for (auto &Inst : *BB) {
+//      if (auto *Phi = dyn_cast<PHINode>(&Inst)) {
+//        Domain.push_back(Converter.FromVal(Phi).get_sort());
+//        Scope.push_back(Phi);
+//      } else
+//        break;
+//    }
+//    BB2Func.setZ3Fun(BB, Ctx.recfun(BB->getNameOrAsOperand().c_str(), Domain.size(), Domain.data(), Range));
+//    Scopes[BB] = Scope;
+//    LLVM_DEBUG({
+//       dbgs() << BB->getNameOrAsOperand() << ": ";
+//       for (auto S : Domain)
+//         dbgs() << S.to_string() << " -> ";
+//       dbgs() << Range.to_string() << "\n";
+//    });
+//    auto *Node = DT.getNode(BB);
+//    for (auto *N : *Node) {
+//      auto *NewBB = N->getBlock();
+//      DFS1(Scope, Domain, NewBB);
+//    }
+//  };
+//
+//  DFS1({LiveOutBase}, {Arguments[0].get_sort()}, OuterLoop->getHeader());
+//
+//  std::function<void(BasicBlock *)> DFS2;
+//
+//  DFS2 = [&OuterLoop, &Scopes, &Converter, &BB2Func, &Ctx, &DT, &DFS2](
+//             BasicBlock *BB) {
+//    auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+//    assert(Br != nullptr && "only basic blocks terminating in a branch instruction are supported");
+//
+//
+//
+//    expr_vector Calls(Ctx);
+//
+//    for (auto *Block : Br->successors()) {
+//      expr_vector Scope(Ctx);
+//      for (auto *V : Scopes[Block]) {
+//        if (auto *Phi = dyn_cast<PHINode>(V)) {
+//          if (Phi->getBasicBlockIndex(BB) > -1) {
+//            Scope.push_back(
+//                Converter.FromVal(Phi->getIncomingValueForBlock(BB)));
+//            continue;
+//          }
+//        }
+//        // otherwise, it MUST be a memory operation.
+//        // find the corresponding store (in this block):
+//        bool Found = false;
+//        for (auto &Inst : *BB) {
+//          if (auto *Store = dyn_cast<StoreInst>(&Inst)) {
+//            if (getPointerOperand(getLoadStorePointerOperand(Store)) == V) {
+//              Scope.push_back(Converter.FromVal(Store));
+//              Found = true;
+//              break;
+//            }
+//          }
+//        }
+//        if (!Found)
+//          Scope.push_back(Converter.FromVal(V));
+//      }
+//      Calls.push_back(BB2Func.getZ3Fun(Block)(Scope));
+//    }
+//
+//    // add to the current scope
+//    expr_vector Scope(Ctx);
+//    for (auto *V : Scopes[BB])
+//      Scope.push_back(Converter.FromVal(V));
+//
+//    expr Body(Ctx);
+//    if (OuterLoop->getUniqueExitBlock() == BB)
+//      Body = Scope[0];
+//    else if (Br->isUnconditional())
+//      Body = Calls[0];
+//    else
+//      Body = ite(Converter.FromVal(Br->getCondition()), Calls[1], Calls[0]);
+//
+//    Ctx.recdef(BB2Func.getZ3Fun(BB), Scope, Body);
+//
+//    LLVM_DEBUG({
+//      dbgs() << BB->getNameOrAsOperand() << ", [";
+//      for (unsigned i=0; i < Scope.size()-1; ++i)
+//        dbgs() << Scope[i].to_string() << ", ";
+//      dbgs() << Scope.back().to_string() << "]\n";
+//      dbgs() << Body.to_string() << "\n";
+//    });
+//
+//    auto *Node = DT.getNode(BB);
+//    for (auto *N : *Node) {
+//      auto *NewBB = N->getBlock();
+//      DFS2(NewBB);
+//    }
+//  };
+//
+//
+//  DFS2(OuterLoop->getHeader());
 
 //  func_decl_vector Kernels(Ctx);
 //  struct KernelRecord {
@@ -1100,14 +1128,14 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
 
 
-//  solver Slv(Ctx);
-//  Value *N = F.getArg(0);
-//  Value *Rptr = F.getArg(1);
-//  Value *Col = F.getArg(2);
-//  Value *Val = F.getArg(3);
-//  Value *X = F.getArg(4);
-//  Value *Y = F.getArg(5);
-//
+  solver Slv(Ctx);
+  Value *N = F.getArg(0);
+  Value *Rptr = F.getArg(1);
+  Value *Col = F.getArg(2);
+  Value *Val = F.getArg(3);
+  Value *X = F.getArg(4);
+  Value *Y = F.getArg(5);
+
 //  expr n = Converter.FromVal(N);
 //  expr rptr = Converter.FromVal(Rptr);
 //  expr val = Converter.FromVal(Val);
@@ -1115,9 +1143,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 //  expr col = Converter.FromVal(Col);
 //  expr x = Converter.FromVal(X);
 //  expr y = Converter.FromVal(Y);
-//  expr zero = Ctx.int_val(0);
-//  expr one = Ctx.int_val(1);
-//  expr two = Ctx.int_val(2);
+  expr zero = Ctx.int_val(0);
+  expr one = Ctx.int_val(1);
+  expr two = Ctx.int_val(2);
+
 //  Slv.add(n == 2);
 //  Slv.add(val[zero] == 1);
 //  Slv.add(val[one] == 1);
@@ -1134,20 +1163,55 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 //
 //  Slv.add(x[zero] == 1);
 //  Slv.add(x[one] == 2);
-//
-//  auto Result = Slv.check();
-//  if (Result == z3::sat) {
-//    auto Model = Slv.get_model();
-//    auto Output = BB2Func.getZ3Fun(OuterLoop->getHeader())(y, 0);
-//    LLVM_DEBUG({
-//      dbgs() << "Concrete Test output: \n";
-//      for (int i=0; i < Model.eval(n).as_int64(); ++i) {
-//        auto elem = Model.eval(Output[Ctx.int_val(i)]);
-//        dbgs() << Z3_get_numeral_string(Ctx, elem) << " ";
-//      }
-//      dbgs() << "\n";
-//    });
-//  }
+  expr n = Ctx.int_val(2);
+  Slv.add(n == 2);
+  expr rptr = Converter.FromVal(Rptr);
+  expr val = Converter.FromVal(Val);
+  expr col = Converter.FromVal(Col);
+  expr x = Converter.FromVal(X);
+  expr y = Converter.FromVal(Y);
+//  val = store(val, 0, 1);
+//  val = store(val, 1, 1);
+//  rptr = store(rptr, 0, 0);
+//  rptr = store(rptr, 1, 1);
+//  rptr = store(rptr, 2, 2);
+//  col = store(col, 0, 1);
+//  col = store(col, 1, 0);
+//  y = store(y, 0, 0);
+//  y = store(y, 1, 0);
+//  x = store(x, 0, 1);
+//  x = store(x, 1, 2);
+    Slv.add(val[zero] == 1);
+    Slv.add(val[one] == 1);
+
+    Slv.add(rptr[zero] == 0);
+    Slv.add(rptr[one] == 1);
+    Slv.add(rptr[two] == 2);
+
+    Slv.add(col[zero] == 1);
+    Slv.add(col[one] == 0);
+
+    Slv.add(y[zero] == 0);
+    Slv.add(y[one] == 0);
+
+    Slv.add(x[zero] == 1);
+    Slv.add(x[one] == 2);
+
+
+  auto Result = Slv.check();
+  if (Result == z3::sat) {
+    auto Model = Slv.get_model();
+    std::vector<expr> Args = {n, rptr, col, val, x, y};
+    auto Output = Translate[&F.getEntryBlock()](Args.size(), Args.data());
+    LLVM_DEBUG({
+      dbgs() << "Concrete Test output: \n";
+      for (int i=0; i < n.as_int64(); ++i) {
+        auto elem = Model.eval(Output[Ctx.int_val(i)].simplify());
+        dbgs() << Z3_get_numeral_string(Ctx, elem) << " ";
+      }
+      dbgs() << "\n";
+    });
+  }
 
 
   return PreservedAnalyses::all();
