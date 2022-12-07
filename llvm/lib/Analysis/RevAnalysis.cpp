@@ -799,1001 +799,120 @@ protected:
 };
 
 
-template<typename ExprTy, typename SortTy>
-class PostConditionBuilder {
-  using Backend = MakeSMT<ExprTy, SortTy>;
-  using RMapTy = DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode*>>;
+
+class SSA2Func {
+  using ConverterTy = MakeZ3;
 public:
-  PostConditionBuilder(Backend &C, RMapTy &RM) : Converter(C), ReductionMap(RM) {}
+  SSA2Func(context &Ctx, DominatorTree &DT, ConverterTy &Converter, z3::sort &Range) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Range) {}
 
-  ExprTy FromVal(Value *V) {
-    // visit all leaves first, replace any special computation
-    if (auto *Inst = dyn_cast<Instruction>(V)) {
-      for (auto &Op : Inst->operands()) {
-        if (ReductionMap.count(Op.get()))
+  func_decl fromFunction(Function *F) {
+    BasicBlock *BB = &F->getEntryBlock();
+    std::vector<Value *> FArgs;
+    for (auto &Use : F->args()) FArgs.push_back(&Use);
+    Scopes[BB] = makeScope(BB, FArgs);
+    makeScopes(BB);
+    makeCalls(BB);
+    return BB2Func.getZ3Fun(BB);
+  }
 
-        ExprTy Expr = Converter.FromVal(&Op);
-      }
+  void makeScopes(BasicBlock *BB) {
+    auto &Scope = Scopes[BB];
+    // make domain
+    std::vector<z3::sort> Domain;
+    for (auto *V : Scope) Domain.push_back(Converter.FromVal(V).get_sort());
+    BB2Func.setZ3Fun(BB, Ctx.recfun(BB->getNameOrAsOperand().c_str(), Domain.size(), Domain.data(), Range));
+    LLVM_DEBUG({
+      dbgs() << BB->getNameOrAsOperand() << ": ";
+      for (auto S : Domain)
+        dbgs() << S.to_string() << " -> ";
+      dbgs() << Range.to_string() << "\n";
+    });
+    auto *Node = DT.getNode(BB);
+    for (auto *N : *Node) {
+      auto *NewBB = N->getBlock();
+      Scopes[NewBB] = makeScope(BB, Scope);
+      makeScopes(BB);
     }
   }
 
-private:
-  Backend &Converter;
-  RMapTy &ReductionMap;
-};
+  void makeCalls(BasicBlock *BB) {
+    expr_vector ExprScope(Ctx);
+    // add to the current scope
+    for (auto *V : Scopes[BB])
+      ExprScope.push_back(Converter.FromVal(V));
 
-template<typename ExprTy>
-class VerificationConditions {
-public:
-  VerificationConditions(Loop *L, Value *LiveOut) : L(L), LiveOut(LiveOut) {}
-
-  ExprTy MakeInvariant() {
-    // (1) trace compute chain
-  }
-private:
-  Loop *L;
-  Value *LiveOut;
-};
-
-class CVCConv {
-public:
-  Solver slv;
-  DenseMap<int, Sort> SpecialSorts;
-  SmallSet<Term *, 16> Leaves;
-  Term RoundingMode;
-  std::vector<Term *> SumArgs;
-  std::vector<Term *> Terminals;
-  DenseMap<Term *, Value *> Terms2Vals;
-  DenseMap<Term *, Value *> Uni2Vals;
-  Term *lb;
-  Term *ub;
-  Term *indvar;
-
-  Term *liveout; // reduction phi in header section
-  Value *liveoutend;  // the end of reduction phi
-
-  DenseMap<StringRef, Term> SynthFuns;
-  DenseMap<Term *, Term> UniversalVars;
-  DenseMap<StringRef, Term> SynthFunCalls;
-  Sort fpsort;
-  Term pc;
-  // TODO destroy this in CVCConv destructor
-  // this is really inefficient but DenseMap was mangling the stringrefs all the time,
-  // couldn't figure out why
-  std::vector<std::pair<Term, Term>> PCRegister; // stores equality relationships from PC
-
-  class UFInfo {
-  public:
-    std::vector<Term> BoundTerms;
-    Term UF;
-    std::vector<Value *> ArgVals;
-    UFInfo(std::vector<Term> BT, Term UF, std::vector<Value *> AV) : BoundTerms(BT), UF(UF), ArgVals(AV) {}
-  };
-
-  CVCConv() {
-    slv.setOption("sygus", "true");
-    slv.setOption("incremental", "false");
-    slv.setOption("sygus-rec-fun", "true");
-    slv.setOption("fmf-fun", "true");
-    slv.setOption("output", "sygus");
-    fpsort = slv.mkFloatingPointSort(11, 53);
-    // TODO assumes double, add float
-    SpecialSorts[Type::TypeID::DoubleTyID] = fpsort;
-    // TODO assume the same rounding mode for all operations
-    RoundingMode = slv.mkRoundingMode(ROUND_NEAREST_TIES_TO_EVEN);
-  };
-
-  Sort ToSort(Type *T) {
-    if (T->getTypeID() == Type::TypeID::IntegerTyID)
-      return slv.getIntegerSort();
-    if (T->getTypeID() == Type::TypeID::DoubleTyID)
-      return SpecialSorts[T->getTypeID()];
-    assert(0 && "unsupported LLVM Type");
-  }
-
-  Term *MakeTerm(Value *V, DenseMap<Value *, Term> &Env) {
-    if (Env.count(V))
-      return &Env[V];
-    if (auto *Const = dyn_cast<Constant>(V)) {
-      switch (Const->getType()->getTypeID()) {
-      case Type::TypeID::IntegerTyID:
-        return &(Env[V] =
-                     slv.mkInteger(dyn_cast<ConstantInt>(V)->getSExtValue()));
-        break;
-      case Type::TypeID::DoubleTyID:
-        return &(
-            Env[V] = slv.mkFloatingPoint(
-                11, 53,
-                slv.mkBitVector(
-                    64,
-                    dyn_cast<ConstantFP>(V)->getValue().convertToDouble())));
-      default:
-        assert(0 && "unsupported constant type");
-        break;
-      }
-    } else if (isa<LoadInst>(V) || isa<StoreInst>(V)) {
-      auto *GEP = dyn_cast<GEPOperator>(getLoadStorePointerOperand(V));
-      // eg. y[i]
-      Term *ArrayAddr = MakeTerm(GEP, Env); // (tuple base offset)
-      // if store, y[i] = ...  (store)
-      // if load %0 = y[i]     (select)
-      Kind ArrayOp = isa<LoadInst>(V) ? SELECT : STORE;
-      std::vector<Term> ArgArray = {ArrayAddr->operator[](1),
-                                    ArrayAddr->operator[](2)};
-      if (auto *Store = dyn_cast<StoreInst>(V))
-        ArgArray.push_back(*MakeTerm(Store->getValueOperand(), Env));
-      return &(Env[V] = slv.mkTerm(ArrayOp, ArgArray));
-    } else if (auto *GEP = dyn_cast<GEPOperator>(V)) {
-      assert(GEP->getNumIndices() == 1);
-      // make the array if it doesn't exist
-      if (!Env.count(GEP->getPointerOperand())) {
-        // TODO assume 1d memory accesses
-        Sort asort = slv.mkArraySort(ToSort(GEP->getOperand(1)->getType()),
-                                     ToSort(GEP->getResultElementType()));
-        Env[GEP->getPointerOperand()] =
-            slv.mkVar(asort, GEP->getPointerOperand()->getNameOrAsOperand());
-        Leaves.insert(&Env[GEP->getPointerOperand()]);
-      }
-      //      return &(Env[V] =
-      //                 slv.mkTerm(SELECT, {*&Env[GEP->getPointerOperand()],
-      //                 *MakeTerm(GEP->getOperand(1), Env)}));
-      Term *Base = &Env[GEP->getPointerOperand()];
-      Term *Offset = MakeTerm(GEP->getOperand(1), Env);
-      return &(Env[V] = slv.mkTuple({Base->getSort(), Offset->getSort()},
-                                    {*Base, *Offset}));
-    } else if (auto *Cast = dyn_cast<CastInst>(V)) {
-      return &(Env[V] = *MakeTerm(Cast->getOperand(0), Env));
-    } else if (isa<PHINode>(V) || isa<Argument>(V)) {
-      Env[V] = slv.mkVar(ToSort(V->getType()), V->getNameOrAsOperand());
-      Leaves.insert(&Env[V]);
-      return &Env[V];
-    } else if (auto *BinOp = dyn_cast<BinaryOperator>(V)) {
-      switch (BinOp->getOpcode()) {
-      case BinaryOperator::BinaryOps::Add:
-        return &(Env[V] =
-                     slv.mkTerm(ADD, {*MakeTerm(BinOp->getOperand(0), Env),
-                                      *MakeTerm(BinOp->getOperand(1), Env)}));
-      case BinaryOperator::BinaryOps::Mul:
-        return &(Env[V] =
-                     slv.mkTerm(MULT, {*MakeTerm(BinOp->getOperand(0), Env),
-                                      *MakeTerm(BinOp->getOperand(1), Env)}));
-      default:
-        assert(0 && "unsupported binop type.");
-        break;
-      }
-    } else if (auto *Cmp = dyn_cast<CmpInst>(V)) {
-      switch (Cmp->getPredicate()) {
-      case CmpInst::ICMP_SLT:
-        return &(Env[V] = slv.mkTerm(LT, {*MakeTerm(Cmp->getOperand(0), Env),
-                                          *MakeTerm(Cmp->getOperand(1), Env)}));
-      default:
-        assert(0 && "unsupported predicate type.");
-        break;
-      }
-    } else if (auto *CI = dyn_cast<CallInst>(V)) {
-      auto *F = CI->getCalledFunction();
-      if (F && F->getIntrinsicID() == Intrinsic::fmuladd) {
-        // a*b + c
-        Term *a = MakeTerm(CI->getOperand(0), Env);
-        Term *b = MakeTerm(CI->getOperand(1), Env);
-        Term *c = MakeTerm(CI->getOperand(2), Env);
-        Env[V] = slv.mkTerm(
-            FLOATINGPOINT_ADD,
-            {RoundingMode,
-             slv.mkTerm(FLOATINGPOINT_MULT, {RoundingMode, *a, *b}), *c});
-        return &Env[V];
-      } else {
-        assert(0 && "arbitrary functions aren't supported.");
-      }
-    }
-
-    assert(0 && "unsupported value");
-    return &(Env[V] = slv.mkBoolean(false));
-  }
-
-  // TODO make a general visitor pattern to unify MakeTerm and RetrieveLeaves
-  void RetrieveLeaves(Value *V, DenseMap<Value *, Term> &Env,
-                      SmallPtrSet<Term *, 8> &LocalLeaves) {
-    if (auto *Const = dyn_cast<Constant>(V)) {
-      return;
-    } else if (isa<LoadInst>(V) || isa<StoreInst>(V)) {
-      RetrieveLeaves(getLoadStorePointerOperand(V), Env, LocalLeaves);
-      if (auto *Store = dyn_cast<StoreInst>(V))
-        RetrieveLeaves(Store->getValueOperand(), Env, LocalLeaves);
-      return;
-    } else if (auto *GEP = dyn_cast<GEPOperator>(V)) {
-      LocalLeaves.insert(&Env[GEP->getPointerOperand()]);
-      RetrieveLeaves(GEP->getOperand(1), Env, LocalLeaves);
-      return;
-    } else if (auto *Cast = dyn_cast<CastInst>(V)) {
-      return RetrieveLeaves(Cast->getOperand(0), Env, LocalLeaves);
-    } else if (isa<PHINode>(V) || isa<Argument>(V)) {
-      LocalLeaves.insert(&Env[V]);
-      return;
-    } else if (auto *BinOp = dyn_cast<BinaryOperator>(V)) {
-      switch (BinOp->getOpcode()) {
-      case BinaryOperator::BinaryOps::Add:
-        RetrieveLeaves(BinOp->getOperand(0), Env, LocalLeaves);
-        RetrieveLeaves(BinOp->getOperand(1), Env, LocalLeaves);
-        break;
-      case BinaryOperator::BinaryOps::Mul:
-        RetrieveLeaves(BinOp->getOperand(0), Env, LocalLeaves);
-        RetrieveLeaves(BinOp->getOperand(1), Env, LocalLeaves);
-        break;
-      default:
-        assert(0 && "unsupported binop type.");
-        break;
-      }
-      return;
-    } else if (auto *Cmp = dyn_cast<CmpInst>(V)) {
-      switch (Cmp->getPredicate()) {
-      case CmpInst::ICMP_SLT:
-        RetrieveLeaves(Cmp->getOperand(0), Env, LocalLeaves);
-        RetrieveLeaves(Cmp->getOperand(1), Env, LocalLeaves);
-        break;
-      default:
-        assert(0 && "unsupported predicate type.");
-        break;
-      }
-      return;
-    }else if(auto *CI = dyn_cast<CallInst>(V)){
-      auto *F = CI->getCalledFunction();
-      if(F && F->getIntrinsicID() == Intrinsic::fmuladd){
-        RetrieveLeaves(CI->getOperand(0), Env, LocalLeaves);
-        RetrieveLeaves(CI->getOperand(1), Env, LocalLeaves);
-        RetrieveLeaves(CI->getOperand(2), Env, LocalLeaves);
-      }
+    if (auto *Ret = dyn_cast<ReturnInst>(BB->getTerminator())) {
+      Ctx.recdef(BB2Func.getZ3Fun(BB), ExprScope, ExprScope[0]);
       return;
     }
 
 
-    assert(0 && ("unsupported value " + V->getNameOrAsOperand()).data());
-    return;
-  }
-
-  UFInfo MakeComputeChain(
-      std::vector<std::tuple<Term, std::vector<Term>, Term>> &FunctionBodies,
-      Value *V, Loop *L, DenseMap<Value *, Term> &Env,
-      DenseMap<Value *, std::pair<RecurrenceDescriptor, PHINode *>> &RecDecs) {
-    // Everything is uninterpreted functions.
-    // This module tries to represent the liveout operation chain
-    // as a single UF over all Phi nodes. For example, consider a liveout store:
-    // store double %sum, ptr %arrayidx   (where arrayidx represents y[i])
-    // in a loop with a single Phi node in the header, the indvar %i.
-    // This should be wrapped in an UF loop(lb_i, ub_i, y[i] = sum)
-    // lb_i and ub_i will be supplied later by the inv and pc grammars,
-    // but practically it will be the Bounds.getInitialIV and
-    // L->getInductionVariable() - 1
-
-    if (RecDecs.count(V)) {
-      // liveout is described by a phi!
-      RecurrenceDescriptor RD = RecDecs[V].first;
-      PHINode *PN = RecDecs[V].second;
-      auto Chain = RD.getReductionOpChain(PN, L);
-      // detect case when llvm converts to fma
-      if (Chain.size() == 1) {
-        if (auto *CI = dyn_cast<CallInst>(Chain[0])) {
-          auto *F = CI->getCalledFunction();
-          if (F && F->getIntrinsicID() == Intrinsic::fmuladd) {
-            //            auto Bounds = L->getBounds(*SE);
-            // from is the lower bound, that for now is any term
-            //            Term from = MakeTerm(&Bounds->getInitialIVValue(),
-            //            Env);
-            Term from = slv.mkVar(slv.getIntegerSort(), "from");
-            // copy the leaves then use them to get the atoms here
-            //            auto LeavesBackup = Leaves;
-            //            Leaves.clear();
-            //            DenseMap<Value *, Term> LocalEnv;
-
-            // to is the upper bound, that we assume is the indvar
-            // also we assume the a and b vars all change w.r.t a single Phi
-            // TODO assert that this is true
-            Term to = slv.mkVar(slv.getIntegerSort(), "to");
-            //            Term c = MakeTerm(CI->getOperand(2), LocalEnv);
-            Term *a = MakeTerm(CI->getOperand(0), Env);
-            Term *b = MakeTerm(CI->getOperand(1), Env);
-            std::vector<Value *> ArgVals = {CI->getOperand(0),
-                                            CI->getOperand(1)};
-
-            SmallPtrSet<Term *, 8> BoundVars;
-            RetrieveLeaves(CI->getOperand(0), Env, BoundVars);
-            RetrieveLeaves(CI->getOperand(1), Env, BoundVars);
-            // copy into non-ptr array
-            //            std::vector<Term> BoundVars2;
-            for (auto *T : BoundVars)
-              if (T == indvar)
-                continue; // skip indvar
-              else
-                SumArgs.push_back(T);
-            for (auto *T : SumArgs)
-              LLVM_DEBUG(dbgs() << T->toString() << "\n");
-
-            std::vector<Sort> Sorts;
-            std::vector<Term> SumArgsLocal;
-            Sorts.push_back(from.getSort());
-            Sorts.push_back(to.getSort());
-            for (auto *Arg : SumArgs) {
-              Sorts.push_back(Arg->getSort());
-              SumArgsLocal.push_back(*Arg);
+    // after setting scopes, start wiring functions together
+    auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+    assert(Br != nullptr && "only basic blocks terminating in a branch instruction are supported");
+    expr_vector Calls(Ctx);
+    for (auto *Block : Br->successors()) {
+      expr_vector LocalScope(Ctx);
+      for (auto *V : Scopes[Block]) {
+        if (auto *Phi = dyn_cast<PHINode>(V)) {
+          if (Phi->getBasicBlockIndex(BB) > -1) {
+            LocalScope.push_back(
+                Converter.FromVal(Phi->getIncomingValueForBlock(BB)));
+            continue;
+          }
+        }
+        // otherwise, it MUST be a memory operation.
+        // find the corresponding store (in this block):
+        bool Found = false;
+        for (auto &Inst : *BB) {
+          if (auto *Store = dyn_cast<StoreInst>(&Inst)) {
+            if (getPointerOperand(getLoadStorePointerOperand(Store)) == V) {
+              LocalScope.push_back(Converter.FromVal(Store));
+              Found = true;
+              break;
             }
-            Sort SumSort = slv.mkFunctionSort(Sorts, ToSort(CI->getType()));
-            Term SumDec = slv.mkConst(
-                SumSort, ("recurrence_" + CI->getNameOrAsOperand()).data());
-            std::vector<Term> InductionStepChildren = {
-                SumDec, from, slv.mkTerm(SUB, {to, slv.mkInteger(1)})};
-            InductionStepChildren.insert(InductionStepChildren.end(),
-                                         SumArgsLocal.begin(),
-                                         SumArgsLocal.end());
-            Term InductionStep = slv.mkTerm(APPLY_UF, InductionStepChildren);
-            Term Mult = slv.mkTerm(FLOATINGPOINT_MULT, {RoundingMode, *a, *b});
-            // add = mult + induction step
-            // a*b + c
-            Term FMA = slv.mkTerm(cvc5::FLOATINGPOINT_ADD,
-                                  {RoundingMode, InductionStep, Mult});
-            Term SumBody = slv.mkTerm(
-                ITE, {slv.mkTerm(LT, {to, from}),
-                      *MakeTerm(ConstantFP::get(CI->getType(), 0), Env), FMA});
-            std::vector<Term> TotalVars;
-            TotalVars.push_back(from);
-            TotalVars.push_back(to);
-            TotalVars.insert(TotalVars.end(), SumArgsLocal.begin(),
-                             SumArgsLocal.end());
-            Term SumFunc = slv.defineFunRec(SumDec, TotalVars, SumBody);
-            FunctionBodies.push_back({SumFunc, TotalVars, SumBody});
-
-            return {{}, SumDec, ArgVals};
-          } else {
-            assert(0 && "arbitrary function calls are not supported");
-          }
-        } else {
-          assert(0 && "reduction is not in intrinsic function");
-        }
-      } else {
-        assert(0 && "reduction with chain>1");
-      }
-    } else if (auto *Store = dyn_cast<StoreInst>(V)) {
-      // calculate compute chain for a store.
-      // the value might depend on inner loops.
-      // if so, it is the PC for that loop.
-      Term *Chain = MakeTerm(Store, Env); // (STORE base offset val)
-      Term Probe = slv.mkTerm(SELECT, {Chain->operator[](0), Chain->operator[](1)});
-      LLVM_DEBUG(dbgs() << "Rev: Chain is " << Chain->toString() << "\n");
-
-      LLVM_DEBUG(dbgs() << "Rev: Probe is " << Probe.toString() << "\n");
-      SmallPtrSet<Term *, 8> LLeaves;
-      RetrieveLeaves(Store, Env, LLeaves);
-      SumArgs.insert(SumArgs.begin(), LLeaves.begin(), LLeaves.end());
-      std::vector<Term> BoundVars;
-      for (auto * T : LLeaves) BoundVars.push_back(*T);
-      auto ArraySort = Chain->operator[](0).getSort();
-      auto StoreValSort = Chain->operator[](2).getSort();
-      // these are dummy vars just to fit the template
-      Term from = slv.mkVar(slv.getIntegerSort(), "from");
-      Term to = slv.mkVar(slv.getIntegerSort(), "to");
-      BoundVars.insert(BoundVars.begin(), to);
-      BoundVars.insert(BoundVars.begin(), from);
-      auto FunDef = slv.defineFun("StoreFun", BoundVars, ArraySort, *Chain);
-//      Kind EqKind = ToSort(Store->getValueOperand()->getType()) == slv.getIntegerSort() ? EQUAL : FLOATINGPOINT_EQ;
-//      Term Eq = slv.mkTerm(EqKind, {Probe, *MakeTerm(Store->getValueOperand(), Env)});
-      std::vector<Value *> FnVals;
-      for (int i = 0; i < Store->getNumOperands(); ++i)
-        FnVals.push_back(Store->getOperand(i));
-
-      FunctionBodies.push_back({FunDef, BoundVars, *Chain});
-//
-//      Term *ToEq = MakeTerm(Store->getValueOperand(), Env);
-//      // collect all the phis, these are args to the loop UF
-//      std::vector<Term> FnArgs;
-//      std::vector<Value *> FnVals;
-//      std::vector<Term> Bounds;
-//      std::vector<Term> Phis;
-//      std::vector<Sort> Sorts;
-//      for (auto &I : *L->getHeader()) {
-//        if (auto *PN = dyn_cast<PHINode>(&I)) {
-//          Term *Phi = MakeTerm(PN, Env);
-//          Phis.push_back(*Phi);
-//          FnArgs.push_back(slv.mkVar(ToSort(PN->getType()),
-//                                     "lb_" + PN->getNameOrAsOperand()));
-//          FnArgs.push_back(slv.mkVar(ToSort(PN->getType()),
-//                                     "ub_" + PN->getNameOrAsOperand()));
-//          Bounds.push_back(slv.mkTerm(
-//              AND, {slv.mkTerm(LEQ, {FnArgs[FnArgs.size() - 2], *Phi}),
-//                    slv.mkTerm(LT, {*Phi, FnArgs[FnArgs.size() - 1]})}));
-//          Sorts.push_back(ToSort(PN->getType()));
-//          Sorts.push_back(ToSort(PN->getType()));
-//          FnVals.push_back(PN);
-//        } else
-//          break;
-//      }
-//      std::vector<Term> BodyList = Phis;
-//      BodyList.insert(BodyList.end(), slv.mkTerm(IMPLIES, {(Bounds.size() == 1 ? Bounds[0] : slv.mkTerm(AND, Bounds)), slv.mkTerm(EqKind, {*ToEq,*Chain})}));
-//      Term Body = slv.mkTerm(FORALL, BodyList);
-//      Sort FnSort = slv.mkFunctionSort(Sorts, Chain->getSort());
-//      Term FnDef = slv.defineFun(L->getName().str(), FnArgs, FnSort, *Chain);
-      return {{}, FunDef, FnVals};
-    } else {
-      assert(0 && "liveout must be described as a phi right now.");
-    }
-  }
-
-  struct GrammarRecord {
-    Grammar &G;
-    StringRef Name;
-  };
-
-  void MakeSynthFuns(std::vector<GrammarRecord> &Grammars) {
-    std::vector<Term> BoundVars;
-    for (auto *T : Terminals)
-      BoundVars.push_back(*T);
-
-    for (auto GR : Grammars)
-      SynthFuns[GR.Name] =
-          slv.synthFun(GR.Name.str(), BoundVars, slv.getBooleanSort(), GR.G);
-  }
-
-  void MakeUniversalVars(std::vector<GrammarRecord> &Grammars) {
-    for (auto *T : Terminals)
-      UniversalVars[T] =
-          slv.declareSygusVar("sys_" + T->getSymbol(), T->getSort());
-  }
-
-  void MakeSynthFunCalls() {
-    for (auto Elem : SynthFuns) {
-      std::vector<Term> Args = {Elem.second};
-      for (auto *T : Terminals)
-        Args.push_back(UniversalVars[T]);
-      SynthFunCalls[Elem.first] = slv.mkTerm(APPLY_UF, Args);
-    }
-  }
-
-  void MakeVerificationConditions(LoopNest *LN, Loop *L, DenseMap<Value *, Term> &Env, DenseMap<Loop *, CVCConv*> &Loop2Converter) {
-    // modify env to inject the universalvars where the previous values were
-    // TODO clean up this whole pointers mess, we need a better way to test
-    // equality
-    //    for (auto &Elem : UniversalVars) {
-    //      Env[Terms2Vals[Elem.first]] = Elem.second;
-    //    }
-    Term Precondition = slv.mkBoolean(false); // TODO fix this hack later
-    Term &Postcondition = SynthFunCalls["pc"];
-    Term &Invariant = SynthFunCalls["inv"];
-    Term *LoopCond = MakeTerm(L->getLatchCmpInst(), Env);
-    Term Exit = LoopCond->notTerm();
-    // then make the updated arg vals for invariant
-    std::vector<Term> NewArgs;
-    DenseMap<Value *, Term> SysEnv;
-    // sandbox everything in a totally new env
-    for (auto *T : Terminals)
-      SysEnv[Terms2Vals[T]] = UniversalVars[T];
-    ExecuteOneIteration(LN, L, NewArgs, SysEnv,Loop2Converter);
-    NewArgs.insert(NewArgs.begin(), SynthFuns["inv"]);
-    LLVM_DEBUG(dbgs() << "NEW ARGS:\n");
-    for (auto &A : NewArgs)
-      LLVM_DEBUG(dbgs() << A.toString() << "\n");
-    Term NewInv = slv.mkTerm(APPLY_UF, NewArgs);
-
-    // then add constraints
-    slv.addSygusAssume(slv.mkTerm(LT, {*MakeTerm(Terms2Vals[lb], SysEnv),
-                                       *MakeTerm(Terms2Vals[ub], SysEnv)}));
-    slv.addSygusConstraint(slv.mkTerm(IMPLIES, {Precondition, Invariant}));
-    slv.addSygusConstraint(
-        slv.mkTerm(IMPLIES, {slv.mkTerm(AND, {Invariant, *LoopCond}), NewInv}));
-    slv.addSygusConstraint(slv.mkTerm(
-        IMPLIES, {slv.mkTerm(AND, {Invariant, Exit}), Postcondition}));
-    SynthResult res = slv.checkSynth();
-    if (res.hasSolution()) {
-      pc = slv.getSynthSolution(SynthFuns["pc"]);
-      LLVM_DEBUG(dbgs() << "FOUND Postcondition:\n"
-                        << pc.toString() << "\n");
-      // also split all the equalities to a map, term* = term*
-      FindValFromPC();
-      // PC register should have one entry
-      assert(PCRegister.size() == 1 && "expected one entry only");
-    } else {
-      LLVM_DEBUG(dbgs() << "no solution.\n");
-    }
-    slv.printStatisticsSafe(fileno(stdout));
-  }
-
-  void FindValFromPC() {
-    assert(PCRegister.size() == 0 && "should be empty");
-    std::function<void(Term&)> SearchTree;
-    SearchTree = [this, &SearchTree](Term &Node) -> void {
-      for (size_t i=0; i<Node.getNumChildren(); ++i) {
-        if ((Node[i].getKind() == EQUAL
-            || Node[i].getKind() == FLOATINGPOINT_EQ)
-            && Node[i][0] == *liveout) {
-          assert(Node[i].getNumChildren() == 2 && "incorrect node type");
-          PCRegister.push_back({Node[i][0], Node[i][1]});
-        } else {
-          auto NextNode = Node[i];
-          SearchTree(NextNode);
-        }
-      }
-    };
-    SearchTree(pc);
-    assert(PCRegister.size() == 1 && "only one value should be found");
-  }
-
-  void ExecuteOneIteration(LoopNest *LN, Loop *L, std::vector<Term> &InvArgs,
-                           DenseMap<Value *, Term> &Env, DenseMap<Loop *, CVCConv *> &Loop2Converter) {
-    for (auto *NT : Terminals) {
-      Term &UniVal = UniversalVars[NT];
-      Value *V = Terms2Vals[NT];
-      //      if (V == nullptr) {
-      //        LLVM_DEBUG(dbgs() << "WARNING: creating new term for " <<
-      //        NT->toString() << "\n"); Term *NV = MakeTerm(V, Env);
-      //        Terms2Vals[NT] = V;
-      //      }
-      if (L->isLoopInvariant(V)) {
-        InvArgs.push_back(UniVal);
-        continue;
-      }
-      // otherwise, either Phi or load
-      if (auto *PN = dyn_cast<PHINode>(V)) {
-        if (PN->getParent() == L->getHeader()) {
-          // for phi instructions, get the incoming (backedge) value
-          Value *NextIter = PN->getIncomingValueForBlock(L->getLoopLatch());
-          Term *NewVal = MakeTerm(NextIter, Env);
-          InvArgs.push_back(*NewVal);
-        } else {
-          // Phi must be in separate latch block/somewhere else, and needs a value
-          // from the depth+1-th loop
-          // (1) find exit val for depth+1-th loop
-          auto *Inner = LN->getLoopsAtDepth(L->getLoopDepth()+1)[0];
-          CVCConv *InnerConv = Loop2Converter[Inner];
-          SmallVector<BasicBlock *> ExitBlocks;
-          Inner->getExitBlocks(ExitBlocks);
-          assert(ExitBlocks.size() == 1 && "only one liveout allowed");
-
-          // must be phi due to LCSSA form
-          PHINode *Incoming = dyn_cast<PHINode>(PN->getIncomingValueForBlock(ExitBlocks[0]));
-
-          if (InnerConv->liveoutend == Incoming->getIncomingValue(0)) {
-            InvArgs.push_back(*MakeTerm(PN, Env));
-          } else {
-            assert(0 && "the phi instruction must match the inner loop PC");
           }
         }
-      } else if (auto *Load = dyn_cast<LoadInst>(V)) {
-        assert(0 && "loads not supported yet");
-      } else {
-        assert(0 && "unsupported instruction");
+        if (!Found)
+          LocalScope.push_back(Converter.FromVal(V));
       }
-    }
-  }
-
-  void MakeTerminals(Loop *L, ScalarEvolution *SE, UFInfo &computechain,
-                        DenseMap<Value *, Term> &Env) {
-    SmallPtrSet<Term *, 8> NonTerms;
-
-    auto Bounds = L->getBounds(*SE);
-    auto *UB = &Bounds->getFinalIVValue();
-    auto *LB = &Bounds->getInitialIVValue();
-    auto *INDVAR = L->getInductionVariable(*SE);
-    // also visit all the phis
-    //    for (auto &I : *L->getHeader()) {
-    //      if (!isa<PHINode>(&I))
-    //        break;
-    //      MakeTerm(&I, Env);
-    //      RetrieveLeaves(&I, Env, NonTerms);
-    //    }
-
-    RetrieveLeaves(UB, Env, NonTerms);
-    RetrieveLeaves(LB, Env, NonTerms);
-    RetrieveLeaves(INDVAR, Env, NonTerms);
-    for (auto *Arg : computechain.ArgVals)
-      RetrieveLeaves(Arg, Env, NonTerms);
-    //    auto BoundsLeaves = Leaves;
-    //    Leaves.clear();
-    // inject the lb and indvar into a special env
-    //    DenseMap<Value*, Term> SpecialEnv;
-    //    std::vector<Term> PostArgs;
-
-    //    for (auto *V : computechain.ArgVals)
-    //      PostArgs.push_back(*MakeTerm(V, Env));
-    //    auto BoundVars = Leaves;
-    //    // copy into non-ptr array
-    //    for (auto T : BoundVars)
-    //      if (T == indvar) continue ; // skip indvar
-    //      else
-    //        SumArgs.push_back(T);
-    //    LLVM_DEBUG(dbgs() << "Created Sum Args:\n");
-    //    for (auto &T : SumArgs)
-    //      LLVM_DEBUG(dbgs() << T.toString() << "\n");
-
-    NonTerms.insert(liveout);
-    for (auto *T : NonTerms)
-      Terminals.push_back(T);
-
-    //    NonTerminals.push_back(indvar);
-    //    for (auto *T : Leaves) NonTerminals.push_back(T);
-
-    LLVM_DEBUG(dbgs() << "Created nonterminals:\n");
-    for (auto &T : Terminals)
-      LLVM_DEBUG(dbgs() << T->toString() << "\n");
-
-    // create the reverse mapping
-    for (auto &Elem : Env)
-      Terms2Vals[&Elem.second] = Elem.first;
-
-    //    Leaves = LeavesBackup;
-  }
-
-  Grammar MakeInvGram(UFInfo &computechain) {
-
-    Term start = slv.mkVar(slv.getBooleanSort(), "start");
-    Term cmp = slv.mkVar(slv.getBooleanSort(), "cmp");
-    Term expr = slv.mkVar(slv.getIntegerSort(), "expr");
-    Term eq = slv.mkVar(slv.getBooleanSort(), "eq");
-
-    // construct grammar rules
-    Term And = slv.mkTerm(AND, {cmp, cmp, eq});
-    Term Leq = slv.mkTerm(LEQ, {expr, expr});
-    cvc5::Kind EqKind =
-        liveout->getKind() == CONST_FLOATINGPOINT ? FLOATINGPOINT_EQ : EQUAL;
-    std::vector<Term> Args;
-    Args.push_back(computechain.UF);
-    Args.push_back(*lb);
-    Args.push_back(slv.mkTerm(SUB, {*indvar, slv.mkInteger(1)}));
-    for (auto *A : SumArgs)
-      Args.push_back(*A);
-
-    Term ComputeChain = slv.mkTerm(APPLY_UF, Args);
-    Term equal = slv.mkTerm(EqKind, {*liveout, ComputeChain});
-
-    std::vector<Term> BoundVars;
-    for (auto *T : Terminals)
-      BoundVars.push_back(*T);
-    Grammar inv_gram = slv.mkGrammar(BoundVars, {start, cmp, expr, eq});
-
-    inv_gram.addRules(start, {And});
-    inv_gram.addRules(cmp, {Leq});
-    inv_gram.addRules(expr, {*lb, *indvar, *ub});
-    inv_gram.addRules(eq, {equal});
-
-    LLVM_DEBUG(dbgs() << "INV GRAMMAR:\n");
-    LLVM_DEBUG(dbgs() << inv_gram.toString() << "\n");
-
-    return inv_gram;
-  }
-
-  Grammar MakePCGrammar(CVCConv::UFInfo compute_chain) {
-    //    auto LeavesBackup = Leaves;
-    //    Leaves.clear();
-    //    DenseMap<Value*, Term> DummyEnv;
-    ////    Term *ub = MakeTerm(UB, Env);
-    ////    Term *lb = MakeTerm(LB, Env);
-    //    auto BoundsLeaves = Leaves;
-    //    Leaves.clear();
-    //    // inject the lb and indvar into a special env
-    //    DenseMap<Value*, Term> SpecialEnv;
-    //    std::vector<Term> PostArgs;
-    ////    Term indvar = MakeTerm(INDVAR, SpecialEnv);
-    //    for (auto *V : compute_chain.ArgVals)
-    //      PostArgs.push_back(MakeTerm(V, SpecialEnv));
-    //    auto BoundVars = Leaves;
-    //    // copy into non-ptr array
-    //    std::vector<Term> BoundVars2;
-    //    for (auto T : BoundVars)
-    //      if (T == indvar) continue ; // skip indvar
-    //      else BoundVars2.push_back(T);
-    //    for (auto &T : BoundVars2)
-    //      LLVM_DEBUG(dbgs() << T.toString() << "\n");
-
-    Term start_pc = slv.mkVar(slv.getBooleanSort(), "start_pc");
-    std::vector<Term> Args;
-
-    Term ub_1 = slv.mkTerm(SUB, {*ub, slv.mkInteger(1)});
-    Args.push_back(compute_chain.UF);
-    Args.push_back(*lb);
-    Args.push_back(ub_1);
-    for (auto *A : SumArgs)
-      Args.push_back(*A);
-
-    Term sumpc = slv.mkTerm(APPLY_UF, Args);
-    Term Eq1 = slv.mkTerm(EQUAL, {*indvar, *ub});
-    auto EqKind = liveout->getSort() == fpsort ? FLOATINGPOINT_EQ : EQUAL;
-    Term Eq2 = slv.mkTerm(EqKind, {*liveout, sumpc});
-    Term AndPC = slv.mkTerm(AND, {Eq1, Eq2});
-    // TODO make this general to handle non-sum cases
-
-    //    std::vector<Term> Leaves2;
-    //    for (auto T : BoundsLeaves) Leaves2.push_back(T);
-    //    Leaves2.push_back(liveout);
-    //    Leaves2.push_back(indvar);
-    //    for (auto T : Leaves) Leaves2.push_back(T);
-    std::vector<Term> BoundVars;
-    for (auto *T : Terminals)
-      BoundVars.push_back(*T);
-    Grammar pc_gram = slv.mkGrammar(BoundVars, {start_pc});
-    pc_gram.addRules(start_pc, {AndPC});
-
-    LLVM_DEBUG(dbgs() << "PC GRAMMAR:\n");
-    LLVM_DEBUG(dbgs() << pc_gram.toString() << "\n");
-
-    //    Leaves = LeavesBackup;
-    return pc_gram;
-  }
-};
-
-class Compression {
-public:
-  enum CType {
-    CRD,
-    POS,
-    VAL,
-    IGNORE,
-    UNKNOWN,
-  };
-
-  Value *Crd, *Pos, *Val;
-  std::vector<CType> CTypes;
-
-  Compression(Value *Crd, Value *Pos, Value *Val, std::vector<CType> CTypes)
-      : Crd(Crd), Pos(Pos), Val(Val), CTypes(CTypes) {};
-
-  static CType CompressionType(LLVMContext &C, Value *V) {
-    if (isa<Constant>(V))
-      return IGNORE;
-    if (isa<PHINode>(V))
-      return IGNORE;
-    Type *VType = V->getType();
-    if (VType == Type::getInt64Ty(C))
-      return IGNORE;
-    if (VType == Type::getInt32Ty(C))
-      return IGNORE;
-    return UNKNOWN;
-  }
-};
-
-
-class Dense {
-public:
-  context &c;
-
-  static func_decl Expand(context &c, expr &rptr, expr &col, expr &vals) {
-    std::vector<z3::sort> Domain = {c.int_sort(), c.int_sort()};
-    auto Range = c.fpa_sort(11, 53);
-    auto Expand = c.recfun("expand", Domain.size(), Domain.data(), Range);
-    expr_vector args(c);
-    auto Er = c.int_const("Er");
-    auto Ec = c.int_const("Ec");
-    args.push_back(Er);
-    args.push_back(Ec);
-    expr T = c.int_const("T");
-    c.recdef(Expand, args,
-             ite(
-                 exists(T, rptr[Er] <= T && T < rptr[Er + 1] && col[T] == Ec),
-                 c.fpa_val(1.0), c.fpa_val(0.0)));
-    return Expand;
-  }
-};
-
-class Tensor {
-  class Dim {
-    expr n;
-    expr m;
-    expr nnz;
-  };
-};
-
-
-struct DepChain {
-  Value *Root;
-  std::vector<DepChain> Children;
-};
-
-struct FindInputTensors : public InstVisitor<FindInputTensors, std::vector<DepChain>> {
-  using RetTy = std::vector<DepChain>;
-  SmallVector<Value *> InputTensors;
-  ScalarEvolution &SE;
-  LoopInfo *LI;
-  SmallVector<SmallVector<Value *>> DepStacks;
-  SmallPtrSet<Value *, 12> Visited;
-  DepChain DC;
-
-  FindInputTensors(ScalarEvolution &SE, LoopInfo *LI) : SE(SE), LI(LI) {};
-
-  RetTy visitLoadInst(LoadInst &LI) {
-    // find the GEP instruction:
-    GEPOperator *GEP = dyn_cast<GEPOperator>(getPointerOperand(&LI));
-    auto *Basepointer = GEP->getPointerOperand();
-    DepChain Current = {Basepointer, {}};
-    for (auto &Idx : GEP->indices()) {
-      auto NewChildren = visit(dyn_cast<Instruction>(&Idx));
-      Current.Children.insert(Current.Children.begin(), NewChildren.begin(), NewChildren.end());
-    }
-    return {Current};
-  }
-
-  RetTy visitStoreInst(StoreInst &SI) {
-    Value *Array = dyn_cast<GEPOperator>(SI.getPointerOperand())->getPointerOperand();
-    DepChain Chain = {Array, {}};
-    if (auto *Inst = dyn_cast<Instruction>(SI.getValueOperand())) {
-      auto Children = visit(Inst);
-      Chain.Children.insert(Chain.Children.begin(), Children.begin(), Children.end());
-    }
-    return {Chain};
-  }
-
-  RetTy visitInstruction(Instruction &I) {
-    if (Visited.contains(&I))
-      return {};
-    Visited.insert(&I);
-    RetTy ToReturn;
-    for (auto &Op : I.operands()) {
-      if (auto *Inst = dyn_cast<Instruction>(&Op)) {
-        auto Siblings = visit(Inst);
-        ToReturn.insert(ToReturn.begin(), Siblings.begin(), Siblings.end());
-      }
-    }
-    return ToReturn;
-  }
-
-  RetTy visitTopLevel(Instruction &I) {
-    auto Chain = visit(I);
-    assert(Chain.size() == 1 && "only one liveout supported right now");
-    DC = Chain[0];
-    return Chain;
-  }
-  void visitTopLevel(Instruction *I) { visitTopLevel(*I); }
-
-  void ConstructDenseTensors(Z3Mapping &M, context &c, DenseMap<Value *, Term> &Ins2Terms, Term *LiveOut, expr &FinalPC) {
-    // DepStacks tells us what arrays need to be tested
-    // all heads of the list are val arrays (store some computation value)
-    // the remaining elements are coordinate arrays (store some index)
-    // any expansion function needs some coord arrays and some val arrays
-    // a val array might store more coordinates in higher order tensors
-    auto YSparse = CVC2Z3(M, c, *LiveOut);
-    // make up a dense version
-    auto YDense = c.constant((YSparse.to_string() + "_dense").data(), YSparse.get_sort());
-    auto Em = c.int_const("M");
-    enum CType {
-      DENSE, COMPRESSED
-    };
-    SmallPtrSet<Value *, 10> ValArrays;
-    SmallPtrSet<Value *, 10> CrdArrays;
-    for (auto &E : DepStacks) {
-      ValArrays.insert(E[0]);
-      for (int i=1; i < E.size(); ++i) {
-        CrdArrays.insert(E[i]);
-      }
-    }
-    // TODO just choose the right permutation for now, later we have to search
-    DenseMap<unsigned, CType> CMap;
-    auto Rptr = CVC2Z3(M, c, Ins2Terms[DC.Children[1].Children[0].Root]);
-    auto Col = CVC2Z3(M, c, Ins2Terms[DC.Children[0].Children[0].Root]);
-    auto Vals = CVC2Z3(M, c, Ins2Terms[DC.Children[1].Root]);
-    func_decl expand = Dense::Expand(c, Rptr, Col, Vals);
-    // TODO we'll have a list of kernels later, for now we just support GEMV
-
-
-    std::vector<z3::sort> Domain = {c.int_sort(), c.int_sort()};
-    auto SumDense = c.recfun("SumDense", Domain.size(), Domain.data(), c.fpa_sort(11, 53));
-    auto Indvar = c.int_const("indvar");
-    auto UB = c.int_const("UB");
-    expr_vector Args(c);
-    Args.push_back(Indvar);
-    Args.push_back(UB);
-    c.recdef(SumDense, Args,
-             ite(
-                 UB < 0, c.fpa_val(0.0),
-                 SumDense(Indvar, UB-1) + expand(Indvar, UB) * Vals[Indvar]
-                 ));
-    // now make the gemv
-    std::vector<z3::sort> GArgs = {c.int_sort(), c.int_sort()};
-    auto GEMV = c.recfun("GEMV", GArgs.size(), GArgs.data(), c.array_sort(c.int_sort(), c.fpa_sort(11, 53)));
-    expr_vector EArgs(c);
-    EArgs.push_back(UB);
-    c.recdef(GEMV, EArgs,
-             ite(
-                 UB < 0,
-                 YDense,
-                 store(GEMV(0, UB-1), UB, SumDense(UB, Em-1))
-                 ));
-
-    // make problem bounds
-    auto N = CVC2Z3(M, c, Ins2Terms[&(LI->getTopLevelLoops()[0]->getBounds(SE)->getFinalIVValue())]);
-    auto NNZ = c.int_const("NNZ");
-    auto S = c.int_const("S"); // quantified var
-    auto T = c.int_const("T"); // quantified var
-    // add constraints
-    // (1) monotonic
-    auto Monotonic = forall(S, implies(0 <= S && S <= NNZ, Rptr[S] <= Rptr[S+1] && Rptr[S] >= 0));
-    auto PMonotonic = forall(S, implies(0 <= S && S < N, forall(T, implies(Rptr[S] <= T && T < Rptr[S+1], Col[T] < Col[T+1]))));
-    // (3) extra
-    auto CBounds = forall(S, implies(0 <= S && S < NNZ, Col[S] >= 0 && Col[S] < Em));
-    auto ValConstraint = forall(S, implies(0 <= S && S < NNZ, Vals[S] == 1.0));
-    auto RptrConstraint1 = Rptr[c.int_val(0)] == 0;
-    auto RptrConstraint2 = Rptr[N] == NNZ;
-    auto NNZConstraint = NNZ <= N*Em;
-
-    solver s(c);
-    s.add(N > 0);
-    s.add(Em > 0);
-    s.add(NNZ > 0);
-    s.add(Monotonic);
-    s.add(PMonotonic);
-    s.add(CBounds);
-    s.add(ValConstraint);
-    s.add(RptrConstraint1);
-    s.add(RptrConstraint2);
-    s.add(NNZConstraint);
-    s.add(YDense == YSparse);
-    s.add(GEMV(0, N-1) != FinalPC);
-
-    LLVM_DEBUG(dbgs() << FinalPC.get_sort().to_string() << "\n");
-
-    check_result result = s.check();
-    if (result == unsat) {
-      LLVM_DEBUG(dbgs() << "no counterexample\n");
-    } else {
-      LLVM_DEBUG({
-          dbgs() << "counterexample:\n";
-          dbgs() << s.get_model().to_string() << "\n";
-      });
+      Calls.push_back(BB2Func.getZ3Fun(Block)(LocalScope));
     }
 
+    expr Body(Ctx);
+    if (Br->isUnconditional())
+      Body = Calls[0];
+    else
+      Body = ite(Converter.FromVal(Br->getCondition()), Calls[1], Calls[0]);
 
-//    while (true) {
-//      WorkList = Permutation;
-//      DenseMap<unsigned, CType> CMap;
-//      while (!WorkList.empty()) {
-//        // compressed takes one val array, two coord arrays
-//        // dense takes one val array, and a possible coord array
-//        // TODO make these into classes, for now just hardcoded
-//        unsigned idx = WorkList.pop_back_val();
-//        auto &DepChain = DepStacks[idx];
-//        if (DepChain.size() != 3)
-//          CMap[idx] = DENSE;
-//        else
-//          CMap[idx] = COMPRESSED;
-//      }
-//      // now, the depchain arrays can be any permutation of crd or pos
-//
-////      for (auto &E : CMap) {
-////        std::vector<unsigned> IdxPermutation;
-////        for (unsigned i=1; i < DepStacks[E.first].size(); ++i) IdxPermutation.push_back(i);
-////        while (true) {
-////          switch (E.second) {
-////          case DENSE:
-////
-////          }
-////          if (!std::next_permutation(IdxPermutation.begin(), IdxPermutation.end()))
-////            break;
-////        }
-////      }
-//      if (!std::next_permutation(Permutation.begin(), Permutation.end()))
-//        break;
-//    }
+    Ctx.recdef(BB2Func.getZ3Fun(BB), ExprScope, Body);
 
+    LLVM_DEBUG({
+      dbgs() << BB->getNameOrAsOperand() << ", [";
+      for (unsigned i=0; i < ExprScope.size()-1; ++i)
+        dbgs() << ExprScope[i].to_string() << ", ";
+      dbgs() << ExprScope.back().to_string() << "]\n";
+      dbgs() << Body.to_string() << "\n";
+    });
   }
 
+private:
+  std::vector<Value*> makeScope(BasicBlock *BB, std::vector<Value*> Prefix) {
+    for (auto &Inst : *BB) {
+      if (auto *Phi = dyn_cast<PHINode>(&Inst))
+        Prefix.push_back(Phi);
+      else
+        break;
+    }
+    return Prefix;
+  }
+  context &Ctx;
+  DenseMap<Value *, std::vector<Value *>> Scopes;
+  TerminalMap BB2Func;
+  DominatorTree &DT;
+  ConverterTy &Converter;
+  z3::sort &Range;
 };
-
-
-
-raw_ostream &operator<<(raw_ostream &OS, const Compression::CType &c) {
-  switch (c) {
-  case Compression::IGNORE:
-    OS << "-";
-    break;
-  case Compression::CRD:
-    OS << "CRD";
-    break;
-  case Compression::POS:
-    OS << "POS";
-    break;
-  case Compression::VAL:
-    OS << "VAL";
-    break;
-  case Compression::UNKNOWN:
-    OS << "?";
-    break;
-  }
-  return OS;
-}
-
 
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
