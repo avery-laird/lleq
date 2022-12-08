@@ -20,6 +20,7 @@
 #include <fstream>
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/Analysis/Delinearization.h"
+#include "llvm/IRReader/IRReader.h"
 
 #define DEBUG_TYPE "rev-analysis"
 
@@ -768,6 +769,21 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       dbgs() << "\n";
     });
   }
+
+  // now let's try to build gemv...
+  llvm::SMDiagnostic Err;
+  auto GemvMod = llvm::parseIRFile("gemv_opt.ll", Err, F.getContext());
+  assert(GemvMod && "couldn't parse kernel.");
+
+  DominatorTree GDT(*GemvMod->getFunction("gemv"));
+  LiveOuts.clear();
+  LoopInfo GemvLI(GDT);
+  LoopNest GemvLN(*GemvLI.getTopLevelLoops()[0], SE);
+  GetLiveOuts(OuterLoop, LiveOuts);
+  assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
+  LiveOut = (*LiveOuts.begin());
+  SSA2Func Gemv(Ctx, GDT, Converter, LiveOut);
+  Gemv.fromFunction(GemvMod->getFunction("gemv"));
 
   return PreservedAnalyses::all();
 }

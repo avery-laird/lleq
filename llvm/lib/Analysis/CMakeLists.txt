@@ -174,6 +174,7 @@ add_llvm_component_library(LLVMAnalysis
   LINK_COMPONENTS
   BinaryFormat
   Core
+  IRReader
   Object
   ProfileData
   Support
