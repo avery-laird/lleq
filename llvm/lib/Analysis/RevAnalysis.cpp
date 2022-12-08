@@ -572,10 +572,10 @@ public:
       TupleSorts.push_back(E.get_sort());
 //    const char * names[] = { "first", "second" };
     std::vector<const char *> Names;
-    std::vector<std::string> SavedNames;
+    SavedNames.resize(Elems.size());
     for (unsigned i = 0; i < Elems.size(); ++i) {
-      SavedNames.push_back(std::string("get_" + std::to_string(i)).c_str());
-      Names.push_back(SavedNames.back().c_str());
+      SavedNames[i] = std::string("get_" + std::to_string(i));
+      Names.push_back(SavedNames[i].c_str());
     }
     func_decl MkTuple = Ctx.tuple_sort("ret", LiveOut.size(), Names.data(), TupleSorts.data(), Projs);
     Output = MkTuple(Elems);
@@ -706,6 +706,7 @@ private:
   z3::sort Range;
   expr Output;
   func_decl_vector Projs;
+  std::vector<std::string> SavedNames;
 };
 
 //expr MkGEMV(context &Ctx, func_decl &csr, expr &y) {
@@ -716,9 +717,9 @@ private:
 //  Ctx.recdef(gemv, Args, ite(n<0, y, store(gemv(n-1), n, csr(n, ))))
 //}
 
-SSA2Func ParseInputFile(StringRef Path, StringRef FunctionName, LLVMContext &Context, ScalarEvolution &SE, context &Ctx, MakeZ3 &Converter) {
+SSA2Func ParseInputFile(StringRef Path, StringRef FunctionName, LLVMContext &Context, ScalarEvolution &SE, context &Ctx, MakeZ3 &Converter, std::unique_ptr<Module> &Module) {
   llvm::SMDiagnostic Err;
-  auto Module = llvm::parseIRFile(Path, Err, Context);
+  Module = llvm::parseIRFile(Path, Err, Context);
   assert(Module && "couldn't parse kernel.");
 
   Function *F = Module->getFunction(FunctionName);
@@ -833,56 +834,56 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   Translate.fromFunction(&F);
 
   solver Slv(Ctx);
-  Value *N = F.getArg(0);
-  Value *Rptr = F.getArg(1);
-  Value *Col = F.getArg(2);
-  Value *Val = F.getArg(3);
-  Value *X = F.getArg(4);
-  Value *Y = F.getArg(5);
-
-  expr zero = Ctx.int_val(0);
-  expr one = Ctx.int_val(1);
-  expr two = Ctx.int_val(2);
-
-
-  expr n = Ctx.int_val(2);
-  Slv.add(n == 2);
-  expr rptr = Converter.FromVal(Rptr);
-  expr val = Converter.FromVal(Val);
-  expr col = Converter.FromVal(Col);
-  expr x = Converter.FromVal(X);
-  expr y = Converter.FromVal(Y);
-  Slv.add(val[zero] == 1);
-  Slv.add(val[one] == 1);
-
-  Slv.add(rptr[zero] == 0);
-  Slv.add(rptr[one] == 1);
-  Slv.add(rptr[two] == 2);
-
-  Slv.add(col[zero] == 1);
-  Slv.add(col[one] == 0);
-
-  Slv.add(y[zero] == 0);
-  Slv.add(y[one] == 0);
-
-  Slv.add(x[zero] == 1);
-  Slv.add(x[one] == 2);
-
-
-  auto Result = Slv.check();
-  if (Result == z3::sat) {
-    auto Model = Slv.get_model();
-    std::vector<expr> Args = {n, rptr, col, val, x, y};
-    auto Output = Translate[&F.getEntryBlock()](Args.size(), Args.data());
-    LLVM_DEBUG({
-      dbgs() << "Concrete Test output: \n";
-      for (int i=0; i < n.as_int64(); ++i) {
-        auto elem = Model.eval(Output[Ctx.int_val(i)].simplify());
-        dbgs() << Z3_get_numeral_string(Ctx, elem) << " ";
-      }
-      dbgs() << "\n";
-    });
-  }
+//  Value *N = F.getArg(0);
+//  Value *Rptr = F.getArg(1);
+//  Value *Col = F.getArg(2);
+//  Value *Val = F.getArg(3);
+//  Value *X = F.getArg(4);
+//  Value *Y = F.getArg(5);
+//
+//  expr zero = Ctx.int_val(0);
+//  expr one = Ctx.int_val(1);
+//  expr two = Ctx.int_val(2);
+//
+//
+//  expr n = Ctx.int_val(2);
+//  Slv.add(n == 2);
+//  expr rptr = Converter.FromVal(Rptr);
+//  expr val = Converter.FromVal(Val);
+//  expr col = Converter.FromVal(Col);
+//  expr x = Converter.FromVal(X);
+//  expr y = Converter.FromVal(Y);
+//  Slv.add(val[zero] == 1);
+//  Slv.add(val[one] == 1);
+//
+//  Slv.add(rptr[zero] == 0);
+//  Slv.add(rptr[one] == 1);
+//  Slv.add(rptr[two] == 2);
+//
+//  Slv.add(col[zero] == 1);
+//  Slv.add(col[one] == 0);
+//
+//  Slv.add(y[zero] == 0);
+//  Slv.add(y[one] == 0);
+//
+//  Slv.add(x[zero] == 1);
+//  Slv.add(x[one] == 2);
+//
+//
+//  auto Result = Slv.check();
+//  if (Result == z3::sat) {
+//    auto Model = Slv.get_model();
+//    std::vector<expr> Args = {n, rptr, col, val, x, y};
+//    auto Output = Translate[&F.getEntryBlock()](Args.size(), Args.data());
+//    LLVM_DEBUG({
+//      dbgs() << "Concrete Test output: \n";
+//      for (int i=0; i < n.as_int64(); ++i) {
+//        auto elem = Model.eval(Output[Ctx.int_val(i)].simplify());
+//        dbgs() << Z3_get_numeral_string(Ctx, elem) << " ";
+//      }
+//      dbgs() << "\n";
+//    });
+//  }
 
   // now let's try to build gemv...
   llvm::SMDiagnostic Err;
@@ -905,14 +906,45 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // TODO I really, really think this should be reversed in the future
   // eg, use compression functions on compressed kernels
 
-  SSA2Func CSR = ParseInputFile("csr_opt.ll", "CSR", F.getContext(), SE, Ctx, Converter);
+  std::unique_ptr<Module> CSRModule;
+  SSA2Func CSR = ParseInputFile("csr_opt.ll", "CSR", F.getContext(), SE, Ctx, Converter, CSRModule);
 
   // Now, the question is:
   // SpMV(CSR(A)) =?= GEMV(A)
   // TODO actually implement the matching algorithm
   // for now, tell the compiler how to wire up functions
 
+  expr A = Ctx.constant("A", Ctx.array_sort(Ctx.int_sort(), Ctx.fpa_sort<64>()));
+  expr n = Ctx.int_const("n");
+  expr m = Ctx.int_const("m");
+  expr vals = Ctx.constant("vals", Ctx.array_sort(Ctx.int_sort(), Ctx.fpa_sort<64>()));
+  expr x = Ctx.constant("x", Ctx.array_sort(Ctx.int_sort(), Ctx.fpa_sort<64>()));
+  expr y = Ctx.constant("y", Ctx.array_sort(Ctx.int_sort(), Ctx.fpa_sort<64>()));
+  expr rptr = Ctx.constant("rptr", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+  expr cols = Ctx.constant("cols", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+  std::vector<expr> CsrArgs = {n, m, A, rptr, cols, vals};
+  expr Compressed = CSR[CSRModule->getFunction("CSR")](CsrArgs.size(), CsrArgs.data());
+  expr output_vals = CSR.getNth(0)(Compressed);
+  expr output_cols = CSR.getNth(1)(Compressed);
+  expr output_rptr = CSR.getNth(2)(Compressed);
+  std::vector<expr> SpmvArgs = {n, output_rptr, output_cols, output_vals, x, y};
+  std::vector<expr> GemvArgs = {n, m, y, A, x};
 
+  Slv.add(n == 1);
+  Slv.add(m == 1);
+//  Slv.add(n < 4);
+//  Slv.add(m < 4);
+  Slv.add(Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data()) != Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data()));
+  dbgs() << Slv.to_smt2() << "\n";
+  auto Result = Slv.check();
+  if (Result == z3::unsat) {
+    dbgs() << "no counterexample\n";
+  } else if (Result == z3::sat) {
+    auto Model = Slv.get_model();
+    dbgs() << Model.to_string() << "\n";
+  } else {
+    dbgs() << Result << "\n";
+  }
 
   return PreservedAnalyses::all();
 }
