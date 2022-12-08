@@ -540,14 +540,31 @@ protected:
 class SSA2Func {
   using ConverterTy = MakeZ3;
 public:
-  SSA2Func(context &Ctx, DominatorTree &DT, ConverterTy &Converter, Value *LiveOut) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Ctx), Output(Ctx) {
+//  SSA2Func(context &Ctx) : Ctx(Ctx), BB2Func(Ctx), DT(nullptr), Converter(nullptr), Range(Ctx), Output(Ctx) {}
+
+  SSA2Func(context &Ctx, DominatorTree *DT, ConverterTy *Converter, Value *LiveOut) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Ctx), Output(Ctx) {
     if (auto *GEP = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LiveOut))) {
-      auto Tuple = Converter.FromGEP(GEP);
+      auto Tuple = Converter->FromGEP(GEP);
       Range = Tuple.Base.get_sort();
       Output = Tuple.Base;
     } else {
       llvm_unreachable("other liveout types aren't supported right now.");
     }
+  }
+
+  SSA2Func(context &Ctx, DominatorTree *DT, ConverterTy *Converter, SmallPtrSetImpl<Value *> &LiveOut) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Ctx), Output(Ctx) {
+    // range is a tuple sort
+    // output is the tuple itself
+    std::vector<z3::sort> TupleSorts;
+    expr_vector Elems(Ctx);
+    for (auto *V : LiveOut)
+      Elems.push_back(Converter->FromVal(V));
+    for (auto E : Elems)
+      TupleSorts.push_back(E.get_sort());
+    func_decl_vector Projs(Ctx);
+    func_decl MkTuple = Ctx.tuple_sort("ret", LiveOut.size(), nullptr, TupleSorts.data(), Projs);
+    Output = MkTuple(Elems);
+    Range = Output.get_sort();
   }
 
   func_decl fromFunction(Function *F) {
@@ -565,7 +582,7 @@ public:
     auto &Scope = Scopes[BB];
     // make domain
     std::vector<z3::sort> Domain;
-    for (auto *V : Scope) Domain.push_back(Converter.FromVal(V).get_sort());
+    for (auto *V : Scope) Domain.push_back(Converter->FromVal(V).get_sort());
     BB2Func.setZ3Fun(BB, Ctx.recfun(BB->getNameOrAsOperand().c_str(), Domain.size(), Domain.data(), Range));
     LLVM_DEBUG({
       dbgs() << BB->getNameOrAsOperand() << ": ";
@@ -573,7 +590,7 @@ public:
         dbgs() << S.to_string() << " -> ";
       dbgs() << Range.to_string() << "\n";
     });
-    auto *Node = DT.getNode(BB);
+    auto *Node = DT->getNode(BB);
     for (auto *N : *Node) {
       auto *NewBB = N->getBlock();
       Scopes[NewBB] = makeScope(NewBB, Scope);
@@ -585,7 +602,7 @@ public:
     expr_vector Scope(Ctx);
     // add to the current scope
     for (auto *V : Scopes[BB])
-      Scope.push_back(Converter.FromVal(V));
+      Scope.push_back(Converter->FromVal(V));
 
     if (auto *Ret = dyn_cast<ReturnInst>(BB->getTerminator())) {
       Ctx.recdef(BB2Func.getZ3Fun(BB), Scope, Output);
@@ -602,7 +619,7 @@ public:
         if (auto *Phi = dyn_cast<PHINode>(V)) {
           if (Phi->getBasicBlockIndex(BB) > -1) {
             LocalScope.push_back(
-                Converter.FromVal(Phi->getIncomingValueForBlock(BB)));
+                Converter->FromVal(Phi->getIncomingValueForBlock(BB)));
             continue;
           }
         }
@@ -612,14 +629,14 @@ public:
         for (auto &Inst : *BB) {
           if (auto *Store = dyn_cast<StoreInst>(&Inst)) {
             if (getPointerOperand(getLoadStorePointerOperand(Store)) == V) {
-              LocalScope.push_back(Converter.FromVal(Store));
+              LocalScope.push_back(Converter->FromVal(Store));
               Found = true;
               break;
             }
           }
         }
         if (!Found)
-          LocalScope.push_back(Converter.FromVal(V));
+          LocalScope.push_back(Converter->FromVal(V));
       }
       Calls.push_back(BB2Func.getZ3Fun(Block)(LocalScope));
     }
@@ -628,7 +645,7 @@ public:
     if (Br->isUnconditional())
       Body = Calls[0];
     else
-      Body = ite(Converter.FromVal(Br->getCondition()), Calls[1], Calls[0]);
+      Body = ite(Converter->FromVal(Br->getCondition()), Calls[1], Calls[0]);
 
     Ctx.recdef(BB2Func.getZ3Fun(BB), Scope, Body);
 
@@ -658,11 +675,42 @@ private:
   context &Ctx;
   DenseMap<Value *, std::vector<Value *>> Scopes;
   TerminalMap BB2Func;
-  DominatorTree &DT;
-  ConverterTy &Converter;
+  DominatorTree *DT;
+  ConverterTy *Converter;
   z3::sort Range;
   expr Output;
 };
+
+//expr MkGEMV(context &Ctx, func_decl &csr, expr &y) {
+//  expr n = Ctx.int_const("n");
+//  expr_vector Args(Ctx);
+//  Args.push_back(n);
+//  func_decl gemv = Ctx.recfun("gemv", Ctx.int_sort(), Ctx.array_sort(Ctx.int_sort(), Ctx.fpa_sort<64>()));
+//  Ctx.recdef(gemv, Args, ite(n<0, y, store(gemv(n-1), n, csr(n, ))))
+//}
+
+SSA2Func ParseInputFile(StringRef Path, StringRef FunctionName, LLVMContext &Context, ScalarEvolution &SE, context &Ctx, MakeZ3 &Converter) {
+  llvm::SMDiagnostic Err;
+  auto Module = llvm::parseIRFile(Path, Err, Context);
+  assert(Module && "couldn't parse kernel.");
+
+  DominatorTree DT(*Module->getFunction(FunctionName));
+  LoopInfo LI(DT);
+  LoopNest LN(*LI.getTopLevelLoops()[0], SE);
+  auto *OuterLoop = &LN.getOutermostLoop();
+
+  SmallPtrSet<Value *, 5> Stores;
+  for (BasicBlock *BB : OuterLoop->blocks()) {
+    for (Instruction &Inst : *BB) {
+      if (auto *Store = dyn_cast<StoreInst>(&Inst))
+        Stores.insert(getLoadStorePointerOperand(Store));
+    }
+  }
+
+  SSA2Func File(Ctx, &DT, &Converter, Stores);
+  File.fromFunction(Module->getFunction(FunctionName));
+  return File;
+}
 
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
@@ -715,7 +763,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
   auto *LiveOut = (*LiveOuts.begin());
 
-  SSA2Func Translate(Ctx, DT, Converter, LiveOut);
+  SSA2Func Translate(Ctx, &DT, &Converter, LiveOut);
   Translate.fromFunction(&F);
 
   solver Slv(Ctx);
@@ -779,11 +827,20 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   LiveOuts.clear();
   LoopInfo GemvLI(GDT);
   LoopNest GemvLN(*GemvLI.getTopLevelLoops()[0], SE);
-  GetLiveOuts(OuterLoop, LiveOuts);
+  GetLiveOuts(&GemvLN.getOutermostLoop(), LiveOuts);
   assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
   LiveOut = (*LiveOuts.begin());
-  SSA2Func Gemv(Ctx, GDT, Converter, LiveOut);
+  SSA2Func Gemv(Ctx, &GDT, &Converter, LiveOut);
   Gemv.fromFunction(GemvMod->getFunction("gemv"));
+
+
+
+  // replace A with the expansion thing
+  // TODO I really, really think this should be reversed in the future
+  // eg, use compression functions on compressed kernels
+
+  SSA2Func CSR = ParseInputFile("csr_opt.ll", "CSR", F.getContext(), SE, Ctx, Converter);
+
 
   return PreservedAnalyses::all();
 }
