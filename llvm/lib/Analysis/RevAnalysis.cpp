@@ -507,14 +507,17 @@ protected:
     auto Left = FromVal(Cmp->getOperand(0));
     auto Right = FromVal(Cmp->getOperand(1));
     switch (Cmp->getPredicate()) {
+    default:
+      llvm_unreachable("unsupported predicate type.");
     case CmpInst::ICMP_SLT:
     case CmpInst::ICMP_ULT:
       return Left < Right;
     case CmpInst::ICMP_SGT:
     case CmpInst::ICMP_UGT:
       return Left > Right;
-    default:
-      llvm_unreachable("unsupported predicate type.");
+    case CmpInst::ICMP_EQ:
+    case CmpInst::FCMP_OEQ:
+      return Left == Right;
     }
   }
 
@@ -542,7 +545,7 @@ class SSA2Func {
 public:
 //  SSA2Func(context &Ctx) : Ctx(Ctx), BB2Func(Ctx), DT(nullptr), Converter(nullptr), Range(Ctx), Output(Ctx) {}
 
-  SSA2Func(context &Ctx, DominatorTree *DT, ConverterTy *Converter, Value *LiveOut) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Ctx), Output(Ctx) {
+  SSA2Func(context &Ctx, DominatorTree *DT, ConverterTy *Converter, Value *LiveOut) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Ctx), Output(Ctx), Projs(Ctx) {
     if (auto *GEP = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LiveOut))) {
       auto Tuple = Converter->FromGEP(GEP);
       Range = Tuple.Base.get_sort();
@@ -552,19 +555,35 @@ public:
     }
   }
 
-  SSA2Func(context &Ctx, DominatorTree *DT, ConverterTy *Converter, SmallPtrSetImpl<Value *> &LiveOut) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Ctx), Output(Ctx) {
+  SSA2Func(context &Ctx, DominatorTree *DT, ConverterTy *Converter, SmallPtrSetImpl<Value *> &LiveOut) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Ctx), Output(Ctx), Projs(Ctx) {
     // range is a tuple sort
     // output is the tuple itself
     std::vector<z3::sort> TupleSorts;
     expr_vector Elems(Ctx);
-    for (auto *V : LiveOut)
-      Elems.push_back(Converter->FromVal(V));
+    for (auto *V : LiveOut) {
+      if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+        auto Tuple = Converter->FromGEP(GEP);
+        Elems.push_back(Tuple.Base);
+      } else {
+        Elems.push_back(Converter->FromVal(V));
+      }
+    }
     for (auto E : Elems)
       TupleSorts.push_back(E.get_sort());
-    func_decl_vector Projs(Ctx);
-    func_decl MkTuple = Ctx.tuple_sort("ret", LiveOut.size(), nullptr, TupleSorts.data(), Projs);
+//    const char * names[] = { "first", "second" };
+    std::vector<const char *> Names;
+    std::vector<std::string> SavedNames;
+    for (unsigned i = 0; i < Elems.size(); ++i) {
+      SavedNames.push_back(std::string("get_" + std::to_string(i)).c_str());
+      Names.push_back(SavedNames.back().c_str());
+    }
+    func_decl MkTuple = Ctx.tuple_sort("ret", LiveOut.size(), Names.data(), TupleSorts.data(), Projs);
     Output = MkTuple(Elems);
     Range = Output.get_sort();
+  }
+
+  func_decl getNth(unsigned i) {
+    return Projs[i];
   }
 
   func_decl fromFunction(Function *F) {
@@ -606,6 +625,13 @@ public:
 
     if (auto *Ret = dyn_cast<ReturnInst>(BB->getTerminator())) {
       Ctx.recdef(BB2Func.getZ3Fun(BB), Scope, Output);
+      LLVM_DEBUG({
+        dbgs() << BB->getNameOrAsOperand() << ", [";
+        for (unsigned i=0; i < Scope.size()-1; ++i)
+          dbgs() << Scope[i].to_string() << ", ";
+        dbgs() << Scope.back().to_string() << "]\n";
+        dbgs() << Output.to_string() << "\n";
+      });
       return;
     }
 
@@ -679,6 +705,7 @@ private:
   ConverterTy *Converter;
   z3::sort Range;
   expr Output;
+  func_decl_vector Projs;
 };
 
 //expr MkGEMV(context &Ctx, func_decl &csr, expr &y) {
@@ -694,7 +721,9 @@ SSA2Func ParseInputFile(StringRef Path, StringRef FunctionName, LLVMContext &Con
   auto Module = llvm::parseIRFile(Path, Err, Context);
   assert(Module && "couldn't parse kernel.");
 
-  DominatorTree DT(*Module->getFunction(FunctionName));
+  Function *F = Module->getFunction(FunctionName);
+
+  DominatorTree DT(*F);
   LoopInfo LI(DT);
   LoopNest LN(*LI.getTopLevelLoops()[0], SE);
   auto *OuterLoop = &LN.getOutermostLoop();
@@ -708,7 +737,44 @@ SSA2Func ParseInputFile(StringRef Path, StringRef FunctionName, LLVMContext &Con
   }
 
   SSA2Func File(Ctx, &DT, &Converter, Stores);
-  File.fromFunction(Module->getFunction(FunctionName));
+  File.fromFunction(F);
+  // let's try something interesting...
+  solver Slv(Ctx);
+  expr n = Converter.FromVal(F->getArg(0));
+  expr m = Converter.FromVal(F->getArg(1));
+  expr A = Converter.FromVal(F->getArg(2));
+  expr rptr = Converter.FromVal(F->getArg(3));
+  expr cols = Converter.FromVal(F->getArg(4));
+  expr vals = Converter.FromVal(F->getArg(5));
+  auto mki = [&](int i) { return Ctx.int_val(i); };
+  Slv.add(n == 2);
+  Slv.add(m == 2);
+  Slv.add(A[mki(0)] == 0);
+  Slv.add(A[mki(1)] == 1);
+  Slv.add(A[mki(2)] == 1);
+  Slv.add(A[mki(3)] == 0);
+  Slv.add(forall(n, rptr[n] == 0));
+  auto Result = Slv.check();
+  if (Result == z3::sat) {
+    auto Model = Slv.get_model();
+    std::vector<expr> Args = {n, m, A, rptr, cols, vals};
+    auto Output = File[&F->getEntryBlock()](Args.size(), Args.data());
+//    LLVM_DEBUG({
+    dbgs() << "Concrete Test output: \n";
+    std::vector<unsigned> lens = {2, 2, 3};
+    for (int idx : {0, 1, 2} ){
+      auto array = Model.eval(File.getNth(idx)(Output).simplify());
+      for (int i = 0; i < lens[idx]; ++i) {
+        auto elem = Model.eval(array[mki(i)].simplify());
+        if (elem.is_fpa())
+          dbgs() << Z3_get_numeral_string(Ctx, elem) << " ";
+        else
+          dbgs() << elem.to_string() << " ";
+      }
+      dbgs() << "\n";
+    }
+//    });
+  }
   return File;
 }
 
@@ -840,6 +906,12 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // eg, use compression functions on compressed kernels
 
   SSA2Func CSR = ParseInputFile("csr_opt.ll", "CSR", F.getContext(), SE, Ctx, Converter);
+
+  // Now, the question is:
+  // SpMV(CSR(A)) =?= GEMV(A)
+  // TODO actually implement the matching algorithm
+  // for now, tell the compiler how to wire up functions
+
 
 
   return PreservedAnalyses::all();
