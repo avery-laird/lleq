@@ -942,9 +942,6 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   std::vector<expr> SpmvArgs = {n, output_rptr, output_cols, output_vals, x, y};
   std::vector<expr> GemvArgs = {n, m, y, A, x};
 
-  Slv.add(n > 0);
-  Slv.add(m > 0);
-
   expr s = Ctx.int_const("s");
   expr t = Ctx.int_const("t");
   // monotonicty
@@ -968,6 +965,20 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   Slv.add(Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data()) != Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data()));
 //  Slv.add(!forall(s, implies(0 <= s && s < n, Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data())[s] == Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data())[s])));
   dbgs() << Slv.to_smt2() << "\n";
+  std::vector<std::vector<expr>> Bases = {
+      {n == 1, m == 1},
+      {n == 1, m == 2},
+      {n == 2, m == 1},
+  };
+  auto Res1 = Slv.check(2, Bases[0].data());
+  auto Res2 = Slv.check(2, Bases[1].data());
+  auto Res3 = Slv.check(2, Bases[2].data());
+  if (Res1 == z3::unsat && Res2 == z3::unsat && Res3 == z3::unsat) {
+    // assume IH
+    dbgs() << "basecase proven\n";
+  }
+
+
   auto Result = Slv.check();
   if (Result == z3::unsat) {
     dbgs() << "no counterexample\n";
