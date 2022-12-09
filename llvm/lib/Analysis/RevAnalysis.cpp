@@ -248,6 +248,7 @@ static void GetLiveIns(Loop *L, SmallPtrSet<Value *, 4> &LiveIns) {
 }
 
 static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
+  SmallPtrSet<Value *, 5> BasePtrs;
   SmallVector<BasicBlock *> ExitBlocks;
   L->getExitBlocks(ExitBlocks);
   for (auto *BB : ExitBlocks)
@@ -257,8 +258,15 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
   // TODO: considering the StoreInst
   for (auto *BB : L->getBlocks())
     for (auto &I : *BB) {
-      if (isa<StoreInst>(&I))
-        LiveOuts.insert(&I);
+      if (isa<StoreInst>(&I)) {
+        // get the GEP
+        if (auto *GEP = dyn_cast<GEPOperator>(getLoadStorePointerOperand(&I))) {
+          if (BasePtrs.count(GEP->getPointerOperand()))
+            continue ;
+          LiveOuts.insert(&I); // TODO replace everything with GEPs
+          BasePtrs.insert(GEP->getPointerOperand());
+        }
+      }
     }
 }
 
@@ -425,8 +433,8 @@ public:
       //      return c.int_sort();
       Mantissa = APFloat::semanticsPrecision(T->getFltSemantics());
       Exponent = APFloat::semanticsSizeInBits(T->getFltSemantics()) - Mantissa;
-      return c.fpa_sort(Exponent, Mantissa);
-      //      return c.fpa_sort<64>();
+//      return c.fpa_sort(Exponent, Mantissa);
+      return c.int_sort();
     }
   }
 
@@ -465,9 +473,9 @@ protected:
       return c.int_val(dyn_cast<ConstantInt>(V)->getSExtValue());
     case Type::TypeID::DoubleTyID:
       // TODO remove this debug hack
-//      dyn_cast<ConstantFP>(V)->getValue().convertToInteger(Result, APFloatBase::rmNearestTiesToEven, &isExact);
-//      return c.int_val(Result.getSExtValue());
-      return c.fpa_val(dyn_cast<ConstantFP>(V)->getValue().convertToDouble());
+      dyn_cast<ConstantFP>(V)->getValue().convertToInteger(Result, APFloatBase::rmNearestTiesToEven, &isExact);
+      return c.int_val(Result.getSExtValue());
+//      return c.fpa_val(dyn_cast<ConstantFP>(V)->getValue().convertToDouble());
     default:
       llvm_unreachable("unsupported constant type");
     }
@@ -528,7 +536,9 @@ protected:
       expr A = FromVal(CI->getOperand(0));
       expr B = FromVal(CI->getOperand(1));
       expr C = FromVal(CI->getOperand(2));
-      return fma(A, B, C, c.fpa_rounding_mode());
+//      return fma(A, B, C, c.fpa_rounding_mode());
+      // TODO remove this debug hack
+      return A * B + C;
     }
     llvm_unreachable("arbitrary functions aren't supported.");
   }
@@ -914,12 +924,13 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // TODO actually implement the matching algorithm
   // for now, tell the compiler how to wire up functions
 
-  expr A = Ctx.constant("A", Ctx.array_sort(Ctx.int_sort(), Ctx.fpa_sort<64>()));
+  z3::sort ElemSort = Ctx.int_sort(); // or Ctx.fpa_sort<64>()
+  expr A = Ctx.constant("A", Ctx.array_sort(Ctx.int_sort(), ElemSort));
   expr n = Ctx.int_const("n");
   expr m = Ctx.int_const("m");
-  expr vals = Ctx.constant("vals", Ctx.array_sort(Ctx.int_sort(), Ctx.fpa_sort<64>()));
-  expr x = Ctx.constant("x", Ctx.array_sort(Ctx.int_sort(), Ctx.fpa_sort<64>()));
-  expr y = Ctx.constant("y", Ctx.array_sort(Ctx.int_sort(), Ctx.fpa_sort<64>()));
+  expr vals = Ctx.constant("vals", Ctx.array_sort(Ctx.int_sort(), ElemSort));
+  expr x = Ctx.constant("x", Ctx.array_sort(Ctx.int_sort(), ElemSort));
+  expr y = Ctx.constant("y", Ctx.array_sort(Ctx.int_sort(), ElemSort));
   expr rptr = Ctx.constant("rptr", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
   expr cols = Ctx.constant("cols", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
   std::vector<expr> CsrArgs = {n, m, A, rptr, cols, vals};
@@ -932,6 +943,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   Slv.add(n == 1);
   Slv.add(m == 1);
+  expr s = Ctx.int_const("s");
+  Slv.add(forall(s, rptr[s] == 0));
+  Slv.add(A[Ctx.int_val(0)] == 1);
 //  Slv.add(n < 4);
 //  Slv.add(m < 4);
   Slv.add(Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data()) != Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data()));
@@ -942,6 +956,27 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   } else if (Result == z3::sat) {
     auto Model = Slv.get_model();
     dbgs() << Model.to_string() << "\n";
+    // print A, vals, rptr, col
+    auto SpmvOutput = Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data());
+    auto GemvOutput = Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data());
+    for (int i=0; i < Model.eval(m).as_int64(); ++i)
+      dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
+    dbgs() << "vals: ";
+    for (int i=0; i < 1; ++i)
+      dbgs() << Model.eval(output_vals[Ctx.int_val(i)]).to_string() << " ";
+    dbgs() << "\n";
+    dbgs() << "cols: ";
+    for (int i=0; i < 1; ++i)
+      dbgs() << Model.eval(output_cols[Ctx.int_val(i)]).to_string() << " ";
+    dbgs() << "\n";
+    dbgs() << "rptr: ";
+    for (int i=0; i < 2; ++i)
+      dbgs() << Model.eval(output_rptr[Ctx.int_val(i)]).to_string() << " ";
+
+    dbgs() << "\n";
+    for (int i=0; i < Model.eval(m).as_int64(); ++i)
+      dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
+
   } else {
     dbgs() << Result << "\n";
   }
