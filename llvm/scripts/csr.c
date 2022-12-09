@@ -1,9 +1,13 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+//typedef struct Compressed {
+//  int *rptr;
+//  int *cols;
+//  double *vals;
+//} Compressed;
 void CSR(int n, int m, double *A, int *rptr, int *cols, double *vals) {
-  double *base_vals = vals;
-  int *base_cols = cols;
+  int vals_idx = 0, cols_idx = 0;
   int nnz = 0;
   rptr[0] = 0;
   for (int i = 0; i < n; ++i) {
@@ -11,25 +15,26 @@ void CSR(int n, int m, double *A, int *rptr, int *cols, double *vals) {
     for (int j=0; j < m; ++j) {
       if (A[i*m + j] == 0)
         continue ;
-      *base_vals = A[i*m+j]; base_vals++;
-      *base_cols = j; base_cols++;
+      vals[vals_idx++] = A[i*m+j];
+      cols[cols_idx++] = j;
       offset++;
       nnz++;
     }
     rptr[i+1] = rptr[i] + offset;
   }
-//  rptr[n] = nnz;
+  return;
 }
 
 int main() {
-  int n = 2, m = 2;
+  int n = 1, m = 1;
   double *A = malloc(sizeof(double)*n*m);
   int *rptr = malloc(sizeof(int)*n*m);
   int *cols = malloc(sizeof(int)*n*m);
   double *vals = malloc(sizeof(double)*n*m);
 
-  A[0] = 0; A[1] = 1;
-  A[2] = 1; A[3] = 0;
+  A[0] = 1;
+//  A[1] = 1;
+//  A[2] = 1; A[3] = 0;
 
   CSR(n, m, A, rptr, cols, vals);
 
