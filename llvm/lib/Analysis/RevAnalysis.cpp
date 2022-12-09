@@ -928,6 +928,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   expr A = Ctx.constant("A", Ctx.array_sort(Ctx.int_sort(), ElemSort));
   expr n = Ctx.int_const("n");
   expr m = Ctx.int_const("m");
+  expr nnz = Ctx.int_const("nnz");
   expr vals = Ctx.constant("vals", Ctx.array_sort(Ctx.int_sort(), ElemSort));
   expr x = Ctx.constant("x", Ctx.array_sort(Ctx.int_sort(), ElemSort));
   expr y = Ctx.constant("y", Ctx.array_sort(Ctx.int_sort(), ElemSort));
@@ -941,14 +942,31 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   std::vector<expr> SpmvArgs = {n, output_rptr, output_cols, output_vals, x, y};
   std::vector<expr> GemvArgs = {n, m, y, A, x};
 
-  Slv.add(n == 1);
-  Slv.add(m == 1);
+  Slv.add(n > 0);
+  Slv.add(m > 0);
+
   expr s = Ctx.int_const("s");
+  expr t = Ctx.int_const("t");
+  // monotonicty
+  Slv.add(forall(s, implies(0 <= s && s <= n, output_rptr[s] <= output_rptr[s+1] && output_rptr[s] >= 0)));
+  // pmonotonicity
+  Slv.add(forall(s, implies(0 <= s && s < n, forall(t, implies(output_rptr[s] <= t && t < output_rptr[s+1], output_cols[t] < output_cols[t+1])))));
+  // extra constraints
+  Slv.add(forall(s, implies(0 <= s && s < nnz, output_cols[s] >= 0 && output_cols[s] < m)));
+  Slv.add(nnz > 0);
+  Slv.add(nnz <= n * m);
+  Slv.add(output_rptr[Ctx.int_val(0)] == 0);
+  Slv.add(output_rptr[n] == nnz);
+
+//  Slv.add(n < 10);
+//  Slv.add(m < 10);
+
   Slv.add(forall(s, rptr[s] == 0));
-  Slv.add(A[Ctx.int_val(0)] == 1);
+//  Slv.add(A[Ctx.int_val(0)] == 1);
 //  Slv.add(n < 4);
 //  Slv.add(m < 4);
   Slv.add(Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data()) != Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data()));
+//  Slv.add(!forall(s, implies(0 <= s && s < n, Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data())[s] == Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data())[s])));
   dbgs() << Slv.to_smt2() << "\n";
   auto Result = Slv.check();
   if (Result == z3::unsat) {
