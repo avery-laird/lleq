@@ -852,6 +852,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   Translate.fromFunction(&F);
 
   solver Slv(Ctx);
+  Slv.set("smtlib2_log", "spmv_csr_test_log.smt2");
   Value *N = F.getArg(0);
   Value *Rptr = F.getArg(1);
   Value *Col = F.getArg(2);
@@ -944,23 +945,11 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   Slv.add(Gemv2(n-1) != Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data()));
 
   dbgs() << Slv.to_smt2() << "\n\n";
-  Slv.set("smtlib2_log", "spmv_csr_test_log.smt2");
 
 
   auto Result = Slv.check();
   if (Result == z3::unsat) {
     dbgs() << "no counterexample\n";
-
-    auto Model = Slv.get_model();
-    dbgs() << Model.to_string() << "\n";
-    // print A, vals, rptr, col
-    auto SpmvOutput = Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data());
-    auto GemvOutput = Gemv2(n-1);
-    for (int i=0; i < Model.eval(m).as_int64(); ++i)
-      dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
-    dbgs() << "\n";
-    for (int i=0; i < Model.eval(m).as_int64(); ++i)
-      dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
 
   } else if (Result == z3::sat) {
     auto Model = Slv.get_model();
@@ -995,8 +984,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // TODO I really, really think this should be reversed in the future
   // eg, use compression functions on compressed kernels
 
-  std::unique_ptr<Module> CSRModule;
-  SSA2Func CSR = ParseInputFile("csr_opt.ll", "CSR", F.getContext(), SE, Ctx, Converter, CSRModule);
+//  std::unique_ptr<Module> CSRModule;
+//  SSA2Func CSR = ParseInputFile("csr_opt.ll", "CSR", F.getContext(), SE, Ctx, Converter, CSRModule);
 
   // Now, the question is:
   // SpMV(CSR(A)) =?= GEMV(A)
