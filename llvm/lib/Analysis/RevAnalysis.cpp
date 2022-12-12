@@ -719,13 +719,21 @@ private:
   std::vector<std::string> SavedNames;
 };
 
-//expr MkGEMV(context &Ctx, func_decl &csr, expr &y) {
-//  expr n = Ctx.int_const("n");
-//  expr_vector Args(Ctx);
-//  Args.push_back(n);
-//  func_decl gemv = Ctx.recfun("gemv", Ctx.int_sort(), Ctx.array_sort(Ctx.int_sort(), Ctx.fpa_sort<64>()));
-//  Ctx.recdef(gemv, Args, ite(n<0, y, store(gemv(n-1), n, csr(n, ))))
-//}
+func_decl MkGEMV(context &Ctx, expr &y, expr &x, expr &rptr, expr &col) {
+  expr n = Ctx.int_const("n");
+  expr m = Ctx.int_const("m");
+  expr t = Ctx.int_const("t");
+  expr_vector Args(Ctx);
+  Args.push_back(n);
+  func_decl gemv = Ctx.recfun("gemv", Ctx.int_sort(), y.get_sort());
+  func_decl dot = Ctx.recfun("dot", Ctx.int_sort(), Ctx.int_sort(), y[Ctx.int_val(0)].get_sort());
+  func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), y[Ctx.int_val(0)].get_sort());
+  Ctx.recdef(gemv, Args, ite(n<0, y, store(gemv(n-1), n, dot(n, m-1))));
+  Args.push_back(m);
+  Ctx.recdef(dot, Args, ite(m < 0, Ctx.int_val(0), dot(n, m-1) + A(n, m) * x[m]));
+  Ctx.recdef(A, Args, ite(exists(t, rptr[n] <= t && t < rptr[n+1] && col[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
+  return gemv;
+}
 
 SSA2Func ParseInputFile(StringRef Path, StringRef FunctionName, LLVMContext &Context, ScalarEvolution &SE, context &Ctx, MakeZ3 &Converter, std::unique_ptr<Module> &Module) {
   llvm::SMDiagnostic Err;
@@ -844,12 +852,12 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   Translate.fromFunction(&F);
 
   solver Slv(Ctx);
-//  Value *N = F.getArg(0);
-//  Value *Rptr = F.getArg(1);
-//  Value *Col = F.getArg(2);
-//  Value *Val = F.getArg(3);
-//  Value *X = F.getArg(4);
-//  Value *Y = F.getArg(5);
+  Value *N = F.getArg(0);
+  Value *Rptr = F.getArg(1);
+  Value *Col = F.getArg(2);
+  Value *Val = F.getArg(3);
+  Value *X = F.getArg(4);
+  Value *Y = F.getArg(5);
 //
 //  expr zero = Ctx.int_val(0);
 //  expr one = Ctx.int_val(1);
@@ -858,11 +866,14 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 //
 //  expr n = Ctx.int_val(2);
 //  Slv.add(n == 2);
-//  expr rptr = Converter.FromVal(Rptr);
-//  expr val = Converter.FromVal(Val);
-//  expr col = Converter.FromVal(Col);
-//  expr x = Converter.FromVal(X);
-//  expr y = Converter.FromVal(Y);
+  expr n = Converter.FromVal(N);
+  expr m = Ctx.int_const("m");
+  expr nnz = Ctx.int_const("nnz");
+  expr rptr = Converter.FromVal(Rptr);
+  expr val = Converter.FromVal(Val);
+  expr col = Converter.FromVal(Col);
+  expr x = Converter.FromVal(X);
+  expr y = Converter.FromVal(Y);
 //  Slv.add(val[zero] == 1);
 //  Slv.add(val[one] == 1);
 //
@@ -910,9 +921,77 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   SSA2Func Gemv(Ctx, &GDT, &Converter, LiveOut);
   Gemv.fromFunction(GemvMod->getFunction("gemv"));
 
+  // now try to replace A with the expansion thing
+  func_decl Gemv2 = MkGEMV(Ctx, y, x, rptr, col);
+
+  expr s = Ctx.int_const("s");
+  expr t = Ctx.int_const("t");
+  Slv.add(m > 0);
+  Slv.add(n > 0);
+  // monotonicty
+  Slv.add(forall(s, implies(0 <= s && s <= n, rptr[s] <= rptr[s+1] && rptr[s] >= 0)));
+  // pmonotonicity
+  Slv.add(forall(s, implies(0 <= s && s < n, forall(t, implies(rptr[s] <= t && t < rptr[s+1], col[t] < col[t+1])))));
+  // extra constraints
+  Slv.add(forall(s, implies(0 <= s && s < nnz, col[s] >= 0 && col[s] < m)));
+  Slv.add(forall(s, implies(0 <= s && s < nnz, val[s] == 1 || val[s] == 0)));
+  Slv.add(nnz > 0);
+  Slv.add(nnz <= n * m);
+  Slv.add(rptr[Ctx.int_val(0)] == 0);
+  Slv.add(rptr[n] == nnz);
+
+  std::vector<expr> SpmvArgs = {n, rptr, col, val, x, y};
+  Slv.add(Gemv2(n-1) != Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data()));
+
+  dbgs() << Slv.to_smt2() << "\n\n";
+  Slv.set("smtlib2_log", "spmv_csr_test_log.smt2");
 
 
-  // replace A with the expansion thing
+  auto Result = Slv.check();
+  if (Result == z3::unsat) {
+    dbgs() << "no counterexample\n";
+
+    auto Model = Slv.get_model();
+    dbgs() << Model.to_string() << "\n";
+    // print A, vals, rptr, col
+    auto SpmvOutput = Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data());
+    auto GemvOutput = Gemv2(n-1);
+    for (int i=0; i < Model.eval(m).as_int64(); ++i)
+      dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
+    dbgs() << "\n";
+    for (int i=0; i < Model.eval(m).as_int64(); ++i)
+      dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
+
+  } else if (Result == z3::sat) {
+    auto Model = Slv.get_model();
+    dbgs() << Model.to_string() << "\n";
+    // print A, vals, rptr, col
+    auto SpmvOutput = Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data());
+    auto GemvOutput = Gemv2(n-1);
+    for (int i=0; i < Model.eval(m).as_int64(); ++i)
+      dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
+//    dbgs() << "vals: ";
+//    for (int i=0; i < 1; ++i)
+//      dbgs() << Model.eval(output_vals[Ctx.int_val(i)]).to_string() << " ";
+//    dbgs() << "\n";
+//    dbgs() << "cols: ";
+//    for (int i=0; i < 1; ++i)
+//      dbgs() << Model.eval(output_cols[Ctx.int_val(i)]).to_string() << " ";
+//    dbgs() << "\n";
+//    dbgs() << "rptr: ";
+//    for (int i=0; i < 2; ++i)
+//      dbgs() << Model.eval(output_rptr[Ctx.int_val(i)]).to_string() << " ";
+
+    dbgs() << "\n";
+    for (int i=0; i < Model.eval(m).as_int64(); ++i)
+      dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
+
+  } else {
+    dbgs() << Result << "\n";
+  }
+
+
+
   // TODO I really, really think this should be reversed in the future
   // eg, use compression functions on compressed kernels
 
@@ -924,91 +1003,93 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // TODO actually implement the matching algorithm
   // for now, tell the compiler how to wire up functions
 
-  z3::sort ElemSort = Ctx.int_sort(); // or Ctx.fpa_sort<64>()
-  expr A = Ctx.constant("A", Ctx.array_sort(Ctx.int_sort(), ElemSort));
-  expr n = Ctx.int_const("n");
-  expr m = Ctx.int_const("m");
-  expr nnz = Ctx.int_const("nnz");
-  expr vals = Ctx.constant("vals", Ctx.array_sort(Ctx.int_sort(), ElemSort));
-  expr x = Ctx.constant("x", Ctx.array_sort(Ctx.int_sort(), ElemSort));
-  expr y = Ctx.constant("y", Ctx.array_sort(Ctx.int_sort(), ElemSort));
-  expr rptr = Ctx.constant("rptr", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
-  expr cols = Ctx.constant("cols", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
-  std::vector<expr> CsrArgs = {n, m, A, rptr, cols, vals};
-  expr Compressed = CSR[CSRModule->getFunction("CSR")](CsrArgs.size(), CsrArgs.data());
-  expr output_vals = CSR.getNth(0)(Compressed);
-  expr output_cols = CSR.getNth(1)(Compressed);
-  expr output_rptr = CSR.getNth(2)(Compressed);
-  std::vector<expr> SpmvArgs = {n, output_rptr, output_cols, output_vals, x, y};
-  std::vector<expr> GemvArgs = {n, m, y, A, x};
-
-  expr s = Ctx.int_const("s");
-  expr t = Ctx.int_const("t");
-  // monotonicty
-  Slv.add(forall(s, implies(0 <= s && s <= n, output_rptr[s] <= output_rptr[s+1] && output_rptr[s] >= 0)));
-  // pmonotonicity
-  Slv.add(forall(s, implies(0 <= s && s < n, forall(t, implies(output_rptr[s] <= t && t < output_rptr[s+1], output_cols[t] < output_cols[t+1])))));
-  // extra constraints
-  Slv.add(forall(s, implies(0 <= s && s < nnz, output_cols[s] >= 0 && output_cols[s] < m)));
-  Slv.add(nnz > 0);
-  Slv.add(nnz <= n * m);
-  Slv.add(output_rptr[Ctx.int_val(0)] == 0);
-  Slv.add(output_rptr[n] == nnz);
-
-//  Slv.add(n < 10);
-//  Slv.add(m < 10);
-
-  Slv.add(forall(s, rptr[s] == 0));
-//  Slv.add(A[Ctx.int_val(0)] == 1);
-//  Slv.add(n < 4);
-//  Slv.add(m < 4);
-  Slv.add(Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data()) != Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data()));
-//  Slv.add(!forall(s, implies(0 <= s && s < n, Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data())[s] == Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data())[s])));
-  dbgs() << Slv.to_smt2() << "\n";
-  std::vector<std::vector<expr>> Bases = {
-      {n == 1, m == 1},
-      {n == 1, m == 2},
-      {n == 2, m == 1},
-  };
-  auto Res1 = Slv.check(2, Bases[0].data());
-  auto Res2 = Slv.check(2, Bases[1].data());
-  auto Res3 = Slv.check(2, Bases[2].data());
-  if (Res1 == z3::unsat && Res2 == z3::unsat && Res3 == z3::unsat) {
-    // assume IH
-    dbgs() << "basecase proven\n";
-  }
-
-
-  auto Result = Slv.check();
-  if (Result == z3::unsat) {
-    dbgs() << "no counterexample\n";
-  } else if (Result == z3::sat) {
-    auto Model = Slv.get_model();
-    dbgs() << Model.to_string() << "\n";
-    // print A, vals, rptr, col
-    auto SpmvOutput = Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data());
-    auto GemvOutput = Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data());
-    for (int i=0; i < Model.eval(m).as_int64(); ++i)
-      dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
-    dbgs() << "vals: ";
-    for (int i=0; i < 1; ++i)
-      dbgs() << Model.eval(output_vals[Ctx.int_val(i)]).to_string() << " ";
-    dbgs() << "\n";
-    dbgs() << "cols: ";
-    for (int i=0; i < 1; ++i)
-      dbgs() << Model.eval(output_cols[Ctx.int_val(i)]).to_string() << " ";
-    dbgs() << "\n";
-    dbgs() << "rptr: ";
-    for (int i=0; i < 2; ++i)
-      dbgs() << Model.eval(output_rptr[Ctx.int_val(i)]).to_string() << " ";
-
-    dbgs() << "\n";
-    for (int i=0; i < Model.eval(m).as_int64(); ++i)
-      dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
-
-  } else {
-    dbgs() << Result << "\n";
-  }
+//  z3::sort ElemSort = Ctx.int_sort(); // or Ctx.fpa_sort<64>()
+//  expr A = Ctx.constant("A", Ctx.array_sort(Ctx.int_sort(), ElemSort));
+//  expr n = Ctx.int_const("n");
+//  expr m = Ctx.int_const("m");
+//  expr nnz = Ctx.int_const("nnz");
+//  expr vals = Ctx.constant("vals", Ctx.array_sort(Ctx.int_sort(), ElemSort));
+//  expr x = Ctx.constant("x", Ctx.array_sort(Ctx.int_sort(), ElemSort));
+//  expr y = Ctx.constant("y", Ctx.array_sort(Ctx.int_sort(), ElemSort));
+//  expr rptr = Ctx.constant("rptr", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+//  expr cols = Ctx.constant("cols", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+//  std::vector<expr> CsrArgs = {n, m, A, rptr, cols, vals};
+//  expr Compressed = CSR[CSRModule->getFunction("CSR")](CsrArgs.size(), CsrArgs.data());
+//  expr output_vals = CSR.getNth(0)(Compressed);
+//  expr output_cols = CSR.getNth(1)(Compressed);
+//  expr output_rptr = CSR.getNth(2)(Compressed);
+//  std::vector<expr> SpmvArgs = {n, output_rptr, output_cols, output_vals, x, y};
+//  std::vector<expr> GemvArgs = {n, m, y, A, x};
+//
+//  expr s = Ctx.int_const("s");
+//  expr t = Ctx.int_const("t");
+//  // monotonicty
+//  Slv.add(forall(s, implies(0 <= s && s <= n, output_rptr[s] <= output_rptr[s+1] && output_rptr[s] >= 0)));
+//  // pmonotonicity
+//  Slv.add(forall(s, implies(0 <= s && s < n, forall(t, implies(output_rptr[s] <= t && t < output_rptr[s+1], output_cols[t] < output_cols[t+1])))));
+//  // extra constraints
+//  Slv.add(forall(s, implies(0 <= s && s < nnz, output_cols[s] >= 0 && output_cols[s] < m)));
+//  Slv.add(nnz > 0);
+//  Slv.add(nnz <= n * m);
+//  Slv.add(output_rptr[Ctx.int_val(0)] == 0);
+//  Slv.add(output_rptr[n] == nnz);
+//
+//  Slv.add(n == 1);
+//  Slv.add(m == 1);
+//
+//  Slv.add(forall(s, rptr[s] == 0));
+////  Slv.add(A[Ctx.int_val(0)] == 1);
+////  Slv.add(n < 4);
+////  Slv.add(m < 4);
+//  Slv.add(Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data()) != Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data()));
+////  Slv.add(!forall(s, implies(0 <= s && s < n, Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data())[s] == Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data())[s])));
+//  dbgs() << Slv.to_smt2() << "\n";
+//  std::vector<std::vector<expr>> Bases = {
+//      {n == 1, m == 1},
+//      {n == 1, m == 2},
+//      {n == 2, m == 1},
+//  };
+////  auto Res1 = Slv.check(2, Bases[0].data());
+////  auto Res2 = Slv.check(2, Bases[1].data());
+////  auto Res3 = Slv.check(2, Bases[2].data());
+////  if (Res1 == z3::unsat
+////      && Res2 == z3::unsat && Res3 == z3::unsat
+////      ) {
+//    // assume IH
+////    dbgs() << "basecase proven\n";
+////  }
+//
+//
+//  auto Result = Slv.check();
+//  if (Result == z3::unsat) {
+//    dbgs() << "no counterexample\n";
+//  } else if (Result == z3::sat) {
+//    auto Model = Slv.get_model();
+//    dbgs() << Model.to_string() << "\n";
+//    // print A, vals, rptr, col
+//    auto SpmvOutput = Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data());
+//    auto GemvOutput = Gemv[GemvMod->getFunction("gemv")](GemvArgs.size(), GemvArgs.data());
+//    for (int i=0; i < Model.eval(m).as_int64(); ++i)
+//      dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
+//    dbgs() << "vals: ";
+//    for (int i=0; i < 1; ++i)
+//      dbgs() << Model.eval(output_vals[Ctx.int_val(i)]).to_string() << " ";
+//    dbgs() << "\n";
+//    dbgs() << "cols: ";
+//    for (int i=0; i < 1; ++i)
+//      dbgs() << Model.eval(output_cols[Ctx.int_val(i)]).to_string() << " ";
+//    dbgs() << "\n";
+//    dbgs() << "rptr: ";
+//    for (int i=0; i < 2; ++i)
+//      dbgs() << Model.eval(output_rptr[Ctx.int_val(i)]).to_string() << " ";
+//
+//    dbgs() << "\n";
+//    for (int i=0; i < Model.eval(m).as_int64(); ++i)
+//      dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
+//
+//  } else {
+//    dbgs() << Result << "\n";
+//  }
 
   return PreservedAnalyses::all();
 }
