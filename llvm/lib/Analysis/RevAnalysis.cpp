@@ -430,7 +430,6 @@ public:
       return c.int_sort();
     case Type::TypeID::DoubleTyID:
       // TODO remove this debug
-      //      return c.int_sort();
       Mantissa = APFloat::semanticsPrecision(T->getFltSemantics());
       Exponent = APFloat::semanticsSizeInBits(T->getFltSemantics()) - Mantissa;
 //      return c.fpa_sort(Exponent, Mantissa);
@@ -719,7 +718,20 @@ private:
   std::vector<std::string> SavedNames;
 };
 
-func_decl MkGEMV(context &Ctx, expr &y, expr &x, expr &rptr, expr &col) {
+
+func_decl MkCSR(context &Ctx, expr &y, expr &rptr, expr &col) {
+  expr n = Ctx.int_const("n");
+  expr m = Ctx.int_const("m");
+  expr t = Ctx.int_const("t");
+  expr_vector Args(Ctx);
+  Args.push_back(n);
+  Args.push_back(m);
+  func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), y[Ctx.int_val(0)].get_sort());
+  Ctx.recdef(A, Args, ite(exists(t, rptr[n] <= t && t < rptr[n+1] && col[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
+  return A;
+}
+
+func_decl MkGEMV(context &Ctx, expr &y, expr &x, func_decl &A) {
   expr n = Ctx.int_const("n");
   expr m = Ctx.int_const("m");
   expr t = Ctx.int_const("t");
@@ -727,11 +739,9 @@ func_decl MkGEMV(context &Ctx, expr &y, expr &x, expr &rptr, expr &col) {
   Args.push_back(n);
   func_decl gemv = Ctx.recfun("gemv", Ctx.int_sort(), y.get_sort());
   func_decl dot = Ctx.recfun("dot", Ctx.int_sort(), Ctx.int_sort(), y[Ctx.int_val(0)].get_sort());
-  func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), y[Ctx.int_val(0)].get_sort());
   Ctx.recdef(gemv, Args, ite(n<0, y, store(gemv(n-1), n, dot(n, m-1))));
   Args.push_back(m);
   Ctx.recdef(dot, Args, ite(m < 0, Ctx.int_val(0), dot(n, m-1) + A(n, m) * x[m]));
-  Ctx.recdef(A, Args, ite(exists(t, rptr[n] <= t && t < rptr[n+1] && col[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
   return gemv;
 }
 
@@ -923,7 +933,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   Gemv.fromFunction(GemvMod->getFunction("gemv"));
 
   // now try to replace A with the expansion thing
-  func_decl Gemv2 = MkGEMV(Ctx, y, x, rptr, col);
+  func_decl CSR = MkCSR(Ctx, y, rptr, col);
+  func_decl GemvCSR = MkGEMV(Ctx, y, x, CSR);
 
   expr s = Ctx.int_const("s");
   expr t = Ctx.int_const("t");
@@ -942,7 +953,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   Slv.add(rptr[n] == nnz);
 
   std::vector<expr> SpmvArgs = {n, rptr, col, val, x, y};
-  Slv.add(Gemv2(n-1) != Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data()));
+  Slv.add(GemvCSR(n-1) != Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data()));
 
   dbgs() << Slv.to_smt2() << "\n\n";
 
@@ -956,7 +967,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     dbgs() << Model.to_string() << "\n";
     // print A, vals, rptr, col
     auto SpmvOutput = Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data());
-    auto GemvOutput = Gemv2(n-1);
+    auto GemvOutput = GemvCSR(n-1);
     for (int i=0; i < Model.eval(m).as_int64(); ++i)
       dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
 //    dbgs() << "vals: ";
