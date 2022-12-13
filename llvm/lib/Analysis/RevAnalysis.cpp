@@ -697,6 +697,8 @@ public:
     return BB2Func.getZ3Fun(V);
   }
 
+  DenseMap<Value *, std::vector<Value *>> Scopes;
+
 private:
   std::vector<Value*> makeScope(BasicBlock *BB, std::vector<Value*> Prefix) {
     for (auto &Inst : *BB) {
@@ -708,7 +710,6 @@ private:
     return Prefix;
   }
   context &Ctx;
-  DenseMap<Value *, std::vector<Value *>> Scopes;
   TerminalMap BB2Func;
   DominatorTree *DT;
   ConverterTy *Converter;
@@ -718,20 +719,50 @@ private:
   std::vector<std::string> SavedNames;
 };
 
+typedef std::vector<unsigned>::iterator IdxIter;
 
-func_decl MkCSR(context &Ctx, expr &y, expr &rptr, expr &col) {
+func_decl MkCSR(context &Ctx, expr_vector const &Ins, IdxIter Iter) {
+  expr val = Ins[*(Iter)];
+  expr rptr = Ins[*(Iter + 1)];
+  expr col = Ins[*(Iter + 2)];
   expr n = Ctx.int_const("n");
   expr m = Ctx.int_const("m");
   expr t = Ctx.int_const("t");
   expr_vector Args(Ctx);
   Args.push_back(n);
   Args.push_back(m);
-  func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), y[Ctx.int_val(0)].get_sort());
+  func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
   Ctx.recdef(A, Args, ite(exists(t, rptr[n] <= t && t < rptr[n+1] && col[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
   return A;
 }
 
-func_decl MkGEMV(context &Ctx, expr &y, expr &x, func_decl &A) {
+expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, IdxIter Iter, expr &m, expr &nnz) {
+  expr val = Ins[*(Iter)];
+  expr rptr = Ins[*(Iter + 1)];
+  expr col = Ins[*(Iter + 2)];
+  expr n = Ins[*(Iter + 3)];
+  expr s = Ctx.int_const("s");
+  expr t = Ctx.int_const("t");
+  expr_vector Props(Ctx);
+  Props.push_back(n > 0);
+  Props.push_back(m > 0);
+  // monotonicty
+  Props.push_back(forall(s, implies(0 <= s && s <= n, rptr[s] <= rptr[s+1] && rptr[s] >= 0)));
+  // pmonotonicity
+  Props.push_back(forall(s, implies(0 <= s && s < n, forall(t, implies(rptr[s] <= t && t < rptr[s+1], col[t] < col[t+1])))));
+  // extra constraints
+  Props.push_back(forall(s, implies(0 <= s && s < nnz, col[s] >= 0 && col[s] < m)));
+  Props.push_back(forall(s, implies(0 <= s && s < nnz, val[s] == 1 || val[s] == 0)));
+  Props.push_back(nnz > 0);
+  Props.push_back(nnz <= n * m);
+  Props.push_back(rptr[Ctx.int_val(0)] == 0);
+  Props.push_back(rptr[n] == nnz);
+  return Props;
+}
+
+func_decl MkGEMV(context &Ctx, func_decl &A, expr_vector const &Ins, IdxIter Iter) {
+  expr y = Ins[*(Iter)];
+  expr x = Ins[*(Iter + 1)];
   expr n = Ctx.int_const("n");
   expr m = Ctx.int_const("m");
   expr t = Ctx.int_const("t");
@@ -807,6 +838,23 @@ SSA2Func ParseInputFile(StringRef Path, StringRef FunctionName, LLVMContext &Con
   return File;
 }
 
+struct StorageRecord {
+  std::string Name;
+  unsigned Arity;
+  std::vector<z3::sort> Sig;
+  z3::sort Range;
+  std::function<func_decl(context &, expr_vector const &, IdxIter)> Maker;
+  std::function<expr_vector(context &, expr_vector const &, IdxIter, expr &, expr &)> IdxProperties;
+};
+
+struct KernelRecord {
+  std::string Name;
+  unsigned Arity;
+  std::vector<z3::sort> Sig;
+  z3::sort Range;
+  std::function<func_decl(context &, func_decl &, expr_vector const &, IdxIter)> Maker;
+};
+
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
   errs() << F.getName() << "\n";
@@ -821,25 +869,25 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
-  for (auto *LP : LI.getTopLevelLoops()) {
-    LLVM_DEBUG(dbgs() << " " << *LP << "\n");
-
-    if (!LegalityAnalysis(LP, &LI, &SE)) {
-      LLVM_DEBUG(dbgs() << "LLNA: "
-                        << "fail to pass legality check \n");
-      return PreservedAnalyses::all();
-    }
-
-    LoopNest LN(*LP, SE);
-    for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
-      Loop *SubLoop = LN.getLoopsAtDepth(Depth)[0];
-      if (!canSupportPhiInstrs(SubLoop, &LI, &DB, &AC, &DT, &SE)) {
-        LLVM_DEBUG(dbgs() << "LLNA: "
-                          << "fail to pass legality check \n");
-        return PreservedAnalyses::all();
-      }
-    }
-  }
+//  for (auto *LP : LI.getTopLevelLoops()) {
+//    LLVM_DEBUG(dbgs() << " " << *LP << "\n");
+//
+//    if (!LegalityAnalysis(LP, &LI, &SE)) {
+//      LLVM_DEBUG(dbgs() << "LLNA: "
+//                        << "fail to pass legality check \n");
+//      return PreservedAnalyses::all();
+//    }
+//
+//    LoopNest LN(*LP, SE);
+//    for (int Depth = LN.getNestDepth(); Depth > 0; --Depth) {
+//      Loop *SubLoop = LN.getLoopsAtDepth(Depth)[0];
+//      if (!canSupportPhiInstrs(SubLoop, &LI, &DB, &AC, &DT, &SE)) {
+//        LLVM_DEBUG(dbgs() << "LLNA: "
+//                          << "fail to pass legality check \n");
+//        return PreservedAnalyses::all();
+//      }
+//    }
+//  }
 
   // analysis here
   // live in/out: any scalars used outside the loop, or memory writes in the
@@ -862,13 +910,15 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   Translate.fromFunction(&F);
 
   solver Slv(Ctx);
+//  Slv.set("enable-assertions", false);
   Slv.set("smtlib2_log", "spmv_csr_test_log.smt2");
-  Value *N = F.getArg(0);
-  Value *Rptr = F.getArg(1);
-  Value *Col = F.getArg(2);
-  Value *Val = F.getArg(3);
-  Value *X = F.getArg(4);
-  Value *Y = F.getArg(5);
+  Slv.set("timeout", 100u);
+//  Value *N = F.getArg(0);
+//  Value *Rptr = F.getArg(1);
+//  Value *Col = F.getArg(2);
+//  Value *Val = F.getArg(3);
+//  Value *X = F.getArg(4);
+//  Value *Y = F.getArg(5);
 //
 //  expr zero = Ctx.int_val(0);
 //  expr one = Ctx.int_val(1);
@@ -877,14 +927,14 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 //
 //  expr n = Ctx.int_val(2);
 //  Slv.add(n == 2);
-  expr n = Converter.FromVal(N);
+//  expr n = Converter.FromVal(N);
   expr m = Ctx.int_const("m");
   expr nnz = Ctx.int_const("nnz");
-  expr rptr = Converter.FromVal(Rptr);
-  expr val = Converter.FromVal(Val);
-  expr col = Converter.FromVal(Col);
-  expr x = Converter.FromVal(X);
-  expr y = Converter.FromVal(Y);
+//  expr rptr = Converter.FromVal(Rptr);
+//  expr val = Converter.FromVal(Val);
+//  expr col = Converter.FromVal(Col);
+//  expr x = Converter.FromVal(X);
+//  expr y = Converter.FromVal(Y);
 //  Slv.add(val[zero] == 1);
 //  Slv.add(val[one] == 1);
 //
@@ -918,77 +968,154 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 //  }
 
   // now let's try to build gemv...
-  llvm::SMDiagnostic Err;
-  auto GemvMod = llvm::parseIRFile("gemv_opt.ll", Err, F.getContext());
-  assert(GemvMod && "couldn't parse kernel.");
+//  llvm::SMDiagnostic Err;
+//  auto GemvMod = llvm::parseIRFile("gemv_opt.ll", Err, F.getContext());
+//  assert(GemvMod && "couldn't parse kernel.");
+//
+//  DominatorTree GDT(*GemvMod->getFunction("gemv"));
+//  LiveOuts.clear();
+//  LoopInfo GemvLI(GDT);
+//  LoopNest GemvLN(*GemvLI.getTopLevelLoops()[0], SE);
+//  GetLiveOuts(&GemvLN.getOutermostLoop(), LiveOuts);
+//  assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
+//  LiveOut = (*LiveOuts.begin());
+//  SSA2Func Gemv(Ctx, &GDT, &Converter, LiveOut);
+//  Gemv.fromFunction(GemvMod->getFunction("gemv"));
 
-  DominatorTree GDT(*GemvMod->getFunction("gemv"));
-  LiveOuts.clear();
-  LoopInfo GemvLI(GDT);
-  LoopNest GemvLN(*GemvLI.getTopLevelLoops()[0], SE);
-  GetLiveOuts(&GemvLN.getOutermostLoop(), LiveOuts);
-  assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
-  LiveOut = (*LiveOuts.begin());
-  SSA2Func Gemv(Ctx, &GDT, &Converter, LiveOut);
-  Gemv.fromFunction(GemvMod->getFunction("gemv"));
+  // Goal: match array inputs to storage formats
+  // array inputs: some subset of Scopes[header]
+  // need to figure out which belong in the storage set or not
 
-  // now try to replace A with the expansion thing
-  func_decl CSR = MkCSR(Ctx, y, rptr, col);
-  func_decl GemvCSR = MkGEMV(Ctx, y, x, CSR);
+  auto IntVec = Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort());
+  sort_vector MatSorts(Ctx);
+  MatSorts.push_back(Ctx.int_sort());
+  MatSorts.push_back(Ctx.int_sort());
+  auto IntMat = Ctx.array_sort(MatSorts, Ctx.int_sort());
+  StorageRecord CSR = {
+      "CSR",
+      4,
+      {IntVec, IntVec, IntVec, Ctx.int_sort()},
+      IntMat,
+      MkCSR,
+      MkCSRIdxProperties};
+  KernelRecord Gemv = {"GEMV", 2, {IntVec, IntVec}, IntVec, MkGEMV}; // symbolic dense mat is implicit
 
-  expr s = Ctx.int_const("s");
-  expr t = Ctx.int_const("t");
-  Slv.add(m > 0);
-  Slv.add(n > 0);
-  // monotonicty
-  Slv.add(forall(s, implies(0 <= s && s <= n, rptr[s] <= rptr[s+1] && rptr[s] >= 0)));
-  // pmonotonicity
-  Slv.add(forall(s, implies(0 <= s && s < n, forall(t, implies(rptr[s] <= t && t < rptr[s+1], col[t] < col[t+1])))));
-  // extra constraints
-  Slv.add(forall(s, implies(0 <= s && s < nnz, col[s] >= 0 && col[s] < m)));
-  Slv.add(forall(s, implies(0 <= s && s < nnz, val[s] == 1 || val[s] == 0)));
-  Slv.add(nnz > 0);
-  Slv.add(nnz <= n * m);
-  Slv.add(rptr[Ctx.int_val(0)] == 0);
-  Slv.add(rptr[n] == nnz);
+  auto &FullScope = Translate.Scopes[&F.getEntryBlock()];
+  expr_vector Exprs(Ctx);
+  for (auto *V : FullScope)
+    Exprs.push_back(Converter.FromVal(V));
 
-  std::vector<expr> SpmvArgs = {n, rptr, col, val, x, y};
-  Slv.add(GemvCSR(n-1) != Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data()));
-
-  dbgs() << Slv.to_smt2() << "\n\n";
+  std::vector<unsigned> Idxs;
+  for (unsigned i = 0; i < Exprs.size(); ++i)
+    Idxs.push_back(i);
 
 
-  auto Result = Slv.check();
-  if (Result == z3::unsat) {
-    dbgs() << "no counterexample\n";
+  bool MappingFound = false;
+  do {
+    if (CSR.Arity + Gemv.Arity > Idxs.size())
+      break ; // skip to next kernel/format choices
 
-  } else if (Result == z3::sat) {
-    auto Model = Slv.get_model();
-    dbgs() << Model.to_string() << "\n";
-    // print A, vals, rptr, col
-    auto SpmvOutput = Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data());
-    auto GemvOutput = GemvCSR(n-1);
-    for (int i=0; i < Model.eval(m).as_int64(); ++i)
-      dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
-//    dbgs() << "vals: ";
-//    for (int i=0; i < 1; ++i)
-//      dbgs() << Model.eval(output_vals[Ctx.int_val(i)]).to_string() << " ";
+    bool Valid = true;
+    // skip invalid args
+    for (unsigned i=0; i < CSR.Arity; ++i)
+      if (!eq(Exprs[Idxs[i]].get_sort(), CSR.Sig[i])) {
+        Valid = false;
+        break;
+      }
+    for (unsigned i=0; i < Gemv.Arity && Valid; ++i)
+      if (!eq(Exprs[Idxs[i+CSR.Arity]].get_sort(), Gemv.Sig[i])) {
+        Valid = false;
+        break;
+      }
+    if (!Valid)
+      continue ;
+
+    LLVM_DEBUG({
+        for (unsigned i=0; i < CSR.Arity + Gemv.Arity; ++i)
+          dbgs() << Exprs[Idxs[i]].to_string() << " ";
+        dbgs() << "\t" << Z3_solver_get_num_scopes(Ctx, Slv) << " " << Slv.assertions().size() << "\n";
+    });
+
+    std::vector<unsigned>::iterator Idx = Idxs.begin();
+
+    // build storage format
+    func_decl Storage = CSR.Maker(Ctx, Exprs, Idx);
+
+    // build kernel
+    func_decl Kernel = Gemv.Maker(Ctx, Storage, Exprs, Idx + CSR.Arity);
+
+//    Slv.push();
+    // add index properties
+    Slv.add(CSR.IdxProperties(Ctx, Exprs, Idx, m, nnz));
+
+    Slv.add(Kernel(Exprs[Idxs[3]]-1) != Translate[&F.getEntryBlock()](Exprs));
+    auto Result = Slv.check();
+    if (Result == z3::unsat) {
+      LLVM_DEBUG(dbgs() << "mapping found\n");
+      MappingFound = true;
+      break; // mapping is in Idxs
+    }
+    // if sat or unknown, try the next one
+    Slv.reset();
+
+  } while (std::next_permutation(Idxs.begin(), Idxs.end()));
+
+  LLVM_DEBUG({
+    if (MappingFound) {
+      dbgs() << "Mapping: \n";
+      dbgs() << "Input program = " << Gemv.Name << "\n";
+      dbgs() << "Storage Format = " << CSR.Name << "\n";
+    } else {
+      dbgs() << "No Mapping Found.\n";
+    }
+  });
+
+//  // now try to replace A with the expansion thing
+//  func_decl CSR = MkCSR(Ctx, val, rptr, col);
+//  func_decl GemvCSR = MkGEMV(Ctx, CSR, y, x);
+//
+//  expr s = Ctx.int_const("s");
+//  expr t = Ctx.int_const("t");
+//  Slv.add(m > 0);
+//  Slv.add(n > 0);
+//  // monotonicty
+//  Slv.add(forall(s, implies(0 <= s && s <= n, rptr[s] <= rptr[s+1] && rptr[s] >= 0)));
+//  // pmonotonicity
+//  Slv.add(forall(s, implies(0 <= s && s < n, forall(t, implies(rptr[s] <= t && t < rptr[s+1], col[t] < col[t+1])))));
+//  // extra constraints
+//  Slv.add(forall(s, implies(0 <= s && s < nnz, col[s] >= 0 && col[s] < m)));
+//  Slv.add(forall(s, implies(0 <= s && s < nnz, val[s] == 1 || val[s] == 0)));
+//  Slv.add(nnz > 0);
+//  Slv.add(nnz <= n * m);
+//  Slv.add(rptr[Ctx.int_val(0)] == 0);
+//  Slv.add(rptr[n] == nnz);
+//
+//  std::vector<expr> SpmvArgs = {n, rptr, col, val, x, y};
+//  Slv.add(GemvCSR(n-1) != Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data()));
+//
+//  dbgs() << Slv.to_smt2() << "\n\n";
+//
+//
+//  auto Result = Slv.check();
+//  if (Result == z3::unsat) {
+//    dbgs() << "no counterexample\n";
+//
+//  } else if (Result == z3::sat) {
+//    auto Model = Slv.get_model();
+//    dbgs() << Model.to_string() << "\n";
+//    // print A, vals, rptr, col
+//    auto SpmvOutput = Translate[&F.getEntryBlock()](SpmvArgs.size(), SpmvArgs.data());
+//    auto GemvOutput = GemvCSR(n-1);
+//    for (int i=0; i < Model.eval(m).as_int64(); ++i)
+//      dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
+//
 //    dbgs() << "\n";
-//    dbgs() << "cols: ";
-//    for (int i=0; i < 1; ++i)
-//      dbgs() << Model.eval(output_cols[Ctx.int_val(i)]).to_string() << " ";
-//    dbgs() << "\n";
-//    dbgs() << "rptr: ";
-//    for (int i=0; i < 2; ++i)
-//      dbgs() << Model.eval(output_rptr[Ctx.int_val(i)]).to_string() << " ";
-
-    dbgs() << "\n";
-    for (int i=0; i < Model.eval(m).as_int64(); ++i)
-      dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
-
-  } else {
-    dbgs() << Result << "\n";
-  }
+//    for (int i=0; i < Model.eval(m).as_int64(); ++i)
+//      dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
+//
+//  } else {
+//    dbgs() << Result << "\n";
+//  }
 
 
 
