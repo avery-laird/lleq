@@ -721,7 +721,10 @@ private:
 
 typedef std::vector<unsigned>::iterator IdxIter;
 
-func_decl MkCSR(context &Ctx, expr_vector const &Ins, IdxIter Iter) {
+
+static unsigned Counter = 0;
+
+static func_decl MkCSR(context &Ctx, expr_vector const &Ins, IdxIter Iter) {
   expr val = Ins[*(Iter)];
   expr rptr = Ins[*(Iter + 1)];
   expr col = Ins[*(Iter + 2)];
@@ -731,12 +734,12 @@ func_decl MkCSR(context &Ctx, expr_vector const &Ins, IdxIter Iter) {
   expr_vector Args(Ctx);
   Args.push_back(n);
   Args.push_back(m);
-  func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
+  func_decl A = Ctx.recfun(("A" + std::to_string(Counter)).c_str(), Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
   Ctx.recdef(A, Args, ite(exists(t, rptr[n] <= t && t < rptr[n+1] && col[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
   return A;
 }
 
-expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, IdxIter Iter, expr &m, expr &nnz) {
+static expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, IdxIter Iter, expr &m, expr &nnz) {
   expr val = Ins[*(Iter)];
   expr rptr = Ins[*(Iter + 1)];
   expr col = Ins[*(Iter + 2)];
@@ -760,7 +763,7 @@ expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, IdxIter Ite
   return Props;
 }
 
-func_decl MkGEMV(context &Ctx, func_decl &A, expr_vector const &Ins, IdxIter Iter) {
+static func_decl MkGEMV(context &Ctx, func_decl &A, expr_vector const &Ins, IdxIter Iter) {
   expr y = Ins[*(Iter)];
   expr x = Ins[*(Iter + 1)];
   expr n = Ctx.int_const("n");
@@ -768,8 +771,8 @@ func_decl MkGEMV(context &Ctx, func_decl &A, expr_vector const &Ins, IdxIter Ite
   expr t = Ctx.int_const("t");
   expr_vector Args(Ctx);
   Args.push_back(n);
-  func_decl gemv = Ctx.recfun("gemv", Ctx.int_sort(), y.get_sort());
-  func_decl dot = Ctx.recfun("dot", Ctx.int_sort(), Ctx.int_sort(), y[Ctx.int_val(0)].get_sort());
+  func_decl gemv = Ctx.recfun(("gemv" + std::to_string(Counter)).c_str(), Ctx.int_sort(), y.get_sort());
+  func_decl dot = Ctx.recfun(("dot" + std::to_string(Counter)).c_str(), Ctx.int_sort(), Ctx.int_sort(), y[Ctx.int_val(0)].get_sort());
   Ctx.recdef(gemv, Args, ite(n<0, y, store(gemv(n-1), n, dot(n, m-1))));
   Args.push_back(m);
   Ctx.recdef(dot, Args, ite(m < 0, Ctx.int_val(0), dot(n, m-1) + A(n, m) * x[m]));
@@ -843,8 +846,10 @@ struct StorageRecord {
   unsigned Arity;
   std::vector<z3::sort> Sig;
   z3::sort Range;
-  std::function<func_decl(context &, expr_vector const &, IdxIter)> Maker;
-  std::function<expr_vector(context &, expr_vector const &, IdxIter, expr &, expr &)> IdxProperties;
+  func_decl (*Maker)(context &, expr_vector const &, IdxIter);
+  expr_vector (*IdxProperties)(context &, expr_vector const &, IdxIter, expr &, expr &);
+//  std::function<func_decl(context &, expr_vector const &, IdxIter)> Maker;
+//  std::function<expr_vector(context &, expr_vector const &, IdxIter, expr &, expr &)> IdxProperties;
 };
 
 struct KernelRecord {
@@ -852,7 +857,8 @@ struct KernelRecord {
   unsigned Arity;
   std::vector<z3::sort> Sig;
   z3::sort Range;
-  std::function<func_decl(context &, func_decl &, expr_vector const &, IdxIter)> Maker;
+  func_decl (*Maker)(context &, func_decl &, expr_vector const &, IdxIter);
+//  std::function<func_decl(context &, func_decl &, expr_vector const &, IdxIter)> Maker;
 };
 
 PreservedAnalyses RevAnalysisPass::run(Function &F,
@@ -910,7 +916,6 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   Translate.fromFunction(&F);
 
   solver Slv(Ctx);
-//  Slv.set("enable-assertions", false);
   Slv.set("smtlib2_log", "spmv_csr_test_log.smt2");
   Slv.set("timeout", 100u);
 //  Value *N = F.getArg(0);
@@ -1057,6 +1062,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     }
     // if sat or unknown, try the next one
     Slv.reset();
+//    Slv.pop();
+    Counter++;
 
   } while (std::next_permutation(Idxs.begin(), Idxs.end()));
 
