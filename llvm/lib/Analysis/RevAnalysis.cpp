@@ -721,9 +721,6 @@ private:
 
 typedef std::vector<unsigned>::iterator IdxIter;
 
-
-static unsigned Counter = 0;
-
 static func_decl MkCSR(context &Ctx, expr_vector const &Ins) {
   expr rptr = Ins[1];
   expr col = Ins[2];
@@ -734,7 +731,7 @@ static func_decl MkCSR(context &Ctx, expr_vector const &Ins) {
   expr_vector Args(Ctx);
   Args.push_back(n);
   Args.push_back(m);
-  func_decl A = Ctx.recfun(("A" + std::to_string(Counter)).c_str(), Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
+  func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
   Ctx.recdef(A, Args, ite(exists(t, rptr[n] <= t && t < rptr[n+1] && col[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
   return A;
 }
@@ -749,17 +746,18 @@ static expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, expr
   expr_vector Props(Ctx);
   Props.push_back(n > 0);
   Props.push_back(m > 0);
+  Props.push_back(nnz > 0);
   // monotonicty
   Props.push_back(forall(s, implies(0 <= s && s <= n, rptr[s] <= rptr[s+1] && rptr[s] >= 0)));
   // pmonotonicity
   Props.push_back(forall(s, implies(0 <= s && s < n, forall(t, implies(rptr[s] <= t && t < rptr[s+1], col[t] < col[t+1])))));
   // extra constraints
   Props.push_back(forall(s, implies(0 <= s && s < nnz, col[s] >= 0 && col[s] < m)));
-  Props.push_back(forall(s, implies(0 <= s && s < nnz, val[s] == 1 || val[s] == 0)));
-  Props.push_back(nnz > 0);
-  Props.push_back(nnz <= n * m);
+  Props.push_back(forall(s, implies(0 <= s && s < nnz, val[s] == 1)));
+
   Props.push_back(rptr[Ctx.int_val(0)] == 0);
   Props.push_back(rptr[n] == nnz);
+  Props.push_back(nnz <= n * m);
   return Props;
 }
 
@@ -771,8 +769,8 @@ static func_decl MkGEMV(context &Ctx, func_decl &A, expr_vector const &Ins) {
   expr t = Ctx.int_const("t");
   expr_vector Args(Ctx);
   Args.push_back(n);
-  func_decl gemv = Ctx.recfun(("gemv" + std::to_string(Counter)).c_str(), Ctx.int_sort(), y.get_sort());
-  func_decl dot = Ctx.recfun(("dot" + std::to_string(Counter)).c_str(), Ctx.int_sort(), Ctx.int_sort(), y[Ctx.int_val(0)].get_sort());
+  func_decl gemv = Ctx.recfun("gemv", Ctx.int_sort(), y.get_sort());
+  func_decl dot = Ctx.recfun("dot", Ctx.int_sort(), Ctx.int_sort(), y[Ctx.int_val(0)].get_sort());
   Ctx.recdef(gemv, Args, ite(n<0, y, store(gemv(n-1), n, dot(n, m-1))));
   Args.push_back(m);
   Ctx.recdef(dot, Args, ite(m < 0, Ctx.int_val(0), dot(n, m-1) + A(n, m) * x[m]));
@@ -1082,7 +1080,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   solver Slv(Ctx);
   Slv.set("smtlib2_log", "spmv_csr_test_log.smt2");
-  Slv.set("timeout", 1000u);
+//  Slv.set("timeout", 1000u);
 //  Value *N = F.getArg(0);
 //  Value *Rptr = F.getArg(1);
 //  Value *Col = F.getArg(2);
@@ -1307,7 +1305,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       SpMVArgs.push_back(Converter.FromVal(V));
 
     Slv.add(IdxProperties);
-    Slv.add(Gemv(CSRArgs[0]-1) != Translate[&F.getEntryBlock()](SpMVArgs));
+    Slv.add(Gemv(CSRArgs[0]) != Translate[&F.getEntryBlock()](SpMVArgs));
     auto Equiv = Slv.check();
     if (Equiv == z3::unsat) {
       LLVM_DEBUG({
@@ -1322,27 +1320,27 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       // print A, vals, rptr, col
       auto SpmvOutput = Translate[&F.getEntryBlock()](SpMVArgs);
       auto GemvOutput = Gemv(CSRArgs[0]-1);
-      dbgs() << "\n\n";
+      dbgs() << "\n\nrowPtr: ";
       for (int i=0; i < Model.eval(nnz).as_int64(); ++i)
         dbgs() << Model.eval(CSRArgs[1][Ctx.int_val(i)]).to_string() << " ";
-      dbgs() << "\n\n";
+      dbgs() << "\n\ncol: ";
       for (int i=0; i < Model.eval(m).as_int64(); ++i)
         dbgs() << Model.eval(CSRArgs[2][Ctx.int_val(i)]).to_string() << " ";
-      dbgs() << "\n\n";
+      dbgs() << "\n\nval: ";
       for (int i=0; i < Model.eval(nnz).as_int64(); ++i)
         dbgs() << Model.eval(CSRArgs[3][Ctx.int_val(i)]).to_string() << " ";
-      dbgs() << "\n\n";
+      dbgs() << "\n\nx: ";
       for (int i=0; i < Model.eval(m).as_int64(); ++i)
         dbgs() << Model.eval(GemvArgs[1][Ctx.int_val(i)]).to_string() << " ";
-      dbgs() << "\n\n";
+      dbgs() << "\n\ny: ";
       for (int i=0; i < Model.eval(m).as_int64(); ++i)
         dbgs() << Model.eval(GemvArgs[0][Ctx.int_val(i)]).to_string() << " ";
 
-      dbgs() << "\n\n\n";
+      dbgs() << "\n\n\nspmv: ";
       for (int i=0; i < Model.eval(CSRArgs[0]).as_int64(); ++i)
         dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
 
-      dbgs() << "\n";
+      dbgs() << "\ngemv: ";
       for (int i=0; i < Model.eval(CSRArgs[0]).as_int64(); ++i)
         dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
 
