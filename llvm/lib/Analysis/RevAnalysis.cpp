@@ -14,6 +14,7 @@
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/Support/raw_ostream.h"
 #include <chrono>
 #include <cvc5/cvc5.h>
@@ -1024,6 +1025,29 @@ public:
   }
 };
 
+//static Loop *PropsCodegen(expr_vector const &Props) {
+//  for (auto const &Prop : Props) {
+//    if (Prop.is_app()) {
+//      switch (Prop.decl().decl_kind()) {
+//      default:
+//      llvm_unreachable("unsupported op type.");
+//      case Z3_OP_LE:
+//
+//      }
+//    }
+//    else if (Prop.is_forall()) {
+//      if (Prop.body().is_implies()) {
+//        expr Implies = Prop.body();
+//        if (Implies.is_and()) {
+//          expr Left = Implies.arg(0);
+//          expr Right = Implies.arg(1);
+//
+//        }
+//      }
+//    }
+//  }
+//}
+
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
   errs() << F.getName() << "\n";
@@ -1314,6 +1338,34 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
           dbgs() << "Input program = GEMV\n";
           dbgs() << "Storage Format = CSR\n";
       });
+
+      // now actually modify the IR
+
+      // cmp1 = @call(my_special_function)
+      // br i8 cmp1 (exit block), (entry block)
+
+      BasicBlock *OldEntry = &F.getEntryBlock();
+      IRBuilder<> Builder(C);
+      BasicBlock *NewEntry = BasicBlock::Create(C, "rev.entry", &F, &F.getEntryBlock());
+      BasicBlock *NewExit = BasicBlock::Create(C, "rev.exit", &F);
+      Builder.SetInsertPoint(NewExit);
+      Builder.CreateRetVoid();
+
+      Builder.SetInsertPoint(NewEntry);
+
+      SmallVector<Type *> ArgTypes;
+      for (auto *V : Scope) ArgTypes.push_back(V->getType());
+
+      auto *FType = FunctionType::get(Type::getInt8Ty(C), ArgTypes, false);
+      auto FHandle = F.getParent()->getOrInsertFunction("SPMV_CSR_D", FType);
+      Value *CallResult = Builder.CreateCall(FHandle, Scope, "dsl.call");
+      Value *CmpResult = Builder.CreateICmpEQ(CallResult, ConstantInt::get(Type::getInt8Ty(C), 1), "rt.check");
+      Builder.CreateCondBr(CmpResult, NewExit, OldEntry);
+
+      dbgs() << *F.getParent();
+      // TODO only abandon the analyses we changed
+      return PreservedAnalyses::none();
+
     } else if (Equiv == z3::sat) {
       auto Model = Slv.get_model();
       dbgs() << Model.to_string() << "\n";
@@ -1347,6 +1399,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     } else {
       dbgs() << Equiv << "\n";
     }
+  } else if (Res == z3::unsat) {
+    dbgs() << "no parameter mapping found for CSR.\n";
+  } else {
+    dbgs() << "storage mapping result is unknown.\n";
   }
 
 //  auto IntVec = Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort());
