@@ -861,6 +861,171 @@ struct KernelRecord {
 //  std::function<func_decl(context &, func_decl &, expr_vector const &, IdxIter)> Maker;
 };
 
+
+class Properties {
+protected:
+  struct Prop {
+    std::string Name;
+    std::function<bool(Value *)> Check;
+    SmallPtrSetImpl<Value *> *Set = nullptr;
+  };
+  std::vector<SmallPtrSet<Value*, 5>> Sets;
+public:
+  std::vector<Prop> Props;
+
+  Properties(LoopNest &LN, ScalarEvolution &SE) {
+    Props = {
+        {
+            "readonly",
+            [](Value *V) {
+              if (V->getType()->getTypeID() != Type::TypeID::PointerTyID)
+                return false;
+              // V is never the ptr operand for any store
+              std::vector<Value *> Stack;
+              SmallPtrSet<Value *, 10> Visited;
+              DenseMap<Value *, Value *> ParentOf;
+              Stack.push_back(V);
+              while (!Stack.empty()) {
+                Value *E = Stack.back();
+                Visited.insert(E);
+                Stack.pop_back();
+                if (auto *Store = dyn_cast<StoreInst>(E))
+                  if (Store->getPointerOperand() == ParentOf[E])
+                    return false;
+                for (auto *U : E->users())
+                  if (!Visited.contains(U)) {
+                    Stack.push_back(U);
+                    ParentOf[U] = E;
+                  }
+              }
+              return true;
+            }
+        },
+        {
+            "int",
+            [](Value *V) {
+              return V->getType()->getTypeID() == Type::TypeID::IntegerTyID;
+            }
+        },
+        {
+            "array",
+            [](Value *V) {
+              return V->getType()->getTypeID() == Type::TypeID::PointerTyID;
+            }
+        },
+        {
+            "as_address",
+            [](Value *V) {
+              if (V->getType()->getTypeID() != Type::TypeID::PointerTyID)
+                return false;
+              // V is a GEP ptr operand
+              // -> used in a load
+              // -> used as a GEP index
+              std::vector<Value *> Stack;
+              SmallPtrSet<Value *, 10> Visited;
+              DenseMap<Value *, Value *> ParentOf;
+              Stack.push_back(V);
+              Value *GEPPtr = nullptr;
+              Value *LoadUser = nullptr;
+              Value *GEPIdx = nullptr;
+              while (!Stack.empty()) {
+                Value *E = Stack.back();
+                Visited.insert(E);
+                Stack.pop_back();
+                if (auto *GEP = dyn_cast<GEPOperator>(E)) {
+                  if (GEP->getPointerOperand() == V)
+                    GEPPtr = GEP;
+                  else if (GEPPtr && LoadUser && (*GEP->indices().begin() == ParentOf[E]))
+                    GEPIdx = GEP;
+                }
+                if (auto *Load = dyn_cast<LoadInst>(E))
+                  if (GEPPtr && Load->getPointerOperand() == GEPPtr)
+                    LoadUser = Load;
+                if (GEPPtr && LoadUser && GEPIdx)
+                  return true;
+                for (auto *U : E->users())
+                  if (!Visited.contains(U)) {
+                    Stack.push_back(U);
+                    ParentOf[U] = E;
+                  }
+              }
+              return false;
+            }
+        },
+        {
+            "direct_access",
+            [](Value *V) {
+              if (V->getType()->getTypeID() != Type::TypeID::PointerTyID)
+                return false;
+              // do GEPs have only 1 dimension?
+              for (auto *U : V->users()) {
+                if (auto *GEP = dyn_cast<GEPOperator>(U)) {
+                  // get the index
+                  if (GEP->getNumIndices() > 1)
+                    llvm_unreachable("GEPOperators with multiple indices are not supported.");
+                  auto &Idx = *GEP->indices().begin();
+                  Instruction *Inst = dyn_cast<Instruction>(&Idx);
+                  while (Inst != nullptr &&
+                        (isa<SExtInst>(Inst) ||
+                         isa<ZExtInst>(Inst) ||
+                         isa<BitCastInst>(Inst))) {
+                    Instruction* Tmp = dyn_cast<Instruction>(Inst->getOperand(0));
+                    if (Tmp == nullptr)
+                      break;
+                    Inst = Tmp;
+                  }
+                  if (getLoadStorePointerOperand(Inst))
+                    return false;
+                }
+              }
+              return true;
+            }
+        },
+        {
+            "loop_bounds",
+            [&](Value *V) {
+              if (V->getType()->getTypeID() != Type::TypeID::PointerTyID)
+                return false;
+              for (const Loop *L : LN.getLoops()) {
+                auto Bounds = L->getBounds(SE);
+                LoadInst *LowInstr = dyn_cast<LoadInst>(&Bounds->getInitialIVValue());
+                LoadInst *UpInstr = dyn_cast<LoadInst>(&Bounds->getFinalIVValue());
+                if (!LowInstr || !UpInstr)
+                  continue ;
+                Value *LowPtr = getLoadStorePointerOperand(LowInstr);
+                Value *UpPtr = getLoadStorePointerOperand(UpInstr);
+                auto *LowGEP = dyn_cast<GetElementPtrInst>(LowPtr);
+                auto *HighGEP = dyn_cast<GetElementPtrInst>(UpPtr);
+                if (!LowGEP || !HighGEP)
+                  continue ;
+                Value *LowPtrBase = LowGEP->getPointerOperand();
+                Value *HighPtrBase = HighGEP->getPointerOperand();
+                const SCEV *LowIndex = SE.getSCEV(LowGEP->getOperand(1));
+                const SCEV *HighIndex = SE.getSCEV(HighGEP->getOperand(1));
+                const SCEV *OffsetIndex = SE.getMinusSCEV(HighIndex, LowIndex);
+                if (LowPtrBase != HighPtrBase)
+                  continue ;
+                if (LowPtrBase == V)
+                  return true;
+              }
+              return false;
+            }
+        }
+    };
+  }
+
+  void buildSets(std::vector<Value*> &Vars) {
+    Sets.resize(Props.size());
+    for (unsigned i = 0; i < Props.size(); ++i) {
+      for (auto *V : Vars) {
+        if (Props[i].Check(V))
+          Sets[i].insert(V);
+      }
+      Props[i].Set = &Sets[i];
+    }
+  }
+};
+
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
   errs() << F.getName() << "\n";
@@ -917,7 +1082,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   solver Slv(Ctx);
   Slv.set("smtlib2_log", "spmv_csr_test_log.smt2");
-  Slv.set("timeout", 100u);
+  Slv.set("timeout", 1000u);
 //  Value *N = F.getArg(0);
 //  Value *Rptr = F.getArg(1);
 //  Value *Col = F.getArg(2);
@@ -991,6 +1156,130 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // array inputs: some subset of Scopes[header]
   // need to figure out which belong in the storage set or not
 
+  Properties Props(LN, SE);
+  auto &Scope = Translate.Scopes[&F.getEntryBlock()];
+  Props.buildSets(Scope);
+  LLVM_DEBUG({
+      for (auto &Prop : Props.Props) {
+        dbgs() << Prop.Name << ": ";
+        for (auto *V : *Prop.Set)
+          dbgs() << *V << " ";
+        dbgs() << "\n";
+      }
+  });
+
+  func_decl_vector AllRelations(Ctx);
+  for (unsigned i=0; i < Props.Props.size(); ++i)
+    AllRelations.push_back(Ctx.function(Props.Props[i].Name.c_str(), Ctx.int_sort(), Ctx.bool_sort()));
+
+  std::vector<std::string> AllNames;
+
+  // Now add the CSR vars
+  std::vector<unsigned> CSRVars;
+  std::vector<std::string> CSRNames = {"n", "rowPtr", "col", "val"};
+  unsigned CSR_CARE = 4;
+  for (unsigned i = 0; i < CSR_CARE; ++i) CSRVars.push_back(i);
+  DenseMap<StringRef, unsigned > CSRMap;
+  CSRMap[CSRNames[0].c_str()] = CSRVars[0];
+  CSRMap[CSRNames[1].c_str()] = CSRVars[1];
+  CSRMap[CSRNames[2].c_str()] = CSRVars[2];
+  CSRMap[CSRNames[3].c_str()] = CSRVars[3];
+  AllNames.resize(CSRVars.size());
+  AllNames[0] = CSRNames[0];
+  AllNames[1] = CSRNames[1];
+  AllNames[2] = CSRNames[2];
+  AllNames[3] = CSRNames[3];
+  std::vector<SmallSet<unsigned, 5>> CSRSets;
+  CSRSets.resize(Props.Props.size());
+  for (unsigned i=0; i < Props.Props.size(); ++i) {
+    auto &P = Props.Props[i];
+    if (P.Name == "readonly") {
+      CSRSets[i].insert(CSRMap["rowPtr"]);
+      CSRSets[i].insert(CSRMap["col"]);
+      CSRSets[i].insert(CSRMap["val"]);
+    } else if (P.Name == "int") {
+      CSRSets[i].insert(CSRMap["n"]);
+    } else if (P.Name == "array") {
+      CSRSets[i].insert(CSRMap["rowPtr"]);
+      CSRSets[i].insert(CSRMap["col"]);
+      CSRSets[i].insert(CSRMap["val"]);
+    } else if (P.Name == "as_address") {
+      CSRSets[i].insert(CSRMap["rowPtr"]);
+      CSRSets[i].insert(CSRMap["col"]);
+    } else if (P.Name == "direct_access") {
+      CSRSets[i].insert(CSRMap["rowPtr"]);
+      CSRSets[i].insert(CSRMap["col"]);
+      CSRSets[i].insert(CSRMap["val"]);
+    } else if (P.Name == "loop_bounds") {
+      CSRSets[i].insert(CSRMap["rowPtr"]);
+    }
+
+    expr_vector List(Ctx);
+    for (unsigned j = 0; j < CSRVars.size(); ++j)
+      List.push_back(
+          AllRelations[i](CSRVars[j]) == Ctx.bool_val(CSRSets[i].contains(CSRVars[j])));
+    for (auto const &E : List)
+      dbgs() << E.to_string() << ", ";
+    dbgs() << "\n";
+    Slv.add(List);
+  }
+
+  // make mapping for scope args
+  std::vector<unsigned> ScopeVars;
+
+  for (unsigned i = 0; i < Scope.size(); ++i) {
+    ScopeVars.push_back(i + CSRVars.size());
+    AllNames.push_back(Scope[i]->getNameOrAsOperand());
+  }
+
+  for (unsigned i=0; i < Props.Props.size(); ++i) {
+    expr_vector List(Ctx);
+    for (unsigned j = 0; j < Scope.size(); ++j)
+      List.push_back(
+          AllRelations[i](ScopeVars[j]) == Ctx.bool_val(Props.Props[i].Set->contains(Scope[j])));
+    for (auto const &E : List)
+      dbgs() << E.to_string() << ", ";
+    dbgs() << "\n";
+    Slv.add(List);
+  }
+
+  expr EQUAL = Ctx.constant("EQUAL", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+
+  // product of ScopeVars and CSRVars
+  expr_vector Pairs(Ctx);
+  std::vector<int> Weights;
+  for (auto A : CSRVars)
+    for (auto B : ScopeVars) {
+      expr_vector AllRels(Ctx);
+      for (auto const &Rel : AllRelations)
+        AllRels.push_back(implies(Rel(A), Rel(B)));
+      AllRels.push_back(EQUAL[Ctx.int_val(B)] == Ctx.int_val(A));
+      Pairs.push_back(mk_and(AllRels));
+      Weights.push_back(1);
+    }
+  for (auto const &E : Pairs)
+    dbgs() << E.to_string() << "\n";
+
+  Slv.add(pbeq(Pairs, Weights.data(), CSR_CARE));
+
+  expr s0 = Ctx.int_const("s0");
+  expr s1 = Ctx.int_const("s1");
+  int LB = ScopeVars.front();
+  int UB = ScopeVars.back();
+  Slv.add(forall(s0, s1, implies(LB <= s0 && s0 <= UB && LB <= s1 && s1 <= UB && EQUAL[s0] == EQUAL[s1], s0 == s1)));
+
+  auto Res = Slv.check();
+  if (Res == z3::sat) {
+    auto model = Slv.get_model();
+    dbgs() << model.to_string() << "\n";
+    for (unsigned i=0; i < CSR_CARE; ++i)
+      dbgs() << model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).to_string() << " ";
+    dbgs() << "\n";
+    for (unsigned i=0; i < CSR_CARE; ++i) {
+      dbgs() << AllNames[ScopeVars[i]] << " -> " << AllNames[model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).as_int64()] << "\n";
+    }
+  }
+
   auto IntVec = Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort());
   sort_vector MatSorts(Ctx);
   MatSorts.push_back(Ctx.int_sort());
@@ -1013,6 +1302,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   std::vector<unsigned> Idxs;
   for (unsigned i = 0; i < Exprs.size(); ++i)
     Idxs.push_back(i);
+
+
+  // find rptr, col, val, n
 
 
   bool MappingFound = false;
