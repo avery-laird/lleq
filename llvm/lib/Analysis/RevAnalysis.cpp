@@ -724,10 +724,10 @@ typedef std::vector<unsigned>::iterator IdxIter;
 
 static unsigned Counter = 0;
 
-static func_decl MkCSR(context &Ctx, expr_vector const &Ins, IdxIter Iter) {
-  expr val = Ins[*(Iter)];
-  expr rptr = Ins[*(Iter + 1)];
-  expr col = Ins[*(Iter + 2)];
+static func_decl MkCSR(context &Ctx, expr_vector const &Ins) {
+  expr rptr = Ins[1];
+  expr col = Ins[2];
+  expr val = Ins[3];
   expr n = Ctx.int_const("n");
   expr m = Ctx.int_const("m");
   expr t = Ctx.int_const("t");
@@ -739,11 +739,11 @@ static func_decl MkCSR(context &Ctx, expr_vector const &Ins, IdxIter Iter) {
   return A;
 }
 
-static expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, IdxIter Iter, expr &m, expr &nnz) {
-  expr val = Ins[*(Iter)];
-  expr rptr = Ins[*(Iter + 1)];
-  expr col = Ins[*(Iter + 2)];
-  expr n = Ins[*(Iter + 3)];
+static expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, expr &m, expr &nnz) {
+  expr n = Ins[0];
+  expr rptr = Ins[1];
+  expr col = Ins[2];
+  expr val = Ins[3];
   expr s = Ctx.int_const("s");
   expr t = Ctx.int_const("t");
   expr_vector Props(Ctx);
@@ -763,9 +763,9 @@ static expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, IdxI
   return Props;
 }
 
-static func_decl MkGEMV(context &Ctx, func_decl &A, expr_vector const &Ins, IdxIter Iter) {
-  expr y = Ins[*(Iter)];
-  expr x = Ins[*(Iter + 1)];
+static func_decl MkGEMV(context &Ctx, func_decl &A, expr_vector const &Ins) {
+  expr y = Ins[0];
+  expr x = Ins[1];
   expr n = Ctx.int_const("n");
   expr m = Ctx.int_const("m");
   expr t = Ctx.int_const("t");
@@ -1278,96 +1278,167 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     for (unsigned i=0; i < CSR_CARE; ++i) {
       dbgs() << AllNames[ScopeVars[i]] << " -> " << AllNames[model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).as_int64()] << "\n";
     }
+
+    Slv.reset();
+
+    // make CSR
+    expr_vector CSRArgs(Ctx);
+    for (unsigned i =0; i < CSR_CARE; ++i)
+      CSRArgs.push_back(Converter.FromVal(Scope[model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).as_int64()]));
+
+    func_decl CSR = MkCSR(Ctx, CSRArgs);
+    expr_vector IdxProperties = MkCSRIdxProperties(Ctx, CSRArgs, m, nnz);
+
+    SmallPtrSet<Value *, 10> ScopeSet;
+    for (auto *V : Scope) ScopeSet.insert(V);
+    for (unsigned i = 0; i < CSR_CARE; ++i) ScopeSet.erase(Scope[model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).as_int64()]);
+    Value *Y = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LiveOut))->getPointerOperand();
+    ScopeSet.erase(Y);
+    if (ScopeSet.size() != 1)
+      llvm_unreachable("Not all args were mapped to a storage format.");
+    expr_vector GemvArgs(Ctx);
+    GemvArgs.push_back(Converter.FromVal(Y)); // y
+    GemvArgs.push_back(Converter.FromVal(*ScopeSet.begin())); // x
+
+    func_decl Gemv = MkGEMV(Ctx, CSR, GemvArgs);
+
+    expr_vector SpMVArgs(Ctx);
+    for (auto *V : Scope)
+      SpMVArgs.push_back(Converter.FromVal(V));
+
+    Slv.add(IdxProperties);
+    Slv.add(Gemv(CSRArgs[0]-1) != Translate[&F.getEntryBlock()](SpMVArgs));
+    auto Equiv = Slv.check();
+    if (Equiv == z3::unsat) {
+      LLVM_DEBUG({
+          dbgs() << "mapping found\n";
+          dbgs() << "Mapping: \n";
+          dbgs() << "Input program = GEMV\n";
+          dbgs() << "Storage Format = CSR\n";
+      });
+    } else if (Equiv == z3::sat) {
+      auto Model = Slv.get_model();
+      dbgs() << Model.to_string() << "\n";
+      // print A, vals, rptr, col
+      auto SpmvOutput = Translate[&F.getEntryBlock()](SpMVArgs);
+      auto GemvOutput = Gemv(CSRArgs[0]-1);
+      dbgs() << "\n\n";
+      for (int i=0; i < Model.eval(nnz).as_int64(); ++i)
+        dbgs() << Model.eval(CSRArgs[1][Ctx.int_val(i)]).to_string() << " ";
+      dbgs() << "\n\n";
+      for (int i=0; i < Model.eval(m).as_int64(); ++i)
+        dbgs() << Model.eval(CSRArgs[2][Ctx.int_val(i)]).to_string() << " ";
+      dbgs() << "\n\n";
+      for (int i=0; i < Model.eval(nnz).as_int64(); ++i)
+        dbgs() << Model.eval(CSRArgs[3][Ctx.int_val(i)]).to_string() << " ";
+      dbgs() << "\n\n";
+      for (int i=0; i < Model.eval(m).as_int64(); ++i)
+        dbgs() << Model.eval(GemvArgs[1][Ctx.int_val(i)]).to_string() << " ";
+      dbgs() << "\n\n";
+      for (int i=0; i < Model.eval(m).as_int64(); ++i)
+        dbgs() << Model.eval(GemvArgs[0][Ctx.int_val(i)]).to_string() << " ";
+
+      dbgs() << "\n\n\n";
+      for (int i=0; i < Model.eval(CSRArgs[0]).as_int64(); ++i)
+        dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
+
+      dbgs() << "\n";
+      for (int i=0; i < Model.eval(CSRArgs[0]).as_int64(); ++i)
+        dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
+
+    } else {
+      dbgs() << Equiv << "\n";
+    }
   }
 
-  auto IntVec = Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort());
-  sort_vector MatSorts(Ctx);
-  MatSorts.push_back(Ctx.int_sort());
-  MatSorts.push_back(Ctx.int_sort());
-  auto IntMat = Ctx.array_sort(MatSorts, Ctx.int_sort());
-  StorageRecord CSR = {
-      "CSR",
-      4,
-      {IntVec, IntVec, IntVec, Ctx.int_sort()},
-      IntMat,
-      MkCSR,
-      MkCSRIdxProperties};
-  KernelRecord Gemv = {"GEMV", 2, {IntVec, IntVec}, IntVec, MkGEMV}; // symbolic dense mat is implicit
-
-  auto &FullScope = Translate.Scopes[&F.getEntryBlock()];
-  expr_vector Exprs(Ctx);
-  for (auto *V : FullScope)
-    Exprs.push_back(Converter.FromVal(V));
-
-  std::vector<unsigned> Idxs;
-  for (unsigned i = 0; i < Exprs.size(); ++i)
-    Idxs.push_back(i);
-
-
-  // find rptr, col, val, n
-
-
-  bool MappingFound = false;
-  do {
-    if (CSR.Arity + Gemv.Arity > Idxs.size())
-      break ; // skip to next kernel/format choices
-
-    bool Valid = true;
-    // skip invalid args
-    for (unsigned i=0; i < CSR.Arity; ++i)
-      if (!eq(Exprs[Idxs[i]].get_sort(), CSR.Sig[i])) {
-        Valid = false;
-        break;
-      }
-    for (unsigned i=0; i < Gemv.Arity && Valid; ++i)
-      if (!eq(Exprs[Idxs[i+CSR.Arity]].get_sort(), Gemv.Sig[i])) {
-        Valid = false;
-        break;
-      }
-    if (!Valid)
-      continue ;
-
-    LLVM_DEBUG({
-        for (unsigned i=0; i < CSR.Arity + Gemv.Arity; ++i)
-          dbgs() << Exprs[Idxs[i]].to_string() << " ";
-        dbgs() << "\t" << Z3_solver_get_num_scopes(Ctx, Slv) << " " << Slv.assertions().size() << "\n";
-    });
-
-    std::vector<unsigned>::iterator Idx = Idxs.begin();
-
-    // build storage format
-    func_decl Storage = CSR.Maker(Ctx, Exprs, Idx);
-
-    // build kernel
-    func_decl Kernel = Gemv.Maker(Ctx, Storage, Exprs, Idx + CSR.Arity);
-
-//    Slv.push();
-    // add index properties
-    Slv.add(CSR.IdxProperties(Ctx, Exprs, Idx, m, nnz));
-
-    Slv.add(Kernel(Exprs[Idxs[3]]-1) != Translate[&F.getEntryBlock()](Exprs));
-    auto Result = Slv.check();
-    if (Result == z3::unsat) {
-      LLVM_DEBUG(dbgs() << "mapping found\n");
-      MappingFound = true;
-      break; // mapping is in Idxs
-    }
-    // if sat or unknown, try the next one
-    Slv.reset();
-//    Slv.pop();
-    Counter++;
-
-  } while (std::next_permutation(Idxs.begin(), Idxs.end()));
-
-  LLVM_DEBUG({
-    if (MappingFound) {
-      dbgs() << "Mapping: \n";
-      dbgs() << "Input program = " << Gemv.Name << "\n";
-      dbgs() << "Storage Format = " << CSR.Name << "\n";
-    } else {
-      dbgs() << "No Mapping Found.\n";
-    }
-  });
+//  auto IntVec = Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort());
+//  sort_vector MatSorts(Ctx);
+//  MatSorts.push_back(Ctx.int_sort());
+//  MatSorts.push_back(Ctx.int_sort());
+//  auto IntMat = Ctx.array_sort(MatSorts, Ctx.int_sort());
+//  StorageRecord CSR = {
+//      "CSR",
+//      4,
+//      {IntVec, IntVec, IntVec, Ctx.int_sort()},
+//      IntMat,
+//      MkCSR,
+//      MkCSRIdxProperties};
+//  KernelRecord Gemv = {"GEMV", 2, {IntVec, IntVec}, IntVec, MkGEMV}; // symbolic dense mat is implicit
+//
+//  auto &FullScope = Translate.Scopes[&F.getEntryBlock()];
+//  expr_vector Exprs(Ctx);
+//  for (auto *V : FullScope)
+//    Exprs.push_back(Converter.FromVal(V));
+//
+//  std::vector<unsigned> Idxs;
+//  for (unsigned i = 0; i < Exprs.size(); ++i)
+//    Idxs.push_back(i);
+//
+//
+//  // find rptr, col, val, n
+//
+//
+//  bool MappingFound = false;
+//  do {
+//    if (CSR.Arity + Gemv.Arity > Idxs.size())
+//      break ; // skip to next kernel/format choices
+//
+//    bool Valid = true;
+//    // skip invalid args
+//    for (unsigned i=0; i < CSR.Arity; ++i)
+//      if (!eq(Exprs[Idxs[i]].get_sort(), CSR.Sig[i])) {
+//        Valid = false;
+//        break;
+//      }
+//    for (unsigned i=0; i < Gemv.Arity && Valid; ++i)
+//      if (!eq(Exprs[Idxs[i+CSR.Arity]].get_sort(), Gemv.Sig[i])) {
+//        Valid = false;
+//        break;
+//      }
+//    if (!Valid)
+//      continue ;
+//
+//    LLVM_DEBUG({
+//        for (unsigned i=0; i < CSR.Arity + Gemv.Arity; ++i)
+//          dbgs() << Exprs[Idxs[i]].to_string() << " ";
+//        dbgs() << "\t" << Z3_solver_get_num_scopes(Ctx, Slv) << " " << Slv.assertions().size() << "\n";
+//    });
+//
+//    std::vector<unsigned>::iterator Idx = Idxs.begin();
+//
+//    // build storage format
+//    func_decl Storage = CSR.Maker(Ctx, Exprs, Idx);
+//
+//    // build kernel
+//    func_decl Kernel = Gemv.Maker(Ctx, Storage, Exprs, Idx + CSR.Arity);
+//
+////    Slv.push();
+//    // add index properties
+//    Slv.add(CSR.IdxProperties(Ctx, Exprs, Idx, m, nnz));
+//
+//    Slv.add(Kernel(Exprs[Idxs[3]]-1) != Translate[&F.getEntryBlock()](Exprs));
+//    auto Result = Slv.check();
+//    if (Result == z3::unsat) {
+//      LLVM_DEBUG(dbgs() << "mapping found\n");
+//      MappingFound = true;
+//      break; // mapping is in Idxs
+//    }
+//    // if sat or unknown, try the next one
+//    Slv.reset();
+////    Slv.pop();
+//    Counter++;
+//
+//  } while (std::next_permutation(Idxs.begin(), Idxs.end()));
+//
+//  LLVM_DEBUG({
+//    if (MappingFound) {
+//      dbgs() << "Mapping: \n";
+//      dbgs() << "Input program = " << Gemv.Name << "\n";
+//      dbgs() << "Storage Format = " << CSR.Name << "\n";
+//    } else {
+//      dbgs() << "No Mapping Found.\n";
+//    }
+//  });
 
 //  // now try to replace A with the expansion thing
 //  func_decl CSR = MkCSR(Ctx, val, rptr, col);
