@@ -12,3 +12,5 @@ void spMV_Mul_csr(int n, int* rowPtr, int* col, double* val, double *x, double *
   }
 }
 
+int main() {}
+

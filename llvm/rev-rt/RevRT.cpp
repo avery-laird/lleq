@@ -41,7 +41,7 @@ extern "C" {
       mkl_sparse_d_create_csr(&A, SPARSE_INDEX_BASE_ZERO, rowPtr[n]/n, n, rowPtr, rowPtr,
                               col, val);
       matrix_descr MD = {SPARSE_MATRIX_TYPE_GENERAL};
-      mkl_sparse_d_mv(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, *A, MD, x, 1.0, y);
+      mkl_sparse_d_mv(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, A, MD, x, 1.0, y);
       return true;
     } else if (BACKEND == TACO) {
       // unimplemented

@@ -22,6 +22,7 @@
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/Analysis/Delinearization.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/Passes/PassPlugin.h"
 
 #define DEBUG_TYPE "rev-analysis"
 
@@ -467,6 +468,8 @@ protected:
   expr FromConst(Constant *V) override {
     APSInt Result;
     bool isExact;
+    if (isa<UndefValue>(V))
+      return c.int_val(0);
 
     switch (V->getType()->getTypeID()) {
     case Type::TypeID::IntegerTyID:
@@ -503,9 +506,18 @@ protected:
     auto Right = FromVal(BinOp->getOperand(1));
     switch (BinOp->getOpcode()) {
     case BinaryOperator::BinaryOps::Add:
+    case BinaryOperator::BinaryOps::FAdd:
       return Left + Right;
     case BinaryOperator::BinaryOps::Mul:
+    case BinaryOperator::BinaryOps::FMul:
       return Left * Right;
+    case BinaryOperator::BinaryOps::Sub:
+    case BinaryOperator::BinaryOps::FSub:
+      return Left - Right;
+    case BinaryOperator::BinaryOps::And:
+      return bv2int(int2bv(64, Left) & int2bv(64, Right), true);
+    case BinaryOperator::BinaryOps::Xor:
+      return bv2int(int2bv(64, Left) ^ int2bv(64, Right), true);
     default:
       llvm_unreachable("unsupported binop type.");
     }
@@ -1050,7 +1062,11 @@ public:
 
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
-  errs() << F.getName() << "\n";
+  LLVM_DEBUG(dbgs() << F.getName() << "\n");
+
+  // TODO replace with better legality analysis
+  if (F.getName() != "spMV_Mul_csr")
+    return PreservedAnalyses::all();
 
   auto start = high_resolution_clock::now();
 
@@ -1085,6 +1101,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // analysis here
   // live in/out: any scalars used outside the loop, or memory writes in the
   // loop
+
+  if (LI.getTopLevelLoops().size() == 0)
+    return PreservedAnalyses::all();
 
   LoopNest LN(*LI.getTopLevelLoops()[0], SE);
 
@@ -1240,9 +1259,13 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     for (unsigned j = 0; j < CSRVars.size(); ++j)
       List.push_back(
           AllRelations[i](CSRVars[j]) == Ctx.bool_val(CSRSets[i].contains(CSRVars[j])));
-    for (auto const &E : List)
-      dbgs() << E.to_string() << ", ";
-    dbgs() << "\n";
+
+    LLVM_DEBUG({
+      for (auto const &E : List)
+        dbgs() << E.to_string() << ", ";
+      dbgs() << "\n";
+    });
+
     Slv.add(List);
   }
 
@@ -1259,9 +1282,11 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     for (unsigned j = 0; j < Scope.size(); ++j)
       List.push_back(
           AllRelations[i](ScopeVars[j]) == Ctx.bool_val(Props.Props[i].Set->contains(Scope[j])));
-    for (auto const &E : List)
-      dbgs() << E.to_string() << ", ";
-    dbgs() << "\n";
+    LLVM_DEBUG({
+      for (auto const &E : List)
+        dbgs() << E.to_string() << ", ";
+      dbgs() << "\n";
+    });
     Slv.add(List);
   }
 
@@ -1279,8 +1304,11 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       Pairs.push_back(mk_and(AllRels));
       Weights.push_back(1);
     }
-  for (auto const &E : Pairs)
-    dbgs() << E.to_string() << "\n";
+  LLVM_DEBUG({
+    for (auto const &E : Pairs)
+      dbgs() << E.to_string() << "\n";
+  });
+
 
   Slv.add(pbeq(Pairs, Weights.data(), CSR_CARE));
 
@@ -1293,13 +1321,15 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   auto Res = Slv.check();
   if (Res == z3::sat) {
     auto model = Slv.get_model();
-    dbgs() << model.to_string() << "\n";
-    for (unsigned i=0; i < CSR_CARE; ++i)
-      dbgs() << model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).to_string() << " ";
-    dbgs() << "\n";
-    for (unsigned i=0; i < CSR_CARE; ++i) {
-      dbgs() << AllNames[ScopeVars[i]] << " -> " << AllNames[model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).as_int64()] << "\n";
-    }
+    LLVM_DEBUG({
+      dbgs() << model.to_string() << "\n";
+      for (unsigned i=0; i < CSR_CARE; ++i)
+        dbgs() << model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).to_string() << " ";
+      dbgs() << "\n";
+      for (unsigned i=0; i < CSR_CARE; ++i) {
+        dbgs() << AllNames[ScopeVars[i]] << " -> " << AllNames[model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).as_int64()] << "\n";
+      }
+    });
 
     Slv.reset();
 
@@ -1362,7 +1392,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       Value *CmpResult = Builder.CreateICmpEQ(CallResult, ConstantInt::get(Type::getInt8Ty(C), 1), "rt.check");
       Builder.CreateCondBr(CmpResult, NewExit, OldEntry);
 
-      dbgs() << *F.getParent();
+      LLVM_DEBUG(dbgs() << *F.getParent());
       // TODO only abandon the analyses we changed
       return PreservedAnalyses::none();
 
@@ -1372,37 +1402,39 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       // print A, vals, rptr, col
       auto SpmvOutput = Translate[&F.getEntryBlock()](SpMVArgs);
       auto GemvOutput = Gemv(CSRArgs[0]-1);
-      dbgs() << "\n\nrowPtr: ";
-      for (int i=0; i < Model.eval(nnz).as_int64(); ++i)
-        dbgs() << Model.eval(CSRArgs[1][Ctx.int_val(i)]).to_string() << " ";
-      dbgs() << "\n\ncol: ";
-      for (int i=0; i < Model.eval(m).as_int64(); ++i)
-        dbgs() << Model.eval(CSRArgs[2][Ctx.int_val(i)]).to_string() << " ";
-      dbgs() << "\n\nval: ";
-      for (int i=0; i < Model.eval(nnz).as_int64(); ++i)
-        dbgs() << Model.eval(CSRArgs[3][Ctx.int_val(i)]).to_string() << " ";
-      dbgs() << "\n\nx: ";
-      for (int i=0; i < Model.eval(m).as_int64(); ++i)
-        dbgs() << Model.eval(GemvArgs[1][Ctx.int_val(i)]).to_string() << " ";
-      dbgs() << "\n\ny: ";
-      for (int i=0; i < Model.eval(m).as_int64(); ++i)
-        dbgs() << Model.eval(GemvArgs[0][Ctx.int_val(i)]).to_string() << " ";
+      LLVM_DEBUG({
+        dbgs() << "\n\nrowPtr: ";
+        for (int i=0; i < Model.eval(nnz).as_int64(); ++i)
+          dbgs() << Model.eval(CSRArgs[1][Ctx.int_val(i)]).to_string() << " ";
+        dbgs() << "\n\ncol: ";
+        for (int i=0; i < Model.eval(m).as_int64(); ++i)
+          dbgs() << Model.eval(CSRArgs[2][Ctx.int_val(i)]).to_string() << " ";
+        dbgs() << "\n\nval: ";
+        for (int i=0; i < Model.eval(nnz).as_int64(); ++i)
+          dbgs() << Model.eval(CSRArgs[3][Ctx.int_val(i)]).to_string() << " ";
+        dbgs() << "\n\nx: ";
+        for (int i=0; i < Model.eval(m).as_int64(); ++i)
+          dbgs() << Model.eval(GemvArgs[1][Ctx.int_val(i)]).to_string() << " ";
+        dbgs() << "\n\ny: ";
+        for (int i=0; i < Model.eval(m).as_int64(); ++i)
+          dbgs() << Model.eval(GemvArgs[0][Ctx.int_val(i)]).to_string() << " ";
 
-      dbgs() << "\n\n\nspmv: ";
-      for (int i=0; i < Model.eval(CSRArgs[0]).as_int64(); ++i)
-        dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
+        dbgs() << "\n\n\nspmv: ";
+        for (int i=0; i < Model.eval(CSRArgs[0]).as_int64(); ++i)
+          dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
 
-      dbgs() << "\ngemv: ";
-      for (int i=0; i < Model.eval(CSRArgs[0]).as_int64(); ++i)
-        dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
+        dbgs() << "\ngemv: ";
+        for (int i=0; i < Model.eval(CSRArgs[0]).as_int64(); ++i)
+          dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
+      });
 
     } else {
-      dbgs() << Equiv << "\n";
+      LLVM_DEBUG(dbgs() << Equiv << "\n");
     }
   } else if (Res == z3::unsat) {
-    dbgs() << "no parameter mapping found for CSR.\n";
+    LLVM_DEBUG(dbgs() << "no parameter mapping found for CSR.\n");
   } else {
-    dbgs() << "storage mapping result is unknown.\n";
+    LLVM_DEBUG(dbgs() << "storage mapping result is unknown.\n");
   }
 
 //  auto IntVec = Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort());
@@ -1644,3 +1676,6 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   return PreservedAnalyses::all();
 }
+
+// THE MAGIC COMMAND LINE TEXT:
+// LD_LIBRARY_PATH=/usr/local/lib ./clang -O3 -I/opt/intel/oneapi/mkl/latest/include -L/opt/intel/oneapi/mkl/latest/lib/intel64 -lmkl_intel_lp64 -lmkl_rt -lmkl_sequential -lmkl_core -lm -fopenmp ../../../scripts/spmv_csr.c ../../../rev-rt/RevRT.cpp -o spmv_mkl_test.ll

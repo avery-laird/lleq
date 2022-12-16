@@ -51,6 +51,7 @@
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/Transforms/Coroutines/CoroCleanup.h"
@@ -86,6 +87,10 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/NameAnonGlobals.h"
 #include "llvm/Transforms/Utils/SymbolRewriter.h"
+#include "llvm/Transforms/Scalar/LoopRotation.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Analysis/RevAnalysis.h"
+#include "llvm/Transforms/Utils/Mem2Reg.h"
 #include <memory>
 using namespace clang;
 using namespace llvm;
@@ -825,6 +830,21 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
   ModulePassManager MPM;
+
+  PB.registerPipelineStartEPCallback(
+      [](ModulePassManager &MPM, OptimizationLevel Level) {
+//         add Rev pass
+        if (Level == OptimizationLevel::O3) {
+          MPM.addPass(createModuleToFunctionPassAdaptor(PromotePass()));
+          MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LoopRotatePass())));
+          MPM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+          MPM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
+          MPM.addPass(createModuleToFunctionPassAdaptor(LoopSimplifyPass()));
+          MPM.addPass(createModuleToFunctionPassAdaptor(LCSSAPass()));
+          MPM.addPass(createModuleToFunctionPassAdaptor(RevAnalysisPass()));
+//          LLVM_DEBUG(llvm::dbgs() << "ADDED REV\n");
+        }
+      });
 
   if (!CodeGenOpts.DisableLLVMPasses) {
     // Map our optimization levels into one of the distinct levels used to
