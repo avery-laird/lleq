@@ -466,7 +466,7 @@ protected:
   expr set(Value *V, const expr &Expr) override { return Map.setZ3(V, Expr); }
 
   expr FromConst(Constant *V) override {
-    APSInt Result;
+    APSInt Result(64); // 64 bits wide
     bool isExact;
     if (isa<UndefValue>(V))
       return c.int_val(0);
@@ -1359,7 +1359,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       SpMVArgs.push_back(Converter.FromVal(V));
 
     Slv.add(IdxProperties);
-    Slv.add(Gemv(CSRArgs[0]) != Translate[&F.getEntryBlock()](SpMVArgs));
+    Slv.add(Gemv(CSRArgs[0]-1) != Translate[&F.getEntryBlock()](SpMVArgs));
     auto Equiv = Slv.check();
     if (Equiv == z3::unsat) {
       LLVM_DEBUG({
@@ -1397,6 +1397,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       return PreservedAnalyses::none();
 
     } else if (Equiv == z3::sat) {
+      LLVM_DEBUG(dbgs() << "[REV] Kernel is not GEMV.\n");
       auto Model = Slv.get_model();
       dbgs() << Model.to_string() << "\n";
       // print A, vals, rptr, col
