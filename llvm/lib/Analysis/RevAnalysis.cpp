@@ -330,7 +330,7 @@ protected:
   SmallPtrSet<Value *, 5> BuildRecursive;
   bool LockRecursion = false;
 public:
-  MakeSMT(TerminalMap &Map, ScalarEvolution &SE) : SE(SE), Map(Map) {}
+  MakeSMT(TerminalMap &Map, ScalarEvolution &SE, const ExprTy &Heap) : SE(SE), Map(Map), Heap(Heap) {}
 
   ExprTy FromVal(Value *V) {
     // update the current loop
@@ -382,26 +382,34 @@ protected:
     ExprTy Offset;
   };
 
+  const ExprTy &Heap;
+
   virtual unsigned count(Value *V) = 0;
   virtual ExprTy get(Value *V) = 0;
   virtual ExprTy set(Value *V, const ExprTy &) = 0;
 
   virtual ExprTy FromConst(Constant *V) = 0;
+  virtual ExprTy FromGEP(GEPOperator *V) = 0;
   virtual ExprTy FromLoadStore(Value *V) = 0;
-  virtual GEPTy FromGEP(GEPOperator *V) = 0;
   virtual ExprTy FromCastInst(CastInst *V) = 0;
   virtual ExprTy FromPHIorArg(Value *V) = 0;
   virtual ExprTy FromBinOp(BinaryOperator *V) = 0;
   virtual ExprTy FromCmpInst(CmpInst *V) = 0;
   virtual ExprTy FromCallInst(CallInst *V) = 0;
+  virtual ExprTy FromPtr(PointerType *P) = 0;
 
   virtual SortTy ToSort(Value *V) = 0;
   virtual SortTy ToSort(Type *T) = 0;
 };
 
 class MakeZ3 : public MakeSMT<expr, z3::sort> {
+
+  expr MkHeap(context &c) {
+    return c.constant("heap", c.array_sort(c.bv_sort(64), c.bv_sort(64)));
+  }
+
 public:
-  MakeZ3(TerminalMap &Map, ScalarEvolution &SE, context &c) : MakeSMT(Map, SE), c(c) {}
+  MakeZ3(TerminalMap &Map, ScalarEvolution &SE, context &c) : MakeSMT(Map, SE, MkHeap(c)), c(c) {}
 
   z3::sort ToSort(Value *V) override {
     auto *T = V->getType();
@@ -412,6 +420,7 @@ public:
     case Type::TypeID::DoubleTyID:
       return ToSort(T);
     case Type::TypeID::PointerTyID:
+      // TODO Remove this when the new heap idea is implemented
       // try to find a use that we can infer the type from
       for (auto *Use : V->users()) {
         if ((isa<LoadInst>(Use) || isa<StoreInst>(Use)))
@@ -439,21 +448,17 @@ public:
     }
   }
 
-  GEPTy FromGEP(GEPOperator *GEP) override {
-    assert(GEP->getNumIndices() == 1);
-    // make the array if it doesn't exist
-    if (!count(GEP->getPointerOperand())) {
-      // TODO assume 1d memory accesses
-      z3::sort ArraySort = c.array_sort(
-          ToSort(GEP->getOperand(1)),
-          ToSort(GEP->getResultElementType()));
-      set(
-          GEP->getPointerOperand(),
-          c.constant(GEP->getPointerOperand()->getName().data(), ArraySort));
-    }
-    expr Base = get(GEP->getPointerOperand());
-    expr Offset = FromVal(GEP->getOperand(1));
-    return {Base, Offset};
+  expr FromLoadStore(Value *V) override {
+    expr Offset = FromVal(getLoadStorePointerOperand(V)); // offset
+    // if store, y[i] = ...  (store)
+    // if load %0 = y[i]     (select)
+    expr Expr(c);
+    if (auto *Store = dyn_cast<StoreInst>(V))
+      return store(
+          Heap,
+          Offset,
+          FromVal(Store->getValueOperand()));
+    return Heap[Offset];
   }
 
 protected:
@@ -484,20 +489,6 @@ protected:
     }
   }
 
-  expr FromLoadStore(Value *V) override {
-    auto *GEP = dyn_cast<GEPOperator>(getLoadStorePointerOperand(V));
-    // eg. y[i]
-    GEPTy ArrayAddr = FromGEP(GEP); // (tuple base offset)
-    // if store, y[i] = ...  (store)
-    // if load %0 = y[i]     (select)
-    expr Expr(c);
-    if (auto *Store = dyn_cast<StoreInst>(V))
-      return store(
-          ArrayAddr.Base,
-          ArrayAddr.Offset,
-          FromVal(Store->getValueOperand()));
-    return ArrayAddr.Base[ArrayAddr.Offset];
-  }
 
   expr FromCastInst(CastInst *C) override { return FromVal(C->getOperand(0)); }
 
@@ -541,6 +532,34 @@ protected:
     }
   }
 
+  expr FromGEP(GEPOperator *GEP) override {
+//    assert(GEP->getNumIndices() == 1);
+//    // make the array if it doesn't exist
+//    if (!count(GEP->getPointerOperand())) {
+//      // TODO assume 1d memory accesses
+//      z3::sort ArraySort = c.array_sort(
+//          ToSort(GEP->getOperand(1)),
+//          ToSort(GEP->getResultElementType()));
+//      set(
+//          GEP->getPointerOperand(),
+//          c.constant(GEP->getPointerOperand()->getName().data(), ArraySort));
+//    }
+//    expr Base = get(GEP->getPointerOperand());
+//    expr Offset = FromVal(GEP->getOperand(1));
+//    return {Base, Offset};
+      assert(GEP->getNumIndices() == 1 && "only linear types supported.");
+      expr Ptr = FromVal(GEP->getPointerOperand());
+      expr_vector Indices(c);
+      for (auto &Idx : GEP->indices())
+        Indices.push_back(FromVal(Idx));
+      return Ptr + Indices[0];
+  }
+
+  expr FromPtr(PointerType *P) override {
+    // just a number
+    return c.int_const(dyn_cast<Value>(P)->getNameOrAsOperand().c_str());
+  }
+
   expr FromCallInst(CallInst *CI) override {
     auto *F = CI->getCalledFunction();
     if (F && F->getIntrinsicID() == Intrinsic::fmuladd) {
@@ -567,7 +586,7 @@ class SSA2Func {
 public:
 //  SSA2Func(context &Ctx) : Ctx(Ctx), BB2Func(Ctx), DT(nullptr), Converter(nullptr), Range(Ctx), Output(Ctx) {}
 
-  SSA2Func(context &Ctx, DominatorTree *DT, ConverterTy *Converter, Value *LiveOut) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Ctx), Output(Ctx), Projs(Ctx) {
+  SSA2Func(context &Ctx, DominatorTree *DT, ConverterTy *Converter, Value *LiveOut) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Ctx), Output(Ctx), Projs(Ctx), Heap(Ctx) {
     if (auto *GEP = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LiveOut))) {
       auto Tuple = Converter->FromGEP(GEP);
       Range = Tuple.Base.get_sort();
@@ -577,7 +596,7 @@ public:
     }
   }
 
-  SSA2Func(context &Ctx, DominatorTree *DT, ConverterTy *Converter, SmallPtrSetImpl<Value *> &LiveOut) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Ctx), Output(Ctx), Projs(Ctx) {
+  SSA2Func(context &Ctx, DominatorTree *DT, ConverterTy *Converter, SmallPtrSetImpl<Value *> &LiveOut) : Ctx(Ctx), BB2Func(Ctx), DT(DT), Converter(Converter), Range(Ctx), Output(Ctx), Projs(Ctx), Heap(Ctx) {
     // range is a tuple sort
     // output is the tuple itself
     std::vector<z3::sort> TupleSorts;
@@ -609,6 +628,8 @@ public:
   }
 
   func_decl fromFunction(Function *F) {
+    // TODO model more complicated types in the heap
+    Heap = Ctx.constant("heap", Ctx.array_sort(Ctx.bv_sort(64), Ctx.bv_sort(64)));
     BasicBlock *BB = &F->getEntryBlock();
     std::vector<Value *> FArgs;
     for (auto &Use : F->args()) FArgs.push_back(&Use);
@@ -677,7 +698,7 @@ public:
         for (auto &Inst : *BB) {
           if (auto *Store = dyn_cast<StoreInst>(&Inst)) {
             if (getPointerOperand(getLoadStorePointerOperand(Store)) == V) {
-              LocalScope.push_back(Converter->FromVal(Store));
+              LocalScope.push_back(Converter->FromLoadStore(Store));
               Found = true;
               break;
             }
@@ -730,6 +751,7 @@ private:
   expr Output;
   func_decl_vector Projs;
   std::vector<std::string> SavedNames;
+  expr Heap;
 };
 
 typedef std::vector<unsigned>::iterator IdxIter;
