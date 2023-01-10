@@ -842,7 +842,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
           MPM.addPass(createModuleToFunctionPassAdaptor(LoopSimplifyPass()));
           MPM.addPass(createModuleToFunctionPassAdaptor(LCSSAPass()));
           MPM.addPass(createModuleToFunctionPassAdaptor(RevAnalysisPass()));
-//          LLVM_DEBUG(llvm::dbgs() << "ADDED REV\n");
+          dbgs() << "ADDED REV\n";
         }
       });
 

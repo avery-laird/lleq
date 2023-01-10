@@ -757,8 +757,8 @@ static expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, expr
   expr s = Ctx.int_const("s");
   expr t = Ctx.int_const("t");
   expr_vector Props(Ctx);
-  Props.push_back(n > 0);
-  Props.push_back(m > 0);
+//  Props.push_back(n > 0);
+//  Props.push_back(m > 0);
   Props.push_back(nnz > 0);
   // monotonicty
   Props.push_back(forall(s, implies(0 <= s && s <= n, rptr[s] <= rptr[s+1] && rptr[s] >= 0)));
@@ -1358,10 +1358,31 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     for (auto *V : Scope)
       SpMVArgs.push_back(Converter.FromVal(V));
 
+    // base cases
+    bool BaseCase = true;
+    std::vector<std::vector<unsigned>> Bases = {{1,1}, {1,2}, {2,1}, {2,2}};
+    for (auto &Base : Bases) {
+      Slv.reset();
+      Slv.add(IdxProperties);
+      Slv.add(CSRArgs[0] == Ctx.int_val(Base[0]));
+      Slv.add(m == Ctx.int_val(Base[1]));
+      Slv.add(Gemv(CSRArgs[0]-1) != Translate[&F.getEntryBlock()](SpMVArgs));
+      auto Res = Slv.check();
+      if (Res == z3::sat) {
+        BaseCase = false;
+        break;
+      }
+    }
+    // inductive step
+    Slv.reset();
     Slv.add(IdxProperties);
-    Slv.add(Gemv(CSRArgs[0]-1) != Translate[&F.getEntryBlock()](SpMVArgs));
-    auto Equiv = Slv.check();
-    if (Equiv == z3::unsat) {
+    Slv.add(CSRArgs[0] > 2);
+    Slv.add(m > 2);
+    Slv.add(forall(s0, implies(0 <= s0 && s0 < CSRArgs[0], Gemv(s0-1) == Translate[&F.getEntryBlock()](SpMVArgs))));
+
+
+    auto Equiv = z3::unsat;
+    if (BaseCase && Equiv == z3::unsat) {
       LLVM_DEBUG({
           dbgs() << "mapping found\n";
           dbgs() << "Mapping: \n";
@@ -1396,7 +1417,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       // TODO only abandon the analyses we changed
       return PreservedAnalyses::none();
 
-    } else if (Equiv == z3::sat) {
+    } else if (!BaseCase || Equiv == z3::sat) {
       LLVM_DEBUG(dbgs() << "[REV] Kernel is not GEMV.\n");
       auto Model = Slv.get_model();
       dbgs() << Model.to_string() << "\n";
