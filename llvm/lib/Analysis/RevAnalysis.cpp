@@ -779,14 +779,25 @@ static func_decl MkGEMV(context &Ctx, func_decl &A, expr_vector const &Ins) {
   expr x = Ins[1];
   expr n = Ctx.int_const("n");
   expr m = Ctx.int_const("m");
-  expr t = Ctx.int_const("t");
-  expr_vector Args(Ctx);
-  Args.push_back(n);
-  func_decl gemv = Ctx.recfun("gemv", Ctx.int_sort(), y.get_sort());
-  func_decl dot = Ctx.recfun("dot", Ctx.int_sort(), Ctx.int_sort(), y[Ctx.int_val(0)].get_sort());
-  Ctx.recdef(gemv, Args, ite(n<0, y, store(gemv(n-1), n, dot(n, m-1))));
-  Args.push_back(m);
-  Ctx.recdef(dot, Args, ite(m < 0, Ctx.int_val(0), dot(n, m-1) + A(n, m) * x[m]));
+  expr i = Ctx.int_const("i");
+  expr j = Ctx.int_const("j");
+  expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+
+  ArgsGemv.push_back(i); // lower bound
+  ArgsGemv.push_back(n);
+  ArgsGemv.push_back(j); // lower bound
+  ArgsGemv.push_back(m);
+
+  ArgsDot.push_back(n);
+  ArgsDot.push_back(j); // lower bound
+  ArgsDot.push_back(m);
+
+  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+  func_decl gemv = Ctx.recfun("gemv", GemvSorts.size(), GemvSorts.data(), y.get_sort());
+  std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+  func_decl dot = Ctx.recfun("dot", DotSorts.size(), DotSorts.data(), y[Ctx.int_val(0)].get_sort());
+  Ctx.recdef(gemv, ArgsGemv, ite(n < i, y, store(gemv(i, n-1, j, m), n, dot(n, j, m-1))));
+  Ctx.recdef(dot, ArgsDot, ite(m < j, Ctx.int_val(0), dot(n, j, m-1) + A(n, m) * x[m]));
   return gemv;
 }
 
@@ -1358,6 +1369,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     for (auto *V : Scope)
       SpMVArgs.push_back(Converter.FromVal(V));
 
+    std::vector<expr> GemvParams = {Ctx.int_val(0), CSRArgs[0]-1, Ctx.int_val(0), m};
+
     // base cases
     bool BaseCase = true;
     std::vector<std::vector<unsigned>> Bases = {{1,1}, {1,2}, {2,1}, {2,2}};
@@ -1366,7 +1379,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       Slv.add(IdxProperties);
       Slv.add(CSRArgs[0] == Ctx.int_val(Base[0]));
       Slv.add(m == Ctx.int_val(Base[1]));
-      Slv.add(Gemv(CSRArgs[0]-1) != Translate[&F.getEntryBlock()](SpMVArgs));
+      Slv.add(Gemv(GemvParams.size(), GemvParams.data()) != Translate[&F.getEntryBlock()](SpMVArgs));
       auto Res = Slv.check();
       if (Res == z3::sat) {
         BaseCase = false;
@@ -1378,7 +1391,11 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     Slv.add(IdxProperties);
     Slv.add(CSRArgs[0] > 2);
     Slv.add(m > 2);
-    Slv.add(forall(s0, implies(0 <= s0 && s0 < CSRArgs[0], Gemv(s0-1) == Translate[&F.getEntryBlock()](SpMVArgs))));
+//    Slv.add(forall(s0, implies(0 <= s0 && s0 < CSRArgs[0]-1, Gemv(s0-1) == Translate[&F.getEntryBlock()](SpMVArgs))));
+
+    std::vector<expr> GemvIndParams = {CSRArgs[0]-2, CSRArgs[0]-1, m-1, m};
+//    Slv.add(Gemv(GemvIndParams.size(), GemvIndParams.data()) != Translate[&F.getEntryBlock()](SpMVArgs)
+//            && Converter.FromVal());
 
 
     auto Equiv = z3::unsat;
