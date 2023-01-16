@@ -564,6 +564,7 @@ protected:
 
 class SSA2Func {
   using ConverterTy = MakeZ3;
+  using PhiMapTy = DenseMap<PHINode*, Value*>;
 public:
 //  SSA2Func(context &Ctx) : Ctx(Ctx), BB2Func(Ctx), DT(nullptr), Converter(nullptr), Range(Ctx), Output(Ctx) {}
 
@@ -619,12 +620,21 @@ public:
     return BB2Func.getZ3Fun(BB);
   }
 
+  func_decl straightlineFromFunction(Function *F, PhiMapTy *PM) {
+    PhiMap = PM;
+    func_decl Translate = fromFunction(F);
+    PhiMap = nullptr;
+    return Translate;
+  }
+
   void makeScopes(BasicBlock *BB) {
     auto &Scope = Scopes[BB];
     // make domain
     std::vector<z3::sort> Domain;
     for (auto *V : Scope) Domain.push_back(Converter->FromVal(V).get_sort());
-    BB2Func.setZ3Fun(BB, Ctx.recfun(BB->getNameOrAsOperand().c_str(), Domain.size(), Domain.data(), Range));
+    auto Name = BB->getNameOrAsOperand();
+    if (PhiMap != nullptr) Name += ".noloop";
+    BB2Func.setZ3Fun(BB, Ctx.recfun(Name.c_str(), Domain.size(), Domain.data(), Range));
     LLVM_DEBUG({
       dbgs() << BB->getNameOrAsOperand() << ": ";
       for (auto S : Domain)
@@ -665,7 +675,19 @@ public:
       expr_vector LocalScope(Ctx);
       for (auto *V : Scopes[Block]) {
         if (auto *Phi = dyn_cast<PHINode>(V)) {
-          if (Phi->getBasicBlockIndex(BB) > -1) {
+//          if (PhiMap != nullptr && PhiMap->count(Phi)) {
+//            // PhiMap is only not-null when we want straightline code
+//            expr Expr = Converter->FromVal(PhiMap->lookup(Phi));
+//            for (auto &Elems : *PhiMap) {
+//              expr_vector Src(Ctx), Dst(Ctx);
+//              Src.push_back(Converter->FromVal(Elems.getFirst()));
+//              Dst.push_back(Converter->FromVal(Elems.getSecond()));
+//              Expr = Expr.substitute(Src, Dst);
+//            }
+//            LocalScope.push_back(Expr);
+//            continue;
+//          }
+          if ((PhiMap == nullptr || (PhiMap != nullptr && !PhiMap->count(Phi))) && Phi->getBasicBlockIndex(BB) > -1) {
             LocalScope.push_back(
                 Converter->FromVal(Phi->getIncomingValueForBlock(BB)));
             continue;
@@ -694,6 +716,16 @@ public:
       Body = Calls[0];
     else
       Body = ite(Converter->FromVal(Br->getCondition()), Calls[1], Calls[0]);
+
+    if (PhiMap != nullptr)
+      for (int i =0; i < 2; ++i) {
+        for (auto &Elems : *PhiMap) {
+          expr_vector Src(Ctx), Dst(Ctx);
+          Src.push_back(Converter->FromVal(Elems.getFirst()));
+          Dst.push_back(Converter->FromVal(Elems.getSecond()));
+          Body = Body.substitute(Src, Dst);
+        }
+      }
 
     Ctx.recdef(BB2Func.getZ3Fun(BB), Scope, Body);
 
@@ -730,6 +762,7 @@ private:
   expr Output;
   func_decl_vector Projs;
   std::vector<std::string> SavedNames;
+  PhiMapTy *PhiMap = nullptr;
 };
 
 typedef std::vector<unsigned>::iterator IdxIter;
@@ -1342,6 +1375,11 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       }
     });
 
+    DenseMap<StringRef, Value* > Str2Val;
+    for (unsigned i=0; i < CSR_CARE; ++i)
+      Str2Val[AllNames[ScopeVars[i]]] = Scope[model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).as_int64()];
+
+
     Slv.reset();
 
     // make CSR
@@ -1391,14 +1429,57 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     Slv.add(IdxProperties);
     Slv.add(CSRArgs[0] > 2);
     Slv.add(m > 2);
-//    Slv.add(forall(s0, implies(0 <= s0 && s0 < CSRArgs[0]-1, Gemv(s0-1) == Translate[&F.getEntryBlock()](SpMVArgs))));
+    SpMVArgs[0] = s0; // TODO clean this up
+    Slv.add(forall(s0, implies(0 <= s0 && s0 < CSRArgs[0]-1, Gemv(GemvParams.size(), GemvParams.data()) == Translate[&F.getEntryBlock()](SpMVArgs))));
 
-    std::vector<expr> GemvIndParams = {CSRArgs[0]-2, CSRArgs[0]-1, m-1, m};
-//    Slv.add(Gemv(GemvIndParams.size(), GemvIndParams.data()) != Translate[&F.getEntryBlock()](SpMVArgs)
-//            && Converter.FromVal());
+    expr n = Converter.FromVal(Str2Val["n"]);
+    expr rptr = Converter.FromVal(Str2Val["rowPtr"]);
+    expr val = Converter.FromVal(Str2Val["val"]);
+
+    expr A = Ctx.constant("A", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+    std::unique_ptr<Module> CSRModule;
+    SSA2Func CSRIR = ParseInputFile("csr_opt.ll", "CSR", F.getContext(), SE, Ctx, Converter, CSRModule);
+    std::vector<expr> CsrArgs = {
+        Converter.FromVal(Str2Val["n"]),
+        m,
+        A,
+        Converter.FromVal(Str2Val["rowPtr"]),
+        Converter.FromVal(Str2Val["col"]),
+        Converter.FromVal(Str2Val["val"]),
+    };
+    expr Compressed = CSRIR[CSRModule->getFunction("CSR")](CsrArgs.size(), CsrArgs.data());
+    expr output_vals = CSRIR.getNth(0)(Compressed);
+    expr output_cols = CSRIR.getNth(1)(Compressed);
+    expr output_rptr = CSRIR.getNth(2)(Compressed);
+
+    std::vector<expr> SpmvDotArgs = {Converter.FromVal(Str2Val["n"]), output_rptr, output_cols, output_vals, Converter.FromVal(Str2Val["x"]), Converter.FromVal(Str2Val["y"])};
+//    std::vector<expr> GemvDotArgs = {Converter.FromVal(Str2Val["n"]), m, Converter.FromVal(Str2Val["y"]), A, Converter.FromVal(Str2Val["x"])};
+    std::vector<expr> GemvDotArgs = {n-1, n, Ctx.int_val(0), Ctx.int_val(1)};
+    // case 1
+    Slv.add(A[(n+1)*m + 0] == 0);
+    Slv.add(val[rptr[n+2]] == 0);
+    Slv.add(Gemv(GemvDotArgs.size(), GemvDotArgs.data()) != Translate[&F.getEntryBlock()](SpMVArgs)); // TODO incomplete
+
+//    std::vector<expr> GemvIndParams = {CSRArgs[0]-2, CSRArgs[0]-1, m-1, m};
+//    // collect all the loop indvars + upper bounds
+//    // make sure every indvar == upper bound - 1
+//    DenseMap<PHINode*, Value*> PhiMap;
+//    for (auto *L : LN.getLoops()) {
+//      auto Bounds = L->getBounds(SE);
+//      auto &UpperBound = Bounds->getFinalIVValue();
+//      auto *IndVar = L->getInductionVariable(SE);
+//      PhiMap[IndVar] = BinaryOperator::CreateSub(&UpperBound, Bounds->getStepValue(), "sub");
+//    }
+//    SSA2Func NoLoopSpMV(Ctx, &DT, &Converter, LiveOut);
+//    auto StraightLine = NoLoopSpMV.straightlineFromFunction(&F, &PhiMap);
+//    Slv.add(Gemv(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(SpMVArgs));
+////    Slv.add(StraightLine(SpMVArgs) != StraightLine(SpMVArgs));
+//
+//    for (auto &Elem : PhiMap)
+//      Elem.getSecond()->deleteValue();
 
 
-    auto Equiv = z3::unsat;
+    auto Equiv = Slv.check();
     if (BaseCase && Equiv == z3::unsat) {
       LLVM_DEBUG({
           dbgs() << "mapping found\n";
