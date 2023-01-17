@@ -12,6 +12,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/IRBuilder.h"
@@ -565,6 +566,7 @@ protected:
 class SSA2Func {
   using ConverterTy = MakeZ3;
   using PhiMapTy = DenseMap<PHINode*, Value*>;
+  using CycleTy = SmallVector<std::pair<const BasicBlock*, const BasicBlock*>>;
 public:
 //  SSA2Func(context &Ctx) : Ctx(Ctx), BB2Func(Ctx), DT(nullptr), Converter(nullptr), Range(Ctx), Output(Ctx) {}
 
@@ -620,10 +622,11 @@ public:
     return BB2Func.getZ3Fun(BB);
   }
 
-  func_decl straightlineFromFunction(Function *F, PhiMapTy *PM) {
-    PhiMap = PM;
+  func_decl straightlineFromFunction(Function *F, CycleTy *C) {
+    Cycles = C;
     func_decl Translate = fromFunction(F);
     PhiMap = nullptr;
+    Cycles = nullptr;
     return Translate;
   }
 
@@ -633,7 +636,7 @@ public:
     std::vector<z3::sort> Domain;
     for (auto *V : Scope) Domain.push_back(Converter->FromVal(V).get_sort());
     auto Name = BB->getNameOrAsOperand();
-    if (PhiMap != nullptr) Name += ".noloop";
+    if (Cycles != nullptr) Name += ".noloop";
     BB2Func.setZ3Fun(BB, Ctx.recfun(Name.c_str(), Domain.size(), Domain.data(), Range));
     LLVM_DEBUG({
       dbgs() << BB->getNameOrAsOperand() << ": ";
@@ -712,20 +715,32 @@ public:
     }
 
     expr Body(Ctx);
+
+    auto IsTarget =
+        [&Br] (unsigned S) {
+          return [&Br, S](auto &Elem) {
+            return Elem.second == Br->getSuccessor(S);
+          };
+        };
     if (Br->isUnconditional())
       Body = Calls[0];
-    else
+    else if (Cycles != nullptr && std::find_if(Cycles->begin(), Cycles->end(), IsTarget(0)) != Cycles->end()) {
+      Body = Calls[0];
+    } else if (Cycles != nullptr && std::find_if(Cycles->begin(), Cycles->end(), IsTarget(1)) != Cycles->end()) {
+      Body = Calls[1];
+    } else {
       Body = ite(Converter->FromVal(Br->getCondition()), Calls[1], Calls[0]);
+    }
 
-    if (PhiMap != nullptr)
-      for (int i =0; i < 2; ++i) {
-        for (auto &Elems : *PhiMap) {
-          expr_vector Src(Ctx), Dst(Ctx);
-          Src.push_back(Converter->FromVal(Elems.getFirst()));
-          Dst.push_back(Converter->FromVal(Elems.getSecond()));
-          Body = Body.substitute(Src, Dst);
-        }
-      }
+    //    if (PhiMap != nullptr)
+//      for (int i =0; i < 2; ++i) {
+//        for (auto &Elems : *PhiMap) {
+//          expr_vector Src(Ctx), Dst(Ctx);
+//          Src.push_back(Converter->FromVal(Elems.getFirst()));
+//          Dst.push_back(Converter->FromVal(Elems.getSecond()));
+//          Body = Body.substitute(Src, Dst);
+//        }
+//      }
 
     Ctx.recdef(BB2Func.getZ3Fun(BB), Scope, Body);
 
@@ -763,6 +778,7 @@ private:
   func_decl_vector Projs;
   std::vector<std::string> SavedNames;
   PhiMapTy *PhiMap = nullptr;
+  CycleTy *Cycles = nullptr;
 };
 
 typedef std::vector<unsigned>::iterator IdxIter;
@@ -1452,14 +1468,36 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     expr output_cols = CSRIR.getNth(1)(Compressed);
     expr output_rptr = CSRIR.getNth(2)(Compressed);
 
-    std::vector<expr> SpmvDotArgs = {Converter.FromVal(Str2Val["n"]), output_rptr, output_cols, output_vals, Converter.FromVal(Str2Val["x"]), Converter.FromVal(Str2Val["y"])};
+    std::vector<expr> SpmvDotArgs = {Converter.FromVal(Str2Val["n"]), output_rptr, output_cols, output_vals, Converter.FromVal(*ScopeSet.begin()), Converter.FromVal(Y)};
 //    std::vector<expr> GemvDotArgs = {Converter.FromVal(Str2Val["n"]), m, Converter.FromVal(Str2Val["y"]), A, Converter.FromVal(Str2Val["x"])};
-    std::vector<expr> GemvDotArgs = {n-1, n, Ctx.int_val(0), Ctx.int_val(1)};
+    std::vector<expr> GemvDotArgs = {Ctx.int_val(0), n, Ctx.int_val(0), Ctx.int_val(1)};
     // case 1
-    Slv.add(A[(n+1)*m + 0] == 0);
-    Slv.add(val[rptr[n+2]] == 0);
-    Slv.add(Gemv(GemvDotArgs.size(), GemvDotArgs.data()) != Translate[&F.getEntryBlock()](SpMVArgs)); // TODO incomplete
+//    Slv.add(A[(n+1)*m + 0] == 0);
+//    Slv.add(val[rptr[n+2]] == 0);
+//    Slv.add(Gemv(GemvDotArgs.size(), GemvDotArgs.data())[Ctx.int_val(0)] != Translate[&F.getEntryBlock()](SpmvDotArgs.size(), SpmvDotArgs.data())[Ctx.int_val(0)]); // TODO incomplete
 
+    SmallVector<std::pair<const BasicBlock*, const BasicBlock*>> Cycles;
+    FindFunctionBackedges(F, Cycles);
+    SSA2Func NoLoopSpMV(Ctx, &DT, &Converter, LiveOut);
+    auto StraightLine = NoLoopSpMV.straightlineFromFunction(&F, &Cycles);
+    expr DummyRptr = Ctx.constant("DummyRptr", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+    expr DummyCol = Ctx.constant("DummyCol", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+    expr DummyVal = Ctx.constant("DummyVal", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+
+    // case 1: new elem is zero
+    Slv.add(DummyRptr[Ctx.int_val(0)] == nnz);
+    Slv.add(DummyRptr[Ctx.int_val(1)] == nnz);
+    Slv.add(DummyCol[Ctx.int_val(0)] == 0);
+    Slv.add(DummyVal[Ctx.int_val(0)] == 0);
+    std::vector<expr> StraightlineArgs = {
+        Converter.FromVal(Str2Val["n"]),
+        DummyRptr,
+        DummyCol,
+        DummyVal,
+        Converter.FromVal(*ScopeSet.begin()),
+        Converter.FromVal(Y)
+    };
+    std::vector<expr> GemvIndParams = {CSRArgs[0]-2, CSRArgs[0]-1, m-1, m};
 //    std::vector<expr> GemvIndParams = {CSRArgs[0]-2, CSRArgs[0]-1, m-1, m};
 //    // collect all the loop indvars + upper bounds
 //    // make sure every indvar == upper bound - 1
