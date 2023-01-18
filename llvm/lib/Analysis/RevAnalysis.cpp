@@ -513,6 +513,10 @@ protected:
     case BinaryOperator::BinaryOps::Mul:
     case BinaryOperator::BinaryOps::FMul:
       return Left * Right;
+    case BinaryOperator::BinaryOps::SDiv:
+    case BinaryOperator::BinaryOps::FDiv:
+    case BinaryOperator::BinaryOps::UDiv:
+      return Left / Right;
     case BinaryOperator::BinaryOps::Sub:
     case BinaryOperator::BinaryOps::FSub:
       return Left - Right;
@@ -520,8 +524,16 @@ protected:
       return bv2int(int2bv(64, Left) & int2bv(64, Right), true);
     case BinaryOperator::BinaryOps::Xor:
       return bv2int(int2bv(64, Left) ^ int2bv(64, Right), true);
+    case BinaryOperator::BinaryOps::Or:
+      return bv2int(int2bv(64, Left) | int2bv(64, Right), true);
     case BinaryOperator::BinaryOps::SRem:
       return Left % Right; // TODO this doesn't map exactly, may be some bugs
+    case BinaryOperator::BinaryOps::Shl:
+      return bv2int(shl(int2bv(64, Left), int2bv(64, Right)), true);
+    case BinaryOperator::BinaryOps::LShr:
+      return bv2int(lshr(int2bv(64, Left), int2bv(64, Right)), true);
+    case BinaryOperator::BinaryOps::AShr:
+      return bv2int(ashr(int2bv(64, Left), int2bv(64, Right)), true);
     default:
       llvm_unreachable("unsupported binop type.");
     }
