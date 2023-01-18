@@ -25,6 +25,7 @@
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Passes/PassPlugin.h"
 #include <sstream>
+#include "llvm/Support/CommandLine.h"
 
 #define DEBUG_TYPE "rev-analysis"
 
@@ -33,6 +34,11 @@ using namespace std::chrono;
 using namespace llvm;
 using namespace z3;
 using namespace cvc5;
+
+
+static cl::opt<bool> EnableLifting(
+    "enable-lifting", cl::init(true), cl::Hidden,
+    cl::desc("Enable lifting of non-affine kernels."));
 
 bool RevAnalysisPass::canSupportPhiInstrs(Loop *TheLoop, LoopInfo *LI,
                                           DemandedBits *DB, AssumptionCache *AC,
@@ -1172,6 +1178,9 @@ public:
 
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
+  if(!EnableLifting)
+    return PreservedAnalyses::all();
+
   LLVM_DEBUG(dbgs() << F.getName() << "\n");
 
   // TODO replace with better legality analysis
