@@ -868,9 +868,9 @@ static func_decl MkGEMVNoLoop(context &Ctx, expr &A, expr_vector const &Ins) {
   func_decl gemv = Ctx.recfun("gemv.noloop", GemvSorts.size(), GemvSorts.data(), y.get_sort());
   Ctx.recdef(gemv, ArgsGemv, ite(n > i,
                                  ite(m > j,
-                                     store(y, 0, select(store(y, 0, 0), 0) + A[Ctx.int_val(0)]*x[Ctx.int_val(0)]),
+                                     store(y, i, select(store(y, i, 0), i) + A[i*m + j]*x[j]),
                                      y),
-                                 store(y, 0, 0)));
+                                 store(y, i, 0)));
 
 //  ArgsDot.push_back(n);
 //  ArgsDot.push_back(j); // lower bound
@@ -1477,35 +1477,35 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     }
     // inductive step
     Slv.reset();
-    Slv.add(IdxProperties);
-    Slv.add(CSRArgs[0] > 2);
-    Slv.add(m > 2);
-    SpMVArgs[0] = s0; // TODO clean this up
-    Slv.add(forall(s0, implies(0 <= s0 && s0 < CSRArgs[0]-1, Gemv(GemvParams.size(), GemvParams.data()) == Translate[&F.getEntryBlock()](SpMVArgs))));
-
     expr n = Converter.FromVal(Str2Val["n"]);
     expr rptr = Converter.FromVal(Str2Val["rowPtr"]);
     expr val = Converter.FromVal(Str2Val["val"]);
+    Slv.add(IdxProperties);
+    Slv.add(n > 2);
+    Slv.add(m > 2);
+//    SpMVArgs[0] = s0; // TODO clean this up
+//    Slv.add(forall(s0, implies(0 <= s0 && s0 < CSRArgs[0]-1, Gemv(GemvParams.size(), GemvParams.data()) == Translate[&F.getEntryBlock()](SpMVArgs))));
 
-    expr A = Ctx.constant("A", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
-    std::unique_ptr<Module> CSRModule;
-    SSA2Func CSRIR = ParseInputFile("csr_opt.ll", "CSR", F.getContext(), SE, Ctx, Converter, CSRModule);
-    std::vector<expr> CsrArgs = {
-        Converter.FromVal(Str2Val["n"]),
-        m,
-        A,
-        Converter.FromVal(Str2Val["rowPtr"]),
-        Converter.FromVal(Str2Val["col"]),
-        Converter.FromVal(Str2Val["val"]),
-    };
-    expr Compressed = CSRIR[CSRModule->getFunction("CSR")](CsrArgs.size(), CsrArgs.data());
-    expr output_vals = CSRIR.getNth(0)(Compressed);
-    expr output_cols = CSRIR.getNth(1)(Compressed);
-    expr output_rptr = CSRIR.getNth(2)(Compressed);
 
-    std::vector<expr> SpmvDotArgs = {Converter.FromVal(Str2Val["n"]), output_rptr, output_cols, output_vals, Converter.FromVal(*ScopeSet.begin()), Converter.FromVal(Y)};
-//    std::vector<expr> GemvDotArgs = {Converter.FromVal(Str2Val["n"]), m, Converter.FromVal(Str2Val["y"]), A, Converter.FromVal(Str2Val["x"])};
-    std::vector<expr> GemvDotArgs = {Ctx.int_val(0), n, Ctx.int_val(0), Ctx.int_val(1)};
+//    expr A = Ctx.constant("A", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+//    std::unique_ptr<Module> CSRModule;
+//    SSA2Func CSRIR = ParseInputFile("csr_opt.ll", "CSR", F.getContext(), SE, Ctx, Converter, CSRModule);
+//    std::vector<expr> CsrArgs = {
+//        Converter.FromVal(Str2Val["n"]),
+//        m,
+//        A,
+//        Converter.FromVal(Str2Val["rowPtr"]),
+//        Converter.FromVal(Str2Val["col"]),
+//        Converter.FromVal(Str2Val["val"]),
+//    };
+//    expr Compressed = CSRIR[CSRModule->getFunction("CSR")](CsrArgs.size(), CsrArgs.data());
+//    expr output_vals = CSRIR.getNth(0)(Compressed);
+//    expr output_cols = CSRIR.getNth(1)(Compressed);
+//    expr output_rptr = CSRIR.getNth(2)(Compressed);
+//
+//    std::vector<expr> SpmvDotArgs = {Converter.FromVal(Str2Val["n"]), output_rptr, output_cols, output_vals, Converter.FromVal(*ScopeSet.begin()), Converter.FromVal(Y)};
+////    std::vector<expr> GemvDotArgs = {Converter.FromVal(Str2Val["n"]), m, Converter.FromVal(Str2Val["y"]), A, Converter.FromVal(Str2Val["x"])};
+//    std::vector<expr> GemvDotArgs = {Ctx.int_val(0), n, Ctx.int_val(0), Ctx.int_val(1)};
     // case 1
 //    Slv.add(A[(n+1)*m + 0] == 0);
 //    Slv.add(val[rptr[n+2]] == 0);
@@ -1535,6 +1535,52 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     std::vector<expr> GemvIndParams = {Ctx.int_val(0), CSRArgs[0]-1, Ctx.int_val(0), m};
     func_decl GemvNoLoop = MkGEMVNoLoop(Ctx, DummyVal, GemvArgs);
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+    auto Case1 = Slv.check();
+
+    Slv.reset(); // Case (2)
+    Slv.add(IdxProperties);
+    Slv.add(n > 2);
+    Slv.add(m > 2);
+    Slv.add(DummyRptr[Ctx.int_val(0)] == 0);
+    Slv.add(DummyRptr[Ctx.int_val(1)] == 1);
+    Slv.add(DummyCol[Ctx.int_val(0)] == 0);
+    Slv.add(DummyVal[Ctx.int_val(0)] != 0);
+    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+    auto Case2 = Slv.check();
+
+    Slv.reset(); // Case (3) new col element
+    Slv.add(IdxProperties);
+    Slv.add(n > 2);
+    Slv.add(m > 2);
+    Slv.add(DummyRptr[Ctx.int_val(0)] == 0);
+    Slv.add(DummyRptr[Ctx.int_val(1)] == 0);
+//    Slv.add(DummyCol[Ctx.int_val(0)] == m);
+    Slv.add(DummyVal[Ctx.int_val(0)] == 0);
+    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+    auto Case3 = Slv.check();
+
+    Slv.reset(); // Case (4) new col element
+    Slv.add(IdxProperties);
+    Slv.add(n > 2);
+    Slv.add(m > 2);
+    Slv.add(DummyRptr[Ctx.int_val(0)] == m);
+    Slv.add(DummyRptr[Ctx.int_val(1)] == m + 1);
+    Slv.add(DummyCol[m] == m);
+    Slv.add(DummyVal[m] != 0);
+    std::vector<expr> GemvIndParams2 = {Ctx.int_val(0), Ctx.int_val(1), m, m+1};
+    Slv.add(GemvNoLoop(GemvIndParams2.size(), GemvIndParams2.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+    auto Case4 = Slv.check();
+    if (Case4 == z3::sat) {
+      auto Model = Slv.get_model();
+      LLVM_DEBUG({
+          dbgs() << Model.to_string() << "\n";
+          auto G = GemvNoLoop(GemvIndParams.size(), GemvIndParams.data());
+          auto S = StraightLine(StraightlineArgs.size(), StraightlineArgs.data());
+          dbgs() << Model.eval(select(G, m)).as_int64() << "\n";
+          dbgs() << Model.eval(select(S, m)).as_int64() << "\n";
+      });
+
+    }
 
 //    std::vector<expr> GemvIndParams = {CSRArgs[0]-2, CSRArgs[0]-1, m-1, m};
 //    // collect all the loop indvars + upper bounds
@@ -1555,7 +1601,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 //      Elem.getSecond()->deleteValue();
 
 
-    auto Equiv = Slv.check();
+    auto Equiv = (Case1 == z3::unsat &&
+                  Case2 == z3::unsat &&
+                  Case3 == z3::unsat &&
+                  Case4 == z3::unsat) ? z3::unsat : z3::sat;
     if (BaseCase && Equiv == z3::unsat) {
       LLVM_DEBUG({
           dbgs() << "mapping found\n";
