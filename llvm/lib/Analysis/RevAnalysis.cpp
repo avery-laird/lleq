@@ -519,6 +519,8 @@ protected:
       return bv2int(int2bv(64, Left) & int2bv(64, Right), true);
     case BinaryOperator::BinaryOps::Xor:
       return bv2int(int2bv(64, Left) ^ int2bv(64, Right), true);
+    case BinaryOperator::BinaryOps::SRem:
+      return Left % Right; // TODO this doesn't map exactly, may be some bugs
     default:
       llvm_unreachable("unsupported binop type.");
     }
@@ -1218,7 +1220,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   solver Slv(Ctx);
   Slv.set("smtlib2_log", "spmv_csr_test_log.smt2");
-//  Slv.set("timeout", 1000u);
+  Slv.set("timeout", 2000u);
 //  Value *N = F.getArg(0);
 //  Value *Rptr = F.getArg(1);
 //  Value *Col = F.getArg(2);
@@ -1475,6 +1477,12 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         break;
       }
     }
+
+    if (!BaseCase) {
+      LLVM_DEBUG(dbgs() << "[REV] BaseCase failed\n");
+      return PreservedAnalyses::all();
+    }
+
     // inductive step
     Slv.reset();
     expr n = Converter.FromVal(Str2Val["n"]);
@@ -1536,6 +1544,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     func_decl GemvNoLoop = MkGEMVNoLoop(Ctx, DummyVal, GemvArgs);
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case1 = Slv.check();
+    if (Case1 != z3::unsat) {
+      LLVM_DEBUG(dbgs() << "[REV] Case1 failed\n");
+      return PreservedAnalyses::all();
+    }
 
     Slv.reset(); // Case (2)
     Slv.add(IdxProperties);
@@ -1547,6 +1559,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     Slv.add(DummyVal[Ctx.int_val(0)] != 0);
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case2 = Slv.check();
+    if (Case2 != z3::unsat) {
+      LLVM_DEBUG(dbgs() << "[REV] Case2 failed\n");
+      return PreservedAnalyses::all();
+    }
 
     Slv.reset(); // Case (3) new col element
     Slv.add(IdxProperties);
@@ -1558,6 +1574,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     Slv.add(DummyVal[Ctx.int_val(0)] == 0);
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case3 = Slv.check();
+    if (Case3 != z3::unsat) {
+      LLVM_DEBUG(dbgs() << "[REV] Case3 failed\n");
+      return PreservedAnalyses::all();
+    }
 
     Slv.reset(); // Case (4) new col element
     Slv.add(IdxProperties);
@@ -1570,44 +1590,15 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     std::vector<expr> GemvIndParams2 = {Ctx.int_val(0), Ctx.int_val(1), m, m+1};
     Slv.add(GemvNoLoop(GemvIndParams2.size(), GemvIndParams2.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case4 = Slv.check();
-    if (Case4 == z3::sat) {
-      auto Model = Slv.get_model();
-      LLVM_DEBUG({
-          dbgs() << Model.to_string() << "\n";
-          auto G = GemvNoLoop(GemvIndParams.size(), GemvIndParams.data());
-          auto S = StraightLine(StraightlineArgs.size(), StraightlineArgs.data());
-          dbgs() << Model.eval(select(G, m)).as_int64() << "\n";
-          dbgs() << Model.eval(select(S, m)).as_int64() << "\n";
-      });
-
+    if (Case4 != z3::unsat) {
+      LLVM_DEBUG(dbgs() << "[REV] Case4 failed\n");
+      return PreservedAnalyses::all();
     }
 
-//    std::vector<expr> GemvIndParams = {CSRArgs[0]-2, CSRArgs[0]-1, m-1, m};
-//    // collect all the loop indvars + upper bounds
-//    // make sure every indvar == upper bound - 1
-//    DenseMap<PHINode*, Value*> PhiMap;
-//    for (auto *L : LN.getLoops()) {
-//      auto Bounds = L->getBounds(SE);
-//      auto &UpperBound = Bounds->getFinalIVValue();
-//      auto *IndVar = L->getInductionVariable(SE);
-//      PhiMap[IndVar] = BinaryOperator::CreateSub(&UpperBound, Bounds->getStepValue(), "sub");
-//    }
-//    SSA2Func NoLoopSpMV(Ctx, &DT, &Converter, LiveOut);
-//    auto StraightLine = NoLoopSpMV.straightlineFromFunction(&F, &PhiMap);
-//    Slv.add(Gemv(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(SpMVArgs));
-////    Slv.add(StraightLine(SpMVArgs) != StraightLine(SpMVArgs));
-//
-//    for (auto &Elem : PhiMap)
-//      Elem.getSecond()->deleteValue();
-
-
-    auto Equiv = (Case1 == z3::unsat &&
-                  Case2 == z3::unsat &&
-                  Case3 == z3::unsat &&
-                  Case4 == z3::unsat) ? z3::unsat : z3::sat;
+    auto Equiv = z3::unsat;
     if (BaseCase && Equiv == z3::unsat) {
       LLVM_DEBUG({
-          dbgs() << "mapping found\n";
+          dbgs() << "[REV] mapping found\n";
           dbgs() << "Mapping: \n";
           dbgs() << "Input program = GEMV\n";
           dbgs() << "Storage Format = CSR\n";
