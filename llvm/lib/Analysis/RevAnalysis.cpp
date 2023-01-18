@@ -24,6 +24,7 @@
 #include "llvm/Analysis/Delinearization.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Passes/PassPlugin.h"
+#include <sstream>
 
 #define DEBUG_TYPE "rev-analysis"
 
@@ -467,7 +468,7 @@ protected:
   expr set(Value *V, const expr &Expr) override { return Map.setZ3(V, Expr); }
 
   expr FromConst(Constant *V) override {
-    APSInt Result(64); // 64 bits wide
+    APSInt Result(64, false); // 64 bits wide, possibly signed
     bool isExact;
     if (isa<UndefValue>(V))
       return c.int_val(0);
@@ -1472,7 +1473,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       Slv.add(m == Ctx.int_val(Base[1]));
       Slv.add(Gemv(GemvParams.size(), GemvParams.data()) != Translate[&F.getEntryBlock()](SpMVArgs));
       auto Res = Slv.check();
-      if (Res == z3::sat) {
+      if (Res != z3::unsat) {
         BaseCase = false;
         break;
       }
@@ -1545,7 +1546,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case1 = Slv.check();
     if (Case1 != z3::unsat) {
-      LLVM_DEBUG(dbgs() << "[REV] Case1 failed\n");
+      std::stringstream S;
+      S << Case1;
+      LLVM_DEBUG(dbgs() << "[REV] Case1 failed: " << S.str() << "\n");
       return PreservedAnalyses::all();
     }
 
@@ -1560,7 +1563,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case2 = Slv.check();
     if (Case2 != z3::unsat) {
-      LLVM_DEBUG(dbgs() << "[REV] Case2 failed\n");
+      std::stringstream S;
+      S << Case2;
+      LLVM_DEBUG(dbgs() << "[REV] Case2 failed: " << S.str() << "\n");
       return PreservedAnalyses::all();
     }
 
@@ -1575,7 +1580,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case3 = Slv.check();
     if (Case3 != z3::unsat) {
-      LLVM_DEBUG(dbgs() << "[REV] Case3 failed\n");
+      std::stringstream S;
+      S << Case3;
+      LLVM_DEBUG(dbgs() << "[REV] Case3 failed: " << S.str() << "\n");
       return PreservedAnalyses::all();
     }
 
@@ -1591,7 +1598,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     Slv.add(GemvNoLoop(GemvIndParams2.size(), GemvIndParams2.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case4 = Slv.check();
     if (Case4 != z3::unsat) {
-      LLVM_DEBUG(dbgs() << "[REV] Case4 failed\n");
+      std::stringstream S;
+      S << Case4;
+      LLVM_DEBUG(dbgs() << "[REV] Case4 failed: " << S.str() << "\n");
       return PreservedAnalyses::all();
     }
 
