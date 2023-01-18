@@ -850,6 +850,41 @@ static func_decl MkGEMV(context &Ctx, func_decl &A, expr_vector const &Ins) {
   return gemv;
 }
 
+static func_decl MkGEMVNoLoop(context &Ctx, expr &A, expr_vector const &Ins) {
+  expr y = Ins[0];
+  expr x = Ins[1];
+  expr n = Ctx.int_const("n");
+  expr m = Ctx.int_const("m");
+  expr i = Ctx.int_const("i");
+  expr j = Ctx.int_const("j");
+  expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+
+  ArgsGemv.push_back(i); // lower bound
+  ArgsGemv.push_back(n);
+  ArgsGemv.push_back(j); // lower bound
+  ArgsGemv.push_back(m);
+
+  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+  func_decl gemv = Ctx.recfun("gemv.noloop", GemvSorts.size(), GemvSorts.data(), y.get_sort());
+  Ctx.recdef(gemv, ArgsGemv, ite(n > i,
+                                 ite(m > j,
+                                     store(y, 0, select(store(y, 0, 0), 0) + A[Ctx.int_val(0)]*x[Ctx.int_val(0)]),
+                                     y),
+                                 store(y, 0, 0)));
+
+//  ArgsDot.push_back(n);
+//  ArgsDot.push_back(j); // lower bound
+//  ArgsDot.push_back(m);
+//
+//  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+//  func_decl gemv = Ctx.recfun("gemv", GemvSorts.size(), GemvSorts.data(), y.get_sort());
+//  std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+//  func_decl dot = Ctx.recfun("dot", DotSorts.size(), DotSorts.data(), y[Ctx.int_val(0)].get_sort());
+//  Ctx.recdef(gemv, ArgsGemv, ite(n < i, y, store(gemv(i, n-1, j, m), n, dot(n, j, m-1))));
+//  Ctx.recdef(dot, ArgsDot, ite(m < j, Ctx.int_val(0), dot(n, j, m-1) + A(n, m) * x[m]));
+  return gemv;
+}
+
 SSA2Func ParseInputFile(StringRef Path, StringRef FunctionName, LLVMContext &Context, ScalarEvolution &SE, context &Ctx, MakeZ3 &Converter, std::unique_ptr<Module> &Module) {
   llvm::SMDiagnostic Err;
   Module = llvm::parseIRFile(Path, Err, Context);
@@ -1497,7 +1532,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         Converter.FromVal(*ScopeSet.begin()),
         Converter.FromVal(Y)
     };
-    std::vector<expr> GemvIndParams = {CSRArgs[0]-2, CSRArgs[0]-1, m-1, m};
+    std::vector<expr> GemvIndParams = {Ctx.int_val(0), CSRArgs[0]-1, Ctx.int_val(0), m};
+    func_decl GemvNoLoop = MkGEMVNoLoop(Ctx, DummyVal, GemvArgs);
+    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+
 //    std::vector<expr> GemvIndParams = {CSRArgs[0]-2, CSRArgs[0]-1, m-1, m};
 //    // collect all the loop indvars + upper bounds
 //    // make sure every indvar == upper bound - 1
