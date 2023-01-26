@@ -1172,7 +1172,8 @@ public:
         InputKernel(InputKernel),
         EQUAL(Ctx.constant("EQUAL", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()))),
         m(Ctx.int_const("m")),
-        nnz(Ctx.int_const("nnz")) {}
+        nnz(Ctx.int_const("nnz")),
+        Model(Ctx) {}
 
   bool validateMapping() {
     Slv.reset();
@@ -1224,7 +1225,7 @@ public:
       for (auto B : ScopeVars) {
         expr_vector AllRels(Ctx);
         for (auto const &Rel : AllRelations)
-          AllRels.push_back(implies(Rel(A), Rel(B)));
+          AllRels.push_back(Rel(A) == Rel(B));
         AllRels.push_back(EQUAL[Ctx.int_val(B)] == Ctx.int_val(A));
         Pairs.push_back(mk_and(AllRels));
         Weights.push_back(1);
@@ -1245,14 +1246,14 @@ public:
 
     auto Res = Slv.check();
     if (Res == z3::sat) {
-      auto model = Slv.get_model();
+      Model = Slv.get_model();
       LLVM_DEBUG({
-        dbgs() << model.to_string() << "\n";
+        dbgs() << Model.to_string() << "\n";
         for (unsigned i=0; i < CARE; ++i)
-          dbgs() << model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).to_string() << " ";
+          dbgs() << Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).to_string() << " ";
         dbgs() << "\n";
         for (unsigned i=0; i < CARE; ++i) {
-          dbgs() << AllNames[i + Vars.size()] << " -> " << AllNames[model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()] << "\n";
+          dbgs() << "(" << AllNames[i + Vars.size()] << ", " << (i + Vars.size()) << ") -> " << "(" << AllNames[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()] << ", " << Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64() << ")\n";
         }
       });
       return true;
@@ -1264,24 +1265,24 @@ public:
   }
 
   bool checkEquality(Value *LiveOut, Function &F, DominatorTree &DT) {
-    auto model = Slv.get_model();
     DenseMap<StringRef, Value* > Str2Val;
     for (unsigned i=0; i < CARE; ++i)
-      Str2Val[AllNames[i + Vars.size()]] = Scope[model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()];
-
-    Slv.reset();
+      Str2Val[AllNames[i + Vars.size()]] = Scope[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()];
 
     // make CSR
     expr_vector Args(Ctx);
-    for (unsigned i =0; i < CARE; ++i)
-      Args.push_back(Converter.FromVal(Scope[model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]));
+    for (unsigned i =0; i < CARE; ++i) {
+      LLVM_DEBUG(dbgs() << (i + Vars.size()) << " -> " << Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64() << ", ");
+      Args.push_back(Converter.FromVal(
+          Scope[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]));
+    }
 
     func_decl CSR = MkCSR(Ctx, Args);
     expr_vector IdxProperties = MkCSRIdxProperties(Ctx, Args, m, nnz);
 
     SmallPtrSet<Value *, 10> ScopeSet;
     for (auto *V : Scope) ScopeSet.insert(V);
-    for (unsigned i = 0; i < CARE; ++i) ScopeSet.erase(Scope[model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]);
+    for (unsigned i = 0; i < CARE; ++i) ScopeSet.erase(Scope[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]);
     Value *Y = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LiveOut))->getPointerOperand();
     ScopeSet.erase(Y);
     if (ScopeSet.size() != 1)
@@ -1425,14 +1426,15 @@ public:
   std::vector<std::string> AllNames;
   std::vector<SmallSet<unsigned, 5>> Sets;
   Properties &Props;
-  expr EQUAL;
+  z3::expr EQUAL;
   const std::vector<Value *> &Scope;
   z3::context &Ctx;
   z3::solver &Slv;
   MakeZ3 &Converter;
   func_decl InputKernel;
-  expr m;
-  expr nnz;
+  z3::expr m;
+  z3::expr nnz;
+  z3::model Model;
 };
 
 class CSRFormat : public Format {
