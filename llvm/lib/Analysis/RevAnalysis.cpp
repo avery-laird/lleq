@@ -804,20 +804,20 @@ private:
 
 typedef std::vector<unsigned>::iterator IdxIter;
 
-static func_decl MkCSR(context &Ctx, expr_vector const &Ins) {
-  expr rptr = Ins[1];
-  expr col = Ins[2];
-  expr val = Ins[3];
-  expr n = Ctx.int_const("n");
-  expr m = Ctx.int_const("m");
-  expr t = Ctx.int_const("t");
-  expr_vector Args(Ctx);
-  Args.push_back(n);
-  Args.push_back(m);
-  func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
-  Ctx.recdef(A, Args, ite(exists(t, rptr[n] <= t && t < rptr[n+1] && col[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
-  return A;
-}
+//static func_decl MkCSR(context &Ctx, expr_vector const &Ins) {
+//  expr rptr = Ins[1];
+//  expr col = Ins[2];
+//  expr val = Ins[3];
+//  expr n = Ctx.int_const("n");
+//  expr m = Ctx.int_const("m");
+//  expr t = Ctx.int_const("t");
+//  expr_vector Args(Ctx);
+//  Args.push_back(n);
+//  Args.push_back(m);
+//  func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
+//  Ctx.recdef(A, Args, ite(exists(t, rptr[n] <= t && t < rptr[n+1] && col[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
+//  return A;
+//}
 
 static expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, expr &m, expr &nnz) {
   expr n = Ins[0];
@@ -827,8 +827,6 @@ static expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, expr
   expr s = Ctx.int_const("s");
   expr t = Ctx.int_const("t");
   expr_vector Props(Ctx);
-//  Props.push_back(n > 0);
-//  Props.push_back(m > 0);
   Props.push_back(nnz > 0);
   // monotonicty
   Props.push_back(forall(s, implies(0 <= s && s <= n, rptr[s] <= rptr[s+1] && rptr[s] >= 0)));
@@ -1156,7 +1154,9 @@ public:
 class Kernel {};
 
 class Format {
+protected:
   using MapTy = DenseMap<StringRef, unsigned >;
+  using NameMapTy = DenseMap<StringRef, Value* > ;
 public:
   Format(Properties &Props,
          z3::context &Ctx,
@@ -1264,10 +1264,13 @@ public:
     return false;
   }
 
+  virtual func_decl makeMatrix(NameMapTy &NameMap) = 0;
+  virtual void makeIndexProperties(expr_vector &Properties, NameMapTy &Ins) = 0;
+
   bool checkEquality(Value *LiveOut, Function &F, DominatorTree &DT) {
-    DenseMap<StringRef, Value* > Str2Val;
+    NameMapTy NameMap;
     for (unsigned i=0; i < CARE; ++i)
-      Str2Val[AllNames[i + Vars.size()]] = Scope[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()];
+      NameMap[AllNames[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]] = Scope[i];
 
     // make CSR
     expr_vector Args(Ctx);
@@ -1277,8 +1280,9 @@ public:
           Scope[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]));
     }
 
-    func_decl CSR = MkCSR(Ctx, Args);
-    expr_vector IdxProperties = MkCSRIdxProperties(Ctx, Args, m, nnz);
+    func_decl Matrix = makeMatrix(NameMap);
+    expr_vector IdxProperties(Ctx);
+    makeIndexProperties(IdxProperties, NameMap);
 
     SmallPtrSet<Value *, 10> ScopeSet;
     for (auto *V : Scope) ScopeSet.insert(V);
@@ -1291,7 +1295,7 @@ public:
     GemvArgs.push_back(Converter.FromVal(Y)); // y
     GemvArgs.push_back(Converter.FromVal(*ScopeSet.begin())); // x
 
-    func_decl Gemv = MkGEMV(Ctx, CSR, GemvArgs);
+    func_decl Gemv = MkGEMV(Ctx, Matrix, GemvArgs);
 
     expr_vector SpMVArgs(Ctx);
     for (auto *V : Scope)
@@ -1322,9 +1326,9 @@ public:
 
     // inductive step
     Slv.reset();
-    expr n = Converter.FromVal(Str2Val["n"]);
-    expr rptr = Converter.FromVal(Str2Val["rowPtr"]);
-    expr val = Converter.FromVal(Str2Val["val"]);
+    expr n = Converter.FromVal(NameMap["n"]);
+    expr rptr = Converter.FromVal(NameMap["rowPtr"]);
+    expr val = Converter.FromVal(NameMap["val"]);
     Slv.add(IdxProperties);
     Slv.add(n > 2);
     Slv.add(m > 2);
@@ -1343,7 +1347,7 @@ public:
     Slv.add(DummyCol[Ctx.int_val(0)] == 0);
     Slv.add(DummyVal[Ctx.int_val(0)] == 0);
     std::vector<expr> StraightlineArgs = {
-        Converter.FromVal(Str2Val["n"]),
+        Converter.FromVal(NameMap["n"]),
         DummyRptr,
         DummyCol,
         DummyVal,
@@ -1485,6 +1489,45 @@ public:
       }
     }
   }
+
+  func_decl makeMatrix(NameMapTy &NameMap) override {
+    expr rptr = Converter.FromVal(NameMap["rowPtr"]);
+    expr col = Converter.FromVal(NameMap["col"]);
+    expr val = Converter.FromVal(NameMap["val"]);
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr t = Ctx.int_const("t");
+    expr_vector Args(Ctx);
+    Args.push_back(n);
+    Args.push_back(m);
+    func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
+    Ctx.recdef(A, Args, ite(exists(t, rptr[n] <= t && t < rptr[n+1] && col[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
+    return A;
+  }
+
+  void makeIndexProperties(expr_vector &Properties, NameMapTy &Ins) override {
+    assert(Properties.size() == 0);
+    expr n = Converter.FromVal(Ins["n"]);
+    expr rptr = Converter.FromVal(Ins["rowPtr"]);
+    expr col = Converter.FromVal(Ins["col"]);
+    expr val = Converter.FromVal(Ins["val"]);
+    expr s = Ctx.int_const("s");
+    expr t = Ctx.int_const("t");
+    Properties.push_back(nnz > 0);
+    // monotonicty
+    Properties.push_back(forall(s, implies(0 <= s && s <= n, rptr[s] <= rptr[s+1] && rptr[s] >= 0)));
+    // pmonotonicity
+    Properties.push_back(forall(s, implies(0 <= s && s < n, forall(t, implies(rptr[s] <= t && t < rptr[s+1], col[t] < col[t+1])))));
+    // extra constraints
+    Properties.push_back(forall(s, implies(0 <= s && s < nnz, col[s] >= 0 && col[s] < m)));
+    Properties.push_back(forall(s, implies(0 <= s && s < nnz, val[s] == 1)));
+
+    Properties.push_back(rptr[Ctx.int_val(0)] == 0);
+    Properties.push_back(rptr[n] == nnz);
+    Properties.push_back(nnz <= n * m);
+    return;
+  }
+
 };
 
 class COOFormat : public Format {
@@ -1534,6 +1577,35 @@ public:
 //        Sets[i].insert(Map["rowPtr"]);
       }
     }
+  }
+
+  func_decl makeMatrix(NameMapTy &NameMap) override {
+    expr rowind = Converter.FromVal(NameMap["rowind"]);
+    expr colind = Converter.FromVal(NameMap["colind"]);
+    expr val = Converter.FromVal(NameMap["val"]);
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr t = Ctx.int_const("t");
+    expr_vector Args(Ctx);
+    Args.push_back(n);
+    Args.push_back(m);
+    func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
+    Ctx.recdef(A, Args, ite(exists(t, rowind[t] == n && colind[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
+    return A;
+  }
+
+  void makeIndexProperties(expr_vector &Properties, NameMapTy &Ins) override {
+    expr nnz = Converter.FromVal(Ins["nz"]);
+    expr rowind = Converter.FromVal(Ins["rowind"]);
+    expr colind = Converter.FromVal(Ins["colind"]);
+    expr val = Converter.FromVal(Ins["val"]);
+    expr s = Ctx.int_const("s");
+    expr t = Ctx.int_const("t");
+
+    Properties.push_back(nnz > 0);
+//    Properties.push_back(nnz <= n * m);
+    Properties.push_back(forall(s, implies(0 <= s && s < nnz, val[s] == 1)));
+    // TODO incomplete
   }
 
 };
