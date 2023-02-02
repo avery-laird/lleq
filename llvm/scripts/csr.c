@@ -6,7 +6,12 @@
 //  int *cols;
 //  double *vals;
 //} Compressed;
-void CSR(int n, int m, double *A, int *rptr, int *cols, double *vals) {
+void CSR(int n,
+         int m,
+         double *A,
+         int *rptr,
+         int *cols,
+         double *vals) {
   int vals_idx = 0, cols_idx = 0;
   int nnz = 0;
   rptr[0] = 0;
@@ -24,6 +29,7 @@ void CSR(int n, int m, double *A, int *rptr, int *cols, double *vals) {
   }
   return;
 }
+
 
 int main() {
   int n = 1, m = 1;
