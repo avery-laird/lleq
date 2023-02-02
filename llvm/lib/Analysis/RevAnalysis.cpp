@@ -12,6 +12,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/IRBuilder.h"
@@ -23,6 +24,8 @@
 #include "llvm/Analysis/Delinearization.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Passes/PassPlugin.h"
+#include <sstream>
+#include "llvm/Support/CommandLine.h"
 
 #define DEBUG_TYPE "rev-analysis"
 
@@ -31,6 +34,11 @@ using namespace std::chrono;
 using namespace llvm;
 using namespace z3;
 using namespace cvc5;
+
+
+static cl::opt<bool> EnableLifting(
+    "enable-lifting", cl::init(true), cl::Hidden,
+    cl::desc("Enable lifting of non-affine kernels."));
 
 bool RevAnalysisPass::canSupportPhiInstrs(Loop *TheLoop, LoopInfo *LI,
                                           DemandedBits *DB, AssumptionCache *AC,
@@ -466,7 +474,7 @@ protected:
   expr set(Value *V, const expr &Expr) override { return Map.setZ3(V, Expr); }
 
   expr FromConst(Constant *V) override {
-    APSInt Result(64); // 64 bits wide
+    APSInt Result(64, false); // 64 bits wide, possibly signed
     bool isExact;
     if (isa<UndefValue>(V))
       return c.int_val(0);
@@ -511,6 +519,10 @@ protected:
     case BinaryOperator::BinaryOps::Mul:
     case BinaryOperator::BinaryOps::FMul:
       return Left * Right;
+    case BinaryOperator::BinaryOps::SDiv:
+    case BinaryOperator::BinaryOps::FDiv:
+    case BinaryOperator::BinaryOps::UDiv:
+      return Left / Right;
     case BinaryOperator::BinaryOps::Sub:
     case BinaryOperator::BinaryOps::FSub:
       return Left - Right;
@@ -518,6 +530,16 @@ protected:
       return bv2int(int2bv(64, Left) & int2bv(64, Right), true);
     case BinaryOperator::BinaryOps::Xor:
       return bv2int(int2bv(64, Left) ^ int2bv(64, Right), true);
+    case BinaryOperator::BinaryOps::Or:
+      return bv2int(int2bv(64, Left) | int2bv(64, Right), true);
+    case BinaryOperator::BinaryOps::SRem:
+      return Left % Right; // TODO this doesn't map exactly, may be some bugs
+    case BinaryOperator::BinaryOps::Shl:
+      return bv2int(shl(int2bv(64, Left), int2bv(64, Right)), true);
+    case BinaryOperator::BinaryOps::LShr:
+      return bv2int(lshr(int2bv(64, Left), int2bv(64, Right)), true);
+    case BinaryOperator::BinaryOps::AShr:
+      return bv2int(ashr(int2bv(64, Left), int2bv(64, Right)), true);
     default:
       llvm_unreachable("unsupported binop type.");
     }
@@ -565,6 +587,7 @@ protected:
 class SSA2Func {
   using ConverterTy = MakeZ3;
   using PhiMapTy = DenseMap<PHINode*, Value*>;
+  using CycleTy = SmallVector<std::pair<const BasicBlock*, const BasicBlock*>>;
 public:
 //  SSA2Func(context &Ctx) : Ctx(Ctx), BB2Func(Ctx), DT(nullptr), Converter(nullptr), Range(Ctx), Output(Ctx) {}
 
@@ -620,10 +643,11 @@ public:
     return BB2Func.getZ3Fun(BB);
   }
 
-  func_decl straightlineFromFunction(Function *F, PhiMapTy *PM) {
-    PhiMap = PM;
+  func_decl straightlineFromFunction(Function *F, CycleTy *C) {
+    Cycles = C;
     func_decl Translate = fromFunction(F);
     PhiMap = nullptr;
+    Cycles = nullptr;
     return Translate;
   }
 
@@ -633,7 +657,7 @@ public:
     std::vector<z3::sort> Domain;
     for (auto *V : Scope) Domain.push_back(Converter->FromVal(V).get_sort());
     auto Name = BB->getNameOrAsOperand();
-    if (PhiMap != nullptr) Name += ".noloop";
+    if (Cycles != nullptr) Name += ".noloop";
     BB2Func.setZ3Fun(BB, Ctx.recfun(Name.c_str(), Domain.size(), Domain.data(), Range));
     LLVM_DEBUG({
       dbgs() << BB->getNameOrAsOperand() << ": ";
@@ -712,20 +736,32 @@ public:
     }
 
     expr Body(Ctx);
+
+    auto IsTarget =
+        [&Br] (unsigned S) {
+          return [&Br, S](auto &Elem) {
+            return Elem.second == Br->getSuccessor(S);
+          };
+        };
     if (Br->isUnconditional())
       Body = Calls[0];
-    else
+    else if (Cycles != nullptr && std::find_if(Cycles->begin(), Cycles->end(), IsTarget(0)) != Cycles->end()) {
+      Body = Calls[0];
+    } else if (Cycles != nullptr && std::find_if(Cycles->begin(), Cycles->end(), IsTarget(1)) != Cycles->end()) {
+      Body = Calls[1];
+    } else {
       Body = ite(Converter->FromVal(Br->getCondition()), Calls[1], Calls[0]);
+    }
 
-    if (PhiMap != nullptr)
-      for (int i =0; i < 2; ++i) {
-        for (auto &Elems : *PhiMap) {
-          expr_vector Src(Ctx), Dst(Ctx);
-          Src.push_back(Converter->FromVal(Elems.getFirst()));
-          Dst.push_back(Converter->FromVal(Elems.getSecond()));
-          Body = Body.substitute(Src, Dst);
-        }
-      }
+    //    if (PhiMap != nullptr)
+//      for (int i =0; i < 2; ++i) {
+//        for (auto &Elems : *PhiMap) {
+//          expr_vector Src(Ctx), Dst(Ctx);
+//          Src.push_back(Converter->FromVal(Elems.getFirst()));
+//          Dst.push_back(Converter->FromVal(Elems.getSecond()));
+//          Body = Body.substitute(Src, Dst);
+//        }
+//      }
 
     Ctx.recdef(BB2Func.getZ3Fun(BB), Scope, Body);
 
@@ -763,24 +799,25 @@ private:
   func_decl_vector Projs;
   std::vector<std::string> SavedNames;
   PhiMapTy *PhiMap = nullptr;
+  CycleTy *Cycles = nullptr;
 };
 
 typedef std::vector<unsigned>::iterator IdxIter;
 
-static func_decl MkCSR(context &Ctx, expr_vector const &Ins) {
-  expr rptr = Ins[1];
-  expr col = Ins[2];
-  expr val = Ins[3];
-  expr n = Ctx.int_const("n");
-  expr m = Ctx.int_const("m");
-  expr t = Ctx.int_const("t");
-  expr_vector Args(Ctx);
-  Args.push_back(n);
-  Args.push_back(m);
-  func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
-  Ctx.recdef(A, Args, ite(exists(t, rptr[n] <= t && t < rptr[n+1] && col[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
-  return A;
-}
+//static func_decl MkCSR(context &Ctx, expr_vector const &Ins) {
+//  expr rptr = Ins[1];
+//  expr col = Ins[2];
+//  expr val = Ins[3];
+//  expr n = Ctx.int_const("n");
+//  expr m = Ctx.int_const("m");
+//  expr t = Ctx.int_const("t");
+//  expr_vector Args(Ctx);
+//  Args.push_back(n);
+//  Args.push_back(m);
+//  func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
+//  Ctx.recdef(A, Args, ite(exists(t, rptr[n] <= t && t < rptr[n+1] && col[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
+//  return A;
+//}
 
 static expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, expr &m, expr &nnz) {
   expr n = Ins[0];
@@ -790,8 +827,6 @@ static expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, expr
   expr s = Ctx.int_const("s");
   expr t = Ctx.int_const("t");
   expr_vector Props(Ctx);
-//  Props.push_back(n > 0);
-//  Props.push_back(m > 0);
   Props.push_back(nnz > 0);
   // monotonicty
   Props.push_back(forall(s, implies(0 <= s && s <= n, rptr[s] <= rptr[s+1] && rptr[s] >= 0)));
@@ -831,6 +866,41 @@ static func_decl MkGEMV(context &Ctx, func_decl &A, expr_vector const &Ins) {
   func_decl dot = Ctx.recfun("dot", DotSorts.size(), DotSorts.data(), y[Ctx.int_val(0)].get_sort());
   Ctx.recdef(gemv, ArgsGemv, ite(n < i, y, store(gemv(i, n-1, j, m), n, dot(n, j, m-1))));
   Ctx.recdef(dot, ArgsDot, ite(m < j, Ctx.int_val(0), dot(n, j, m-1) + A(n, m) * x[m]));
+  return gemv;
+}
+
+static func_decl MkGEMVNoLoop(context &Ctx, expr &A, expr_vector const &Ins) {
+  expr y = Ins[0];
+  expr x = Ins[1];
+  expr n = Ctx.int_const("n");
+  expr m = Ctx.int_const("m");
+  expr i = Ctx.int_const("i");
+  expr j = Ctx.int_const("j");
+  expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+
+  ArgsGemv.push_back(i); // lower bound
+  ArgsGemv.push_back(n);
+  ArgsGemv.push_back(j); // lower bound
+  ArgsGemv.push_back(m);
+
+  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+  func_decl gemv = Ctx.recfun("gemv.noloop", GemvSorts.size(), GemvSorts.data(), y.get_sort());
+  Ctx.recdef(gemv, ArgsGemv, ite(n > i,
+                                 ite(m > j,
+                                     store(y, i, select(store(y, i, 0), i) + A[i*m + j]*x[j]),
+                                     y),
+                                 store(y, i, 0)));
+
+//  ArgsDot.push_back(n);
+//  ArgsDot.push_back(j); // lower bound
+//  ArgsDot.push_back(m);
+//
+//  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+//  func_decl gemv = Ctx.recfun("gemv", GemvSorts.size(), GemvSorts.data(), y.get_sort());
+//  std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+//  func_decl dot = Ctx.recfun("dot", DotSorts.size(), DotSorts.data(), y[Ctx.int_val(0)].get_sort());
+//  Ctx.recdef(gemv, ArgsGemv, ite(n < i, y, store(gemv(i, n-1, j, m), n, dot(n, j, m-1))));
+//  Ctx.recdef(dot, ArgsDot, ite(m < j, Ctx.int_val(0), dot(n, j, m-1) + A(n, m) * x[m]));
   return gemv;
 }
 
@@ -1081,6 +1151,512 @@ public:
   }
 };
 
+class Kernel {};
+
+class Format {
+protected:
+  using MapTy = DenseMap<StringRef, unsigned >;
+  using NameMapTy = DenseMap<StringRef, Value* > ;
+public:
+  Format(Properties &Props,
+         z3::context &Ctx,
+         const std::vector<Value *> &Scope,
+         z3::solver &Slv,
+         MakeZ3 &Converter,
+         func_decl InputKernel)
+      : Props(Props),
+        Ctx(Ctx),
+        Scope(Scope),
+        Slv(Slv),
+        Converter(Converter),
+        InputKernel(InputKernel),
+        EQUAL(Ctx.constant("EQUAL", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()))),
+        n(Ctx.int_const("n")),
+        m(Ctx.int_const("m")),
+        nnz(Ctx.int_const("nnz")),
+        Model(Ctx) {}
+
+  bool validateMapping() {
+    Slv.reset();
+
+    func_decl_vector AllRelations(Ctx);
+    for (unsigned i=0; i < Props.Props.size(); ++i)
+      AllRelations.push_back(Ctx.function(Props.Props[i].Name.c_str(), Ctx.int_sort(), Ctx.bool_sort()));
+
+    for (unsigned i=0; i<Props.Props.size(); ++i) {
+      expr_vector List(Ctx);
+      for (unsigned j = 0; j < Vars.size(); ++j)
+        List.push_back(
+            AllRelations[i](Vars[j]) == Ctx.bool_val(Sets[i].contains(Vars[j])));
+
+      LLVM_DEBUG({
+        for (auto const &E : List)
+          dbgs() << E.to_string() << ", ";
+        dbgs() << "\n";
+      });
+
+      Slv.add(List);
+    }
+
+    // make mapping for scope args
+    std::vector<unsigned> ScopeVars;
+
+    for (unsigned i = 0; i < Scope.size(); ++i) {
+      ScopeVars.push_back(i + Vars.size());
+      AllNames.push_back(Scope[i]->getNameOrAsOperand());
+    }
+
+    for (unsigned i=0; i < Props.Props.size(); ++i) {
+      expr_vector List(Ctx);
+      for (unsigned j = 0; j < Scope.size(); ++j)
+        List.push_back(
+            AllRelations[i](ScopeVars[j]) == Ctx.bool_val(Props.Props[i].Set->contains(Scope[j])));
+      LLVM_DEBUG({
+        for (auto const &E : List)
+          dbgs() << E.to_string() << ", ";
+        dbgs() << "\n";
+      });
+      Slv.add(List);
+    }
+
+    // product of ScopeVars and CSRVars
+    expr_vector Pairs(Ctx);
+    std::vector<int> Weights;
+    for (auto A : Vars)
+      for (auto B : ScopeVars) {
+        expr_vector AllRels(Ctx);
+        for (auto const &Rel : AllRelations)
+          AllRels.push_back(Rel(A) == Rel(B));
+        AllRels.push_back(EQUAL[Ctx.int_val(B)] == Ctx.int_val(A));
+        Pairs.push_back(mk_and(AllRels));
+        Weights.push_back(1);
+      }
+    LLVM_DEBUG({
+      for (auto const &E : Pairs)
+        dbgs() << E.to_string() << "\n";
+    });
+
+
+    Slv.add(pbeq(Pairs, Weights.data(), CARE));
+
+    expr s0 = Ctx.int_const("s0");
+    expr s1 = Ctx.int_const("s1");
+    int LB = ScopeVars.front();
+    int UB = ScopeVars.back();
+    Slv.add(forall(s0, s1, implies(LB <= s0 && s0 <= UB && LB <= s1 && s1 <= UB && EQUAL[s0] == EQUAL[s1], s0 == s1)));
+
+    auto Res = Slv.check();
+    if (Res == z3::sat) {
+      Model = Slv.get_model();
+      LLVM_DEBUG({
+        dbgs() << Model.to_string() << "\n";
+        for (unsigned i=0; i < CARE; ++i)
+          dbgs() << Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).to_string() << " ";
+        dbgs() << "\n";
+        for (unsigned i=0; i < CARE; ++i) {
+          dbgs() << "(" << AllNames[i + Vars.size()] << ", " << (i + Vars.size()) << ") -> " << "(" << AllNames[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()] << ", " << Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64() << ")\n";
+        }
+      });
+      return true;
+    }
+    std::stringstream S;
+    S << Res;
+    LLVM_DEBUG(dbgs() << "[REV] Format Check for " << FormatName << " failed: " << S.str() << "\n");
+    return false;
+  }
+
+  virtual func_decl makeMatrix(NameMapTy &NameMap) = 0;
+  virtual void makeIndexProperties(expr_vector &Properties, NameMapTy &Ins) = 0;
+  virtual expr makeNumberRows(NameMapTy &NameMap) = 0;
+  virtual expr makeNumberNonZero(NameMapTy &NameMap) = 0;
+
+  bool checkEquality(Value *LiveOut, Function &F, DominatorTree &DT) {
+    NameMapTy NameMap;
+    for (unsigned i=0; i < CARE; ++i)
+      NameMap[AllNames[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]] = Scope[i];
+
+
+    nnz = makeNumberNonZero(NameMap);
+    // make CSR
+//    expr_vector Args(Ctx);
+//    for (unsigned i =0; i < CARE; ++i) {
+//      LLVM_DEBUG(dbgs() << (i + Vars.size()) << " -> " << Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64() << ", ");
+//      Args.push_back(Converter.FromVal(
+//          Scope[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]));
+//    }
+
+    func_decl Matrix = makeMatrix(NameMap);
+    expr_vector IdxProperties(Ctx);
+    makeIndexProperties(IdxProperties, NameMap);
+
+    SmallPtrSet<Value *, 10> ScopeSet;
+    for (auto *V : Scope) ScopeSet.insert(V);
+    for (unsigned i = 0; i < CARE; ++i) ScopeSet.erase(Scope[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]);
+    Value *Y = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LiveOut))->getPointerOperand();
+    ScopeSet.erase(Y);
+    if (ScopeSet.size() != 1)
+      llvm_unreachable("Not all args were mapped to a storage format.");
+    expr_vector GemvArgs(Ctx);
+    GemvArgs.push_back(Converter.FromVal(Y)); // y
+    GemvArgs.push_back(Converter.FromVal(*ScopeSet.begin())); // x
+
+    func_decl Gemv = MkGEMV(Ctx, Matrix, GemvArgs);
+
+    expr_vector SpMVArgs(Ctx);
+    for (auto *V : Scope)
+      SpMVArgs.push_back(Converter.FromVal(V));
+
+    std::vector<expr> GemvParams = {Ctx.int_val(0), makeNumberRows(NameMap)-1, Ctx.int_val(0), m};
+
+    // base cases
+    bool BaseCase = true;
+    std::vector<std::vector<unsigned>> Bases = {{1,1}, {1,2}, {2,1}, {2,2}};
+    for (auto &Base : Bases) {
+      Slv.reset();
+      Slv.add(IdxProperties);
+      Slv.add(makeNumberRows(NameMap) == Ctx.int_val(Base[0]));
+      Slv.add(m == Ctx.int_val(Base[1]));
+      Slv.add(Gemv(GemvParams.size(), GemvParams.data()) != InputKernel(SpMVArgs));
+      auto Res = Slv.check();
+      if (Res != z3::unsat) {
+        BaseCase = false;
+//        LLVM_DEBUG({
+          z3::model BaseModel = Slv.get_model();
+          int64_t _n = BaseModel.eval(n).as_int64();
+          int64_t _m = BaseModel.eval(m).as_int64();
+          int64_t _nnz = BaseModel.eval(makeNumberNonZero(NameMap)).as_int64();
+          dbgs() << "n = " << _n << ", m = " << _m << ", nnz = " << _nnz << "\n";
+          unsigned I;
+          for (I=0; I < _n; ++I) {
+            for (unsigned J=0; J < _m; ++J) {
+              dbgs() << BaseModel.eval(Matrix(Ctx.int_val(I), Ctx.int_val(J))).as_int64() << " ";
+            }
+            dbgs() << "| " << BaseModel.eval(Converter.FromVal(*ScopeSet.begin())[Ctx.int_val(I)]).as_int64();
+            if (I == _n / 2)
+              dbgs() << " = ";
+            else
+              dbgs() << "   ";
+            dbgs() << " " << BaseModel.eval(Converter.FromVal(Y)[Ctx.int_val(I)]).as_int64() << "\n";
+          }
+          for (; I < _m; ++I) {
+            for (unsigned Pad=0; Pad < (_m*2 + 7); ++Pad) dbgs() << " ";
+            dbgs() << BaseModel.eval(Converter.FromVal(Y)[Ctx.int_val(I)]).as_int64() << "\n";
+          }
+          dbgs() << "GEMV\tInputKernel\n";
+          for (I=0; I < _m; ++I) {
+            dbgs() << BaseModel.eval(Gemv(GemvParams.size(), GemvParams.data())[Ctx.int_val(I)]).as_int64() << "\t\t";
+            dbgs() << BaseModel.eval(InputKernel(SpMVArgs)[Ctx.int_val(I)]).as_int64() << "\n";
+          }
+//        });
+        break;
+      }
+    }
+
+    if (!BaseCase) {
+      LLVM_DEBUG(dbgs() << "[REV] BaseCase failed\n");
+      return false;
+    }
+
+    // inductive step
+    Slv.reset();
+    expr n = Converter.FromVal(NameMap["n"]);
+    expr rptr = Converter.FromVal(NameMap["rowPtr"]);
+    expr val = Converter.FromVal(NameMap["val"]);
+    Slv.add(IdxProperties);
+    Slv.add(n > 2);
+    Slv.add(m > 2);
+
+    SmallVector<std::pair<const BasicBlock*, const BasicBlock*>> Cycles;
+    FindFunctionBackedges(F, Cycles);
+    SSA2Func NoLoopSpMV(Ctx, &DT, &Converter, LiveOut);
+    auto StraightLine = NoLoopSpMV.straightlineFromFunction(&F, &Cycles);
+    expr DummyRptr = Ctx.constant("DummyRptr", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+    expr DummyCol = Ctx.constant("DummyCol", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+    expr DummyVal = Ctx.constant("DummyVal", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+
+    // case 1: new elem is zero
+    Slv.add(DummyRptr[Ctx.int_val(0)] == nnz);
+    Slv.add(DummyRptr[Ctx.int_val(1)] == nnz);
+    Slv.add(DummyCol[Ctx.int_val(0)] == 0);
+    Slv.add(DummyVal[Ctx.int_val(0)] == 0);
+    std::vector<expr> StraightlineArgs = {
+        Converter.FromVal(NameMap["n"]),
+        DummyRptr,
+        DummyCol,
+        DummyVal,
+        Converter.FromVal(*ScopeSet.begin()),
+        Converter.FromVal(Y)
+    };
+    std::vector<expr> GemvIndParams = {Ctx.int_val(0), makeNumberRows(NameMap)-1, Ctx.int_val(0), m};
+    func_decl GemvNoLoop = MkGEMVNoLoop(Ctx, DummyVal, GemvArgs);
+    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+    auto Case1 = Slv.check();
+    if (Case1 != z3::unsat) {
+      std::stringstream S;
+      S << Case1;
+      LLVM_DEBUG(dbgs() << "[REV] Case1 failed: " << S.str() << "\n");
+      return false;
+    }
+
+    Slv.reset(); // Case (2)
+    Slv.add(IdxProperties);
+    Slv.add(n > 2);
+    Slv.add(m > 2);
+    Slv.add(DummyRptr[Ctx.int_val(0)] == 0);
+    Slv.add(DummyRptr[Ctx.int_val(1)] == 1);
+    Slv.add(DummyCol[Ctx.int_val(0)] == 0);
+    Slv.add(DummyVal[Ctx.int_val(0)] != 0);
+    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+    auto Case2 = Slv.check();
+    if (Case2 != z3::unsat) {
+      std::stringstream S;
+      S << Case2;
+      LLVM_DEBUG(dbgs() << "[REV] Case2 failed: " << S.str() << "\n");
+      return false;
+    }
+
+    Slv.reset(); // Case (3) new col element
+    Slv.add(IdxProperties);
+    Slv.add(n > 2);
+    Slv.add(m > 2);
+    Slv.add(DummyRptr[Ctx.int_val(0)] == 0);
+    Slv.add(DummyRptr[Ctx.int_val(1)] == 0);
+    //    Slv.add(DummyCol[Ctx.int_val(0)] == m);
+    Slv.add(DummyVal[Ctx.int_val(0)] == 0);
+    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+    auto Case3 = Slv.check();
+    if (Case3 != z3::unsat) {
+      std::stringstream S;
+      S << Case3;
+      LLVM_DEBUG(dbgs() << "[REV] Case3 failed: " << S.str() << "\n");
+      return false;
+    }
+
+    Slv.reset(); // Case (4) new col element
+    Slv.add(IdxProperties);
+    Slv.add(n > 2);
+    Slv.add(m > 2);
+    Slv.add(DummyRptr[Ctx.int_val(0)] == m);
+    Slv.add(DummyRptr[Ctx.int_val(1)] == m + 1);
+    Slv.add(DummyCol[m] == m);
+    Slv.add(DummyVal[m] != 0);
+    std::vector<expr> GemvIndParams2 = {Ctx.int_val(0), Ctx.int_val(1), m, m+1};
+    Slv.add(GemvNoLoop(GemvIndParams2.size(), GemvIndParams2.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+    auto Case4 = Slv.check();
+    if (Case4 != z3::unsat) {
+      std::stringstream S;
+      S << Case4;
+      LLVM_DEBUG(dbgs() << "[REV] Case4 failed: " << S.str() << "\n");
+      return false;
+    }
+
+    return true;
+  }
+
+
+//private:
+  std::string FormatName;
+  std::vector<unsigned> Vars;
+  std::vector<std::string> Names;
+  unsigned CARE; // num vars we care about
+  MapTy Map;
+  std::vector<std::string> AllNames;
+  std::vector<SmallSet<unsigned, 5>> Sets;
+  Properties &Props;
+  z3::expr EQUAL;
+  const std::vector<Value *> &Scope;
+  z3::context &Ctx;
+  z3::solver &Slv;
+  MakeZ3 &Converter;
+  func_decl InputKernel;
+  z3::expr n;
+  z3::expr m;
+  z3::expr nnz;
+  z3::model Model;
+};
+
+class CSRFormat : public Format {
+public:
+  CSRFormat(Properties &Props,
+            z3::context &Ctx,
+            const std::vector<Value *> &Scope,
+            z3::solver &Slv,
+            MakeZ3 &Converter,
+            func_decl InputKernel)
+      : Format(Props, Ctx, Scope, Slv, Converter, InputKernel) {
+    FormatName = "CSR";
+    CARE = 4;
+    Names.push_back("n");
+    Names.push_back("rowPtr");
+    Names.push_back("col");
+    Names.push_back("val");
+    for (unsigned i=0; i < CARE; ++i) {
+      Vars.push_back(i);
+      Map[Names[i].c_str()] = Vars[i];
+    }
+    AllNames.resize(Vars.size());
+    for (unsigned i=0; i < CARE; ++i)
+      AllNames[i] = Names[i];
+
+    Sets.resize(Props.Props.size());
+    for (unsigned i=0; i < Props.Props.size(); ++i) {
+      auto &P = Props.Props[i];
+      if (P.Name == "readonly") {
+        Sets[i].insert(Map["rowPtr"]);
+        Sets[i].insert(Map["col"]);
+        Sets[i].insert(Map["val"]);
+      } else if (P.Name == "int") {
+        Sets[i].insert(Map["n"]);
+      } else if (P.Name == "array") {
+        Sets[i].insert(Map["rowPtr"]);
+        Sets[i].insert(Map["col"]);
+        Sets[i].insert(Map["val"]);
+      } else if (P.Name == "as_address") {
+        Sets[i].insert(Map["rowPtr"]);
+        Sets[i].insert(Map["col"]);
+      } else if (P.Name == "direct_access") {
+        Sets[i].insert(Map["rowPtr"]);
+        Sets[i].insert(Map["col"]);
+        Sets[i].insert(Map["val"]);
+      } else if (P.Name == "loop_bounds") {
+        Sets[i].insert(Map["rowPtr"]);
+      }
+    }
+  }
+
+  func_decl makeMatrix(NameMapTy &NameMap) override {
+    expr rptr = Converter.FromVal(NameMap["rowPtr"]);
+    expr col = Converter.FromVal(NameMap["col"]);
+    expr val = Converter.FromVal(NameMap["val"]);
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr t = Ctx.int_const("t");
+    expr_vector Args(Ctx);
+    Args.push_back(n);
+    Args.push_back(m);
+    func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
+    Ctx.recdef(A, Args, ite(exists(t, rptr[n] <= t && t < rptr[n+1] && col[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
+    return A;
+  }
+
+  void makeIndexProperties(expr_vector &Properties, NameMapTy &Ins) override {
+    assert(Properties.size() == 0);
+    expr n = Converter.FromVal(Ins["n"]);
+    expr rptr = Converter.FromVal(Ins["rowPtr"]);
+    expr col = Converter.FromVal(Ins["col"]);
+    expr val = Converter.FromVal(Ins["val"]);
+    expr s = Ctx.int_const("s");
+    expr t = Ctx.int_const("t");
+    Properties.push_back(nnz > 0);
+    // monotonicty
+    Properties.push_back(forall(s, implies(0 <= s && s <= n, rptr[s] <= rptr[s+1] && rptr[s] >= 0)));
+    // pmonotonicity
+    Properties.push_back(forall(s, implies(0 <= s && s < n, forall(t, implies(rptr[s] <= t && t < rptr[s+1], col[t] < col[t+1])))));
+    // extra constraints
+    Properties.push_back(forall(s, implies(0 <= s && s < nnz, col[s] >= 0 && col[s] < m)));
+    Properties.push_back(forall(s, implies(0 <= s && s < nnz, val[s] == 1)));
+
+    Properties.push_back(rptr[Ctx.int_val(0)] == 0);
+    Properties.push_back(rptr[n] == nnz);
+    Properties.push_back(nnz <= n * m);
+    return;
+  }
+
+  expr makeNumberRows(NameMapTy &NameMap) override {
+    return Converter.FromVal(NameMap["n"]);
+  }
+
+  expr makeNumberNonZero(NameMapTy &NameMap) override {
+    return nnz;
+  }
+
+};
+
+class COOFormat : public Format {
+public:
+  COOFormat(Properties &Props,
+         z3::context &Ctx,
+         const std::vector<Value *> &Scope,
+         z3::solver &Slv,
+         MakeZ3 &Converter,
+         func_decl InputKernel)
+      : Format(Props, Ctx, Scope, Slv, Converter, InputKernel) {
+    FormatName = "COO";
+    CARE = 4;
+    Names.push_back("nz");
+    Names.push_back("rowind");
+    Names.push_back("colind");
+    Names.push_back("val");
+    for (unsigned i=0; i < CARE; ++i) {
+      Vars.push_back(i);
+      Map[Names[i].c_str()] = Vars[i];
+    }
+    AllNames.resize(Vars.size());
+    for (unsigned i=0; i < CARE; ++i)
+      AllNames[i] = Names[i];
+
+    Sets.resize(Props.Props.size());
+    for (unsigned i=0; i < Props.Props.size(); ++i) {
+      auto &P = Props.Props[i];
+      if (P.Name == "readonly") {
+        Sets[i].insert(Map["val"]);
+        Sets[i].insert(Map["colind"]);
+        Sets[i].insert(Map["rowind"]);
+      } else if (P.Name == "int") {
+        Sets[i].insert(Map["nz"]);
+      } else if (P.Name == "array") {
+        Sets[i].insert(Map["rowind"]);
+        Sets[i].insert(Map["colind"]);
+        Sets[i].insert(Map["val"]);
+      } else if (P.Name == "as_address") {
+        Sets[i].insert(Map["rowind"]);
+        Sets[i].insert(Map["colind"]);
+      } else if (P.Name == "direct_access") {
+        Sets[i].insert(Map["rowind"]);
+        Sets[i].insert(Map["colind"]);
+        Sets[i].insert(Map["val"]);
+      } else if (P.Name == "loop_bounds") {
+//        Sets[i].insert(Map["rowPtr"]);
+      }
+    }
+  }
+
+  func_decl makeMatrix(NameMapTy &NameMap) override {
+    expr rowind = Converter.FromVal(NameMap["rowind"]);
+    expr colind = Converter.FromVal(NameMap["colind"]);
+    expr val = Converter.FromVal(NameMap["val"]);
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr t = Ctx.int_const("t");
+    expr_vector Args(Ctx);
+    Args.push_back(n);
+    Args.push_back(m);
+    func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
+    Ctx.recdef(A, Args, ite(exists(t, rowind[t] == n && colind[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
+    return A;
+  }
+
+  void makeIndexProperties(expr_vector &Properties, NameMapTy &Ins) override {
+    expr nnz = Converter.FromVal(Ins["nz"]);
+    expr rowind = Converter.FromVal(Ins["rowind"]);
+    expr colind = Converter.FromVal(Ins["colind"]);
+    expr val = Converter.FromVal(Ins["val"]);
+    expr s = Ctx.int_const("s");
+    expr t = Ctx.int_const("t");
+
+    Properties.push_back(nnz > 0);
+    Properties.push_back(nnz <= makeNumberRows(Ins) * m);
+    Properties.push_back(forall(s, implies(0 <= s && s < nnz, val[s] == 1)));
+    // TODO incomplete
+  }
+
+  expr makeNumberRows(NameMapTy &NameMap) override { return n; }
+  expr makeNumberNonZero(NameMapTy &NameMap) override {
+    return Converter.FromVal(NameMap["nz"]);
+  }
+
+};
+
 //static Loop *PropsCodegen(expr_vector const &Props) {
 //  for (auto const &Prop : Props) {
 //    if (Prop.is_app()) {
@@ -1106,11 +1682,14 @@ public:
 
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
+  if(!EnableLifting)
+    return PreservedAnalyses::all();
+
   LLVM_DEBUG(dbgs() << F.getName() << "\n");
 
   // TODO replace with better legality analysis
-  if (F.getName() != "spMV_Mul_csr")
-    return PreservedAnalyses::all();
+//  if (F.getName() != "spMV_Mul_csr")
+//    return PreservedAnalyses::all();
 
   auto start = high_resolution_clock::now();
 
@@ -1167,7 +1746,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   solver Slv(Ctx);
   Slv.set("smtlib2_log", "spmv_csr_test_log.smt2");
-//  Slv.set("timeout", 1000u);
+  Slv.set("timeout", 2000u);
 //  Value *N = F.getArg(0);
 //  Value *Rptr = F.getArg(1);
 //  Value *Col = F.getArg(2);
@@ -1253,309 +1832,113 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       }
   });
 
-  func_decl_vector AllRelations(Ctx);
-  for (unsigned i=0; i < Props.Props.size(); ++i)
-    AllRelations.push_back(Ctx.function(Props.Props[i].Name.c_str(), Ctx.int_sort(), Ctx.bool_sort()));
-
-  std::vector<std::string> AllNames;
-
-  // Now add the CSR vars
-  std::vector<unsigned> CSRVars;
-  std::vector<std::string> CSRNames = {"n", "rowPtr", "col", "val"};
-  unsigned CSR_CARE = 4;
-  for (unsigned i = 0; i < CSR_CARE; ++i) CSRVars.push_back(i);
-  DenseMap<StringRef, unsigned > CSRMap;
-  CSRMap[CSRNames[0].c_str()] = CSRVars[0];
-  CSRMap[CSRNames[1].c_str()] = CSRVars[1];
-  CSRMap[CSRNames[2].c_str()] = CSRVars[2];
-  CSRMap[CSRNames[3].c_str()] = CSRVars[3];
-  AllNames.resize(CSRVars.size());
-  AllNames[0] = CSRNames[0];
-  AllNames[1] = CSRNames[1];
-  AllNames[2] = CSRNames[2];
-  AllNames[3] = CSRNames[3];
-  std::vector<SmallSet<unsigned, 5>> CSRSets;
-  CSRSets.resize(Props.Props.size());
-  for (unsigned i=0; i < Props.Props.size(); ++i) {
-    auto &P = Props.Props[i];
-    if (P.Name == "readonly") {
-      CSRSets[i].insert(CSRMap["rowPtr"]);
-      CSRSets[i].insert(CSRMap["col"]);
-      CSRSets[i].insert(CSRMap["val"]);
-    } else if (P.Name == "int") {
-      CSRSets[i].insert(CSRMap["n"]);
-    } else if (P.Name == "array") {
-      CSRSets[i].insert(CSRMap["rowPtr"]);
-      CSRSets[i].insert(CSRMap["col"]);
-      CSRSets[i].insert(CSRMap["val"]);
-    } else if (P.Name == "as_address") {
-      CSRSets[i].insert(CSRMap["rowPtr"]);
-      CSRSets[i].insert(CSRMap["col"]);
-    } else if (P.Name == "direct_access") {
-      CSRSets[i].insert(CSRMap["rowPtr"]);
-      CSRSets[i].insert(CSRMap["col"]);
-      CSRSets[i].insert(CSRMap["val"]);
-    } else if (P.Name == "loop_bounds") {
-      CSRSets[i].insert(CSRMap["rowPtr"]);
+  CSRFormat CSR_F(Props, Ctx, Scope, Slv, Converter, Translate[&F.getEntryBlock()]);
+  COOFormat COO_F(Props, Ctx, Scope, Slv, Converter, Translate[&F.getEntryBlock()]);
+  bool Res = false;
+  Format *ValidFormat = nullptr;
+  std::vector<Format *> FormatList = {
+      &CSR_F,
+      &COO_F
+  };
+  for (auto *Cur : FormatList) {
+    if(Cur->validateMapping()) {
+      if (Res)
+        llvm_unreachable("[REV] Multiple valid formats!");
+      Res = true;
+      ValidFormat = Cur;
     }
-
-    expr_vector List(Ctx);
-    for (unsigned j = 0; j < CSRVars.size(); ++j)
-      List.push_back(
-          AllRelations[i](CSRVars[j]) == Ctx.bool_val(CSRSets[i].contains(CSRVars[j])));
-
-    LLVM_DEBUG({
-      for (auto const &E : List)
-        dbgs() << E.to_string() << ", ";
-      dbgs() << "\n";
-    });
-
-    Slv.add(List);
   }
 
-  // make mapping for scope args
-  std::vector<unsigned> ScopeVars;
-
-  for (unsigned i = 0; i < Scope.size(); ++i) {
-    ScopeVars.push_back(i + CSRVars.size());
-    AllNames.push_back(Scope[i]->getNameOrAsOperand());
+  if (!Res) {
+    LLVM_DEBUG(dbgs() << "[REV] No viable format mappings found\n");
+    return PreservedAnalyses::all();
   }
 
-  for (unsigned i=0; i < Props.Props.size(); ++i) {
-    expr_vector List(Ctx);
-    for (unsigned j = 0; j < Scope.size(); ++j)
-      List.push_back(
-          AllRelations[i](ScopeVars[j]) == Ctx.bool_val(Props.Props[i].Set->contains(Scope[j])));
-    LLVM_DEBUG({
-      for (auto const &E : List)
-        dbgs() << E.to_string() << ", ";
-      dbgs() << "\n";
-    });
-    Slv.add(List);
-  }
+  // Now test every possible kernel
 
-  expr EQUAL = Ctx.constant("EQUAL", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
+//  auto model = Slv.get_model();
 
-  // product of ScopeVars and CSRVars
-  expr_vector Pairs(Ctx);
-  std::vector<int> Weights;
-  for (auto A : CSRVars)
-    for (auto B : ScopeVars) {
-      expr_vector AllRels(Ctx);
-      for (auto const &Rel : AllRelations)
-        AllRels.push_back(implies(Rel(A), Rel(B)));
-      AllRels.push_back(EQUAL[Ctx.int_val(B)] == Ctx.int_val(A));
-      Pairs.push_back(mk_and(AllRels));
-      Weights.push_back(1);
-    }
-  LLVM_DEBUG({
-    for (auto const &E : Pairs)
-      dbgs() << E.to_string() << "\n";
-  });
-
-
-  Slv.add(pbeq(Pairs, Weights.data(), CSR_CARE));
-
-  expr s0 = Ctx.int_const("s0");
-  expr s1 = Ctx.int_const("s1");
-  int LB = ScopeVars.front();
-  int UB = ScopeVars.back();
-  Slv.add(forall(s0, s1, implies(LB <= s0 && s0 <= UB && LB <= s1 && s1 <= UB && EQUAL[s0] == EQUAL[s1], s0 == s1)));
-
-  auto Res = Slv.check();
-  if (Res == z3::sat) {
-    auto model = Slv.get_model();
-    LLVM_DEBUG({
-      dbgs() << model.to_string() << "\n";
-      for (unsigned i=0; i < CSR_CARE; ++i)
-        dbgs() << model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).to_string() << " ";
-      dbgs() << "\n";
-      for (unsigned i=0; i < CSR_CARE; ++i) {
-        dbgs() << AllNames[ScopeVars[i]] << " -> " << AllNames[model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).as_int64()] << "\n";
-      }
-    });
-
-    DenseMap<StringRef, Value* > Str2Val;
-    for (unsigned i=0; i < CSR_CARE; ++i)
-      Str2Val[AllNames[ScopeVars[i]]] = Scope[model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).as_int64()];
-
-
-    Slv.reset();
-
-    // make CSR
-    expr_vector CSRArgs(Ctx);
-    for (unsigned i =0; i < CSR_CARE; ++i)
-      CSRArgs.push_back(Converter.FromVal(Scope[model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).as_int64()]));
-
-    func_decl CSR = MkCSR(Ctx, CSRArgs);
-    expr_vector IdxProperties = MkCSRIdxProperties(Ctx, CSRArgs, m, nnz);
-
-    SmallPtrSet<Value *, 10> ScopeSet;
-    for (auto *V : Scope) ScopeSet.insert(V);
-    for (unsigned i = 0; i < CSR_CARE; ++i) ScopeSet.erase(Scope[model.eval(EQUAL[Ctx.int_val(ScopeVars[i])]).as_int64()]);
-    Value *Y = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LiveOut))->getPointerOperand();
-    ScopeSet.erase(Y);
-    if (ScopeSet.size() != 1)
-      llvm_unreachable("Not all args were mapped to a storage format.");
-    expr_vector GemvArgs(Ctx);
-    GemvArgs.push_back(Converter.FromVal(Y)); // y
-    GemvArgs.push_back(Converter.FromVal(*ScopeSet.begin())); // x
-
-    func_decl Gemv = MkGEMV(Ctx, CSR, GemvArgs);
-
-    expr_vector SpMVArgs(Ctx);
-    for (auto *V : Scope)
-      SpMVArgs.push_back(Converter.FromVal(V));
-
-    std::vector<expr> GemvParams = {Ctx.int_val(0), CSRArgs[0]-1, Ctx.int_val(0), m};
-
-    // base cases
-    bool BaseCase = true;
-    std::vector<std::vector<unsigned>> Bases = {{1,1}, {1,2}, {2,1}, {2,2}};
-    for (auto &Base : Bases) {
-      Slv.reset();
-      Slv.add(IdxProperties);
-      Slv.add(CSRArgs[0] == Ctx.int_val(Base[0]));
-      Slv.add(m == Ctx.int_val(Base[1]));
-      Slv.add(Gemv(GemvParams.size(), GemvParams.data()) != Translate[&F.getEntryBlock()](SpMVArgs));
-      auto Res = Slv.check();
-      if (Res == z3::sat) {
-        BaseCase = false;
-        break;
-      }
-    }
-    // inductive step
-    Slv.reset();
-    Slv.add(IdxProperties);
-    Slv.add(CSRArgs[0] > 2);
-    Slv.add(m > 2);
-    SpMVArgs[0] = s0; // TODO clean this up
-    Slv.add(forall(s0, implies(0 <= s0 && s0 < CSRArgs[0]-1, Gemv(GemvParams.size(), GemvParams.data()) == Translate[&F.getEntryBlock()](SpMVArgs))));
-
-    expr n = Converter.FromVal(Str2Val["n"]);
-    expr rptr = Converter.FromVal(Str2Val["rowPtr"]);
-    expr val = Converter.FromVal(Str2Val["val"]);
-
-    expr A = Ctx.constant("A", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
-    std::unique_ptr<Module> CSRModule;
-    SSA2Func CSRIR = ParseInputFile("csr_opt.ll", "CSR", F.getContext(), SE, Ctx, Converter, CSRModule);
-    std::vector<expr> CsrArgs = {
-        Converter.FromVal(Str2Val["n"]),
-        m,
-        A,
-        Converter.FromVal(Str2Val["rowPtr"]),
-        Converter.FromVal(Str2Val["col"]),
-        Converter.FromVal(Str2Val["val"]),
-    };
-    expr Compressed = CSRIR[CSRModule->getFunction("CSR")](CsrArgs.size(), CsrArgs.data());
-    expr output_vals = CSRIR.getNth(0)(Compressed);
-    expr output_cols = CSRIR.getNth(1)(Compressed);
-    expr output_rptr = CSRIR.getNth(2)(Compressed);
-
-    std::vector<expr> SpmvDotArgs = {Converter.FromVal(Str2Val["n"]), output_rptr, output_cols, output_vals, Converter.FromVal(Str2Val["x"]), Converter.FromVal(Str2Val["y"])};
-//    std::vector<expr> GemvDotArgs = {Converter.FromVal(Str2Val["n"]), m, Converter.FromVal(Str2Val["y"]), A, Converter.FromVal(Str2Val["x"])};
-    std::vector<expr> GemvDotArgs = {n-1, n, Ctx.int_val(0), Ctx.int_val(1)};
-    // case 1
-    Slv.add(A[(n+1)*m + 0] == 0);
-    Slv.add(val[rptr[n+2]] == 0);
-    Slv.add(Gemv(GemvDotArgs.size(), GemvDotArgs.data()) != Translate[&F.getEntryBlock()](SpMVArgs)); // TODO incomplete
-
-//    std::vector<expr> GemvIndParams = {CSRArgs[0]-2, CSRArgs[0]-1, m-1, m};
-//    // collect all the loop indvars + upper bounds
-//    // make sure every indvar == upper bound - 1
-//    DenseMap<PHINode*, Value*> PhiMap;
-//    for (auto *L : LN.getLoops()) {
-//      auto Bounds = L->getBounds(SE);
-//      auto &UpperBound = Bounds->getFinalIVValue();
-//      auto *IndVar = L->getInductionVariable(SE);
-//      PhiMap[IndVar] = BinaryOperator::CreateSub(&UpperBound, Bounds->getStepValue(), "sub");
+//  LLVM_DEBUG({
+//    dbgs() << model.to_string() << "\n";
+//    for (unsigned i=0; i < CurFormat.CARE; ++i)
+//      dbgs() << model.eval(CurFormat.EQUAL[Ctx.int_val(i + CurFormat.Vars.size())]).to_string() << " ";
+//    dbgs() << "\n";
+//    for (unsigned i=0; i < CurFormat.CARE; ++i) {
+//      dbgs() << CurFormat.AllNames[i + CurFormat.Vars.size()] << " -> " << CurFormat.AllNames[model.eval(CurFormat.EQUAL[Ctx.int_val(i + CurFormat.Vars.size())]).as_int64()] << "\n";
 //    }
-//    SSA2Func NoLoopSpMV(Ctx, &DT, &Converter, LiveOut);
-//    auto StraightLine = NoLoopSpMV.straightlineFromFunction(&F, &PhiMap);
-//    Slv.add(Gemv(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(SpMVArgs));
-////    Slv.add(StraightLine(SpMVArgs) != StraightLine(SpMVArgs));
-//
-//    for (auto &Elem : PhiMap)
-//      Elem.getSecond()->deleteValue();
+//  });
 
+  bool IsEqual = ValidFormat->checkEquality(LiveOut, F, DT);
 
-    auto Equiv = Slv.check();
-    if (BaseCase && Equiv == z3::unsat) {
-      LLVM_DEBUG({
-          dbgs() << "mapping found\n";
-          dbgs() << "Mapping: \n";
-          dbgs() << "Input program = GEMV\n";
-          dbgs() << "Storage Format = CSR\n";
-      });
+  if (IsEqual) {
+    LLVM_DEBUG({
+        dbgs() << "[REV] mapping found\n";
+        dbgs() << "Mapping: \n";
+        dbgs() << "Input program = GEMV\n";
+        dbgs() << "Storage Format = CSR\n";
+    });
 
-      // now actually modify the IR
+    // now actually modify the IR
 
-      // cmp1 = @call(my_special_function)
-      // br i8 cmp1 (exit block), (entry block)
+    // cmp1 = @call(my_special_function)
+    // br i8 cmp1 (exit block), (entry block)
 
-      BasicBlock *OldEntry = &F.getEntryBlock();
-      IRBuilder<> Builder(C);
-      BasicBlock *NewEntry = BasicBlock::Create(C, "rev.entry", &F, &F.getEntryBlock());
-      BasicBlock *NewExit = BasicBlock::Create(C, "rev.exit", &F);
-      Builder.SetInsertPoint(NewExit);
-      Builder.CreateRetVoid();
+    BasicBlock *OldEntry = &F.getEntryBlock();
+    IRBuilder<> Builder(C);
+    BasicBlock *NewEntry = BasicBlock::Create(C, "rev.entry", &F, &F.getEntryBlock());
+    BasicBlock *NewExit = BasicBlock::Create(C, "rev.exit", &F);
+    Builder.SetInsertPoint(NewExit);
+    Builder.CreateRetVoid();
 
-      Builder.SetInsertPoint(NewEntry);
+    Builder.SetInsertPoint(NewEntry);
 
-      SmallVector<Type *> ArgTypes;
-      for (auto *V : Scope) ArgTypes.push_back(V->getType());
+    SmallVector<Type *> ArgTypes;
+    for (auto *V : Scope) ArgTypes.push_back(V->getType());
 
-      auto *FType = FunctionType::get(Type::getInt8Ty(C), ArgTypes, false);
-      auto FHandle = F.getParent()->getOrInsertFunction("SPMV_CSR_D", FType);
-      Value *CallResult = Builder.CreateCall(FHandle, Scope, "dsl.call");
-      Value *CmpResult = Builder.CreateICmpEQ(CallResult, ConstantInt::get(Type::getInt8Ty(C), 1), "rt.check");
-      Builder.CreateCondBr(CmpResult, NewExit, OldEntry);
+    auto *FType = FunctionType::get(Type::getInt8Ty(C), ArgTypes, false);
+    auto FHandle = F.getParent()->getOrInsertFunction("SPMV_CSR_D", FType);
+    Value *CallResult = Builder.CreateCall(FHandle, Scope, "dsl.call");
+    Value *CmpResult = Builder.CreateICmpEQ(CallResult, ConstantInt::get(Type::getInt8Ty(C), 1), "rt.check");
+    Builder.CreateCondBr(CmpResult, NewExit, OldEntry);
 
-      LLVM_DEBUG(dbgs() << *F.getParent());
-      // TODO only abandon the analyses we changed
-      return PreservedAnalyses::none();
+    LLVM_DEBUG(dbgs() << *F.getParent());
+    // TODO only abandon the analyses we changed
+    return PreservedAnalyses::none();
 
-    } else if (!BaseCase || Equiv == z3::sat) {
-      LLVM_DEBUG(dbgs() << "[REV] Kernel is not GEMV.\n");
-      auto Model = Slv.get_model();
-      dbgs() << Model.to_string() << "\n";
-      // print A, vals, rptr, col
-      auto SpmvOutput = Translate[&F.getEntryBlock()](SpMVArgs);
-      auto GemvOutput = Gemv(CSRArgs[0]-1);
-      LLVM_DEBUG({
-        dbgs() << "\n\nrowPtr: ";
-        for (int i=0; i < Model.eval(nnz).as_int64(); ++i)
-          dbgs() << Model.eval(CSRArgs[1][Ctx.int_val(i)]).to_string() << " ";
-        dbgs() << "\n\ncol: ";
-        for (int i=0; i < Model.eval(m).as_int64(); ++i)
-          dbgs() << Model.eval(CSRArgs[2][Ctx.int_val(i)]).to_string() << " ";
-        dbgs() << "\n\nval: ";
-        for (int i=0; i < Model.eval(nnz).as_int64(); ++i)
-          dbgs() << Model.eval(CSRArgs[3][Ctx.int_val(i)]).to_string() << " ";
-        dbgs() << "\n\nx: ";
-        for (int i=0; i < Model.eval(m).as_int64(); ++i)
-          dbgs() << Model.eval(GemvArgs[1][Ctx.int_val(i)]).to_string() << " ";
-        dbgs() << "\n\ny: ";
-        for (int i=0; i < Model.eval(m).as_int64(); ++i)
-          dbgs() << Model.eval(GemvArgs[0][Ctx.int_val(i)]).to_string() << " ";
-
-        dbgs() << "\n\n\nspmv: ";
-        for (int i=0; i < Model.eval(CSRArgs[0]).as_int64(); ++i)
-          dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
-
-        dbgs() << "\ngemv: ";
-        for (int i=0; i < Model.eval(CSRArgs[0]).as_int64(); ++i)
-          dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
-      });
-
-    } else {
-      LLVM_DEBUG(dbgs() << Equiv << "\n");
-    }
-  } else if (Res == z3::unsat) {
-    LLVM_DEBUG(dbgs() << "no parameter mapping found for CSR.\n");
-  } else {
-    LLVM_DEBUG(dbgs() << "storage mapping result is unknown.\n");
   }
+
+  LLVM_DEBUG(dbgs() << "[REV] Kernel is not GEMV.\n");
+//    auto Model = Slv.get_model();
+//    dbgs() << Model.to_string() << "\n";
+//    // print A, vals, rptr, col
+//    auto SpmvOutput = Translate[&F.getEntryBlock()](SpMVArgs);
+//    auto GemvOutput = Gemv(CSRArgs[0]-1);
+//    LLVM_DEBUG({
+//      dbgs() << "\n\nrowPtr: ";
+//      for (int i=0; i < Model.eval(nnz).as_int64(); ++i)
+//        dbgs() << Model.eval(CSRArgs[1][Ctx.int_val(i)]).to_string() << " ";
+//      dbgs() << "\n\ncol: ";
+//      for (int i=0; i < Model.eval(m).as_int64(); ++i)
+//        dbgs() << Model.eval(CSRArgs[2][Ctx.int_val(i)]).to_string() << " ";
+//      dbgs() << "\n\nval: ";
+//      for (int i=0; i < Model.eval(nnz).as_int64(); ++i)
+//        dbgs() << Model.eval(CSRArgs[3][Ctx.int_val(i)]).to_string() << " ";
+//      dbgs() << "\n\nx: ";
+//      for (int i=0; i < Model.eval(m).as_int64(); ++i)
+//        dbgs() << Model.eval(GemvArgs[1][Ctx.int_val(i)]).to_string() << " ";
+//      dbgs() << "\n\ny: ";
+//      for (int i=0; i < Model.eval(m).as_int64(); ++i)
+//        dbgs() << Model.eval(GemvArgs[0][Ctx.int_val(i)]).to_string() << " ";
+//
+//      dbgs() << "\n\n\nspmv: ";
+//      for (int i=0; i < Model.eval(CSRArgs[0]).as_int64(); ++i)
+//        dbgs() << Model.eval(SpmvOutput[Ctx.int_val(i)]).to_string() << " ";
+//
+//      dbgs() << "\ngemv: ";
+//      for (int i=0; i < Model.eval(CSRArgs[0]).as_int64(); ++i)
+//        dbgs() << Model.eval(GemvOutput[Ctx.int_val(i)]).to_string() << " ";
+//    });
+
 
 //  auto IntVec = Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort());
 //  sort_vector MatSorts(Ctx);

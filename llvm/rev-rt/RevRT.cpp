@@ -37,8 +37,6 @@ extern "C" {
       return false;
 
     if (BACKEND == MKL) {
-      mkl_set_dynamic(0);
-      mkl_set_num_threads(12);
       sparse_matrix_t A;
       mkl_sparse_d_create_csr(&A, SPARSE_INDEX_BASE_ZERO, rowPtr[n]/n, n, rowPtr, rowPtr,
                               col, val);
