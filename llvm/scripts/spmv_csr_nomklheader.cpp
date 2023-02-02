@@ -1,7 +1,6 @@
 #include "csr.h"
 #include <cstring>
-#include "omp.h"
-#include "mkl.h"
+
 
 extern "C" {
 void spMV_Mul_csr(int n,
@@ -13,7 +12,7 @@ void spMV_Mul_csr(int n,
   int i, k;
   double sum;
 
-  for (i = 0; i < n % 4; i++) {
+  for (i = 0; i < n; i++) {
     sum = 0.0;
     for (k = rowPtr[i]; k < rowPtr[i + 1]; k++) {
       sum += val[k] * x[col[k]];
@@ -60,22 +59,22 @@ void spMV_Mul_csr(int n,
 //}
 //
 //
-//void spMV_Mul_csr_addsingle_withbranch(int n, int* rowPtr, int* col, double* val, double *x, double *y)
-//{
-//  int i,k;
-//  double sum;
-//
-//  if (n > 0) {
-//    i = 0;
-//    sum = 0.0;
-//    if (rowPtr[i] < rowPtr[i+1]) {
-//      k = rowPtr[i];
-//      sum += val[k]*x[col[k]];
-//    }
-//    y[i] = sum;
-//    i = i + 1;
-//  }
-//}
+void spMV_Mul_csr_addsingle_withbranch(int n, int* rowPtr, int* col, double* val, double *x, double *y)
+{
+  int i,k;
+  double sum;
+
+  if (n > 0) {
+    i = 0;
+    sum = 0.0;
+    if (rowPtr[i] < rowPtr[i+1]) {
+      k = rowPtr[i];
+      sum += val[k]*x[col[k]];
+    }
+    y[i] = sum;
+    i = i + 1;
+  }
+}
 
 // how does val relate to A?
 // val ~ A
@@ -124,22 +123,18 @@ int main(int argc, char *argv[]) {
   memset(y, 0, sizeof(double) * csr->m);
 
 
-  mkl_set_dynamic(0);
-  mkl_set_num_threads(12); // TODO should be dynamic?
-  omp_set_num_threads(12); // TODO should be dynamic?
-
   int trials = 200;
   double begin, end;
 
   // warmup
   spMV_Mul_csr(csr->m, csr->row_ptr, csr->col_ind, csr->val, x, y);
 
-  begin = omp_get_wtime();
-  for (unsigned i = 0; i < trials; ++i) {
-    spMV_Mul_csr(csr->m, csr->row_ptr, csr->col_ind, csr->val, x, y);
-  }
-  end = omp_get_wtime();
-
-  printf("%f\n", (end-begin)/trials);
+//  begin = omp_get_wtime();
+//  for (unsigned i = 0; i < trials; ++i) {
+//    spMV_Mul_csr(csr->m, csr->row_ptr, csr->col_ind, csr->val, x, y);
+//  }
+//  end = omp_get_wtime();
+//
+//  printf("%f\n", (end-begin)/trials);
 
 }

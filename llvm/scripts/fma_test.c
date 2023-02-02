@@ -1,3 +1,13 @@
-//
-// Created by avery on 01/12/22.
-//
+int fma_test(int base, int arg1, int base2, int arg2) {
+  int a = 0;
+
+  a = (base + base2) + arg1 * arg2;
+
+  a = a + a;
+
+  return a;
+}
+
+int fma_imp(int a, int b, int c) {
+  return a*b+c;
+}
