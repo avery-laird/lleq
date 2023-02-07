@@ -1269,6 +1269,7 @@ public:
   virtual void makeIndexProperties(expr_vector &Properties, NameMapTy &Ins) = 0;
   virtual expr makeNumberRows(NameMapTy &NameMap) = 0;
   virtual expr makeNumberNonZero(NameMapTy &NameMap) = 0;
+  virtual void printSparseMatrix(NameMapTy &NameMap, z3::model &Model) = 0;
 
   bool checkEquality(Value *LiveOut, Function &F, DominatorTree &DT) {
     NameMapTy NameMap;
@@ -1277,6 +1278,7 @@ public:
 
 
     nnz = makeNumberNonZero(NameMap);
+    n = makeNumberRows(NameMap);
     // make CSR
 //    expr_vector Args(Ctx);
 //    for (unsigned i =0; i < CARE; ++i) {
@@ -1322,10 +1324,17 @@ public:
         BaseCase = false;
 //        LLVM_DEBUG({
           z3::model BaseModel = Slv.get_model();
+          dbgs() << BaseModel.to_string() << "\n-------------------------\n";
           int64_t _n = BaseModel.eval(n).as_int64();
           int64_t _m = BaseModel.eval(m).as_int64();
           int64_t _nnz = BaseModel.eval(makeNumberNonZero(NameMap)).as_int64();
           dbgs() << "n = " << _n << ", m = " << _m << ", nnz = " << _nnz << "\n";
+          printSparseMatrix(NameMap, BaseModel);
+          expr TestVal = Matrix(Ctx.int_val(0), Ctx.int_val(0));
+          std::stringstream M;
+          M << BaseModel.eval(Matrix(Ctx.int_val(0), Ctx.int_val(0)), true) << "\n";
+          dbgs() << M.str();
+
           unsigned I;
           for (I=0; I < _n; ++I) {
             for (unsigned J=0; J < _m; ++J) {
@@ -1570,6 +1579,8 @@ public:
     return nnz;
   }
 
+  void printSparseMatrix(NameMapTy &NameMap, z3::model &Model) override {}
+
 };
 
 class COOFormat : public Format {
@@ -1625,14 +1636,29 @@ public:
     expr rowind = Converter.FromVal(NameMap["rowind"]);
     expr colind = Converter.FromVal(NameMap["colind"]);
     expr val = Converter.FromVal(NameMap["val"]);
-    expr n = Ctx.int_const("n");
-    expr m = Ctx.int_const("m");
+    expr i = Ctx.int_const("i");
+    expr j = Ctx.int_const("j");
     expr t = Ctx.int_const("t");
     expr_vector Args(Ctx);
-    Args.push_back(n);
-    Args.push_back(m);
+    Args.push_back(i);
+    Args.push_back(j);
     func_decl A = Ctx.recfun("A", Ctx.int_sort(), Ctx.int_sort(), val[Ctx.int_val(0)].get_sort());
-    Ctx.recdef(A, Args, ite(exists(t, rowind[t] == n && colind[t] == m), Ctx.int_val(1), Ctx.int_val(0)));
+    std::vector<z3::sort> SearchSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+    func_decl Search = Ctx.recfun("Search", SearchSorts.size(), SearchSorts.data(), val[Ctx.int_val(0)].get_sort());
+    expr_vector  SearchArgs(Ctx);
+    SearchArgs.push_back(t);
+    SearchArgs.push_back(i);
+    SearchArgs.push_back(j);
+//    Ctx.recdef(Search, SearchArgs, ite(t+1 < nnz,
+//                                       Search(t+1, i, j),
+//                                       ))
+//    Ctx.recdef(A, Args, ite(exists(t,
+//                                   0 <= t && t < nnz &&
+////                                   0 <= i && i < makeNumberRows(NameMap) &&
+////                                   0 <= j && j < m &&
+//                                   rowind[t] == i && colind[t] == j),
+//                            Ctx.int_val(1), Ctx.int_val(0)));
+
     return A;
   }
 
@@ -1647,12 +1673,30 @@ public:
     Properties.push_back(nnz > 0);
     Properties.push_back(nnz <= makeNumberRows(Ins) * m);
     Properties.push_back(forall(s, implies(0 <= s && s < nnz, val[s] == 1)));
+    Properties.push_back(forall(s, implies(0 <= s && s < nnz, 0 <= rowind[s] && rowind[s] < n)));
+    Properties.push_back(forall(s, implies(0 <= s && s < nnz, 0 <= colind[s] && colind[s] < m)));
+//    Properties.push_back(forall(s, val[s] == 1));
     // TODO incomplete
   }
 
   expr makeNumberRows(NameMapTy &NameMap) override { return n; }
   expr makeNumberNonZero(NameMapTy &NameMap) override {
     return Converter.FromVal(NameMap["nz"]);
+  }
+
+  void printSparseMatrix(NameMapTy &NameMap, z3::model &Model) override {
+//    LLVM_DEBUG({
+       int64_t nnz = Model.eval(Converter.FromVal(NameMap["nz"])).as_int64();
+       dbgs() << "val\n";
+       for (unsigned i=0; i < nnz; ++i)
+         dbgs() << Model.eval(Converter.FromVal(NameMap["val"])[Ctx.int_val(i)]).as_int64() << " ";
+       dbgs() << "\n";
+       dbgs() << "rowind\tcolind\n";
+       for (unsigned i=0; i < nnz; ++i) {
+         dbgs() << Model.eval(Converter.FromVal(NameMap["rowind"])[Ctx.int_val(i)]).as_int64() << "\t";
+         dbgs() << Model.eval(Converter.FromVal(NameMap["colind"])[Ctx.int_val(i)]).as_int64() << "\n";
+       }
+//    });
   }
 
 };
