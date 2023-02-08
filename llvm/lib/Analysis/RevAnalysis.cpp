@@ -1830,41 +1830,44 @@ public:
       return false;
     }
 
-//    Slv.reset(); // Case (3) new col element
-//    Slv.add(IdxProperties);
-//    Slv.add(n > 2);
-//    Slv.add(m > 2);
-//    Slv.add(DummyRptr[Ctx.int_val(0)] == 0);
-//    Slv.add(DummyRptr[Ctx.int_val(1)] == 0);
-//    //    Slv.add(DummyCol[Ctx.int_val(0)] == m);
+    // TODO this is the same as case (1)
+    Slv.reset(); // Case (3) new col element
+    Slv.add(IdxProperties);
+    Slv.add(n > 2);
+    Slv.add(m > 2);
+    Slv.add(nnz == 0);
+//    Slv.add(DummyRowInd[Ctx.int_val(0)] == 0);
+//    Slv.add(DummyColInd[Ctx.int_val(0)] == m);
 //    Slv.add(DummyVal[Ctx.int_val(0)] == 0);
-//    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
-//    auto Case3 = Slv.check();
-//    if (Case3 != z3::unsat) {
-//      std::stringstream S;
-//      S << Case3;
-//      LLVM_DEBUG(dbgs() << "[REV] Case3 failed: " << S.str() << "\n");
-//      return false;
-//    }
-//
-//    Slv.reset(); // Case (4) new col element
-//    Slv.add(IdxProperties);
-//    Slv.add(n > 2);
-//    Slv.add(m > 2);
-//    Slv.add(DummyRptr[Ctx.int_val(0)] == m);
-//    Slv.add(DummyRptr[Ctx.int_val(1)] == m + 1);
-//    Slv.add(DummyCol[m] == m);
-//    Slv.add(DummyVal[m] != 0);
-//    std::vector<expr> GemvIndParams2 = {Ctx.int_val(0), Ctx.int_val(1), m, m+1};
-//    Slv.add(GemvNoLoop(GemvIndParams2.size(), GemvIndParams2.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
-//    auto Case4 = Slv.check();
-//    if (Case4 != z3::unsat) {
-//      std::stringstream S;
-//      S << Case4;
-//      LLVM_DEBUG(dbgs() << "[REV] Case4 failed: " << S.str() << "\n");
-//      return false;
-//    }
-//
+    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+    auto Case3 = Slv.check();
+    if (Case3 != z3::unsat) {
+      std::stringstream S;
+      S << Case3;
+      LLVM_DEBUG(dbgs() << "[REV] Case3 failed: " << S.str() << "\n");
+      return false;
+    }
+
+    Slv.reset(); // Case (4) new col element
+    Slv.add(IdxProperties);
+    Slv.add(n > 2);
+    Slv.add(m > 2);
+    Slv.add(nnz == 1);
+    Slv.add(DummyRowInd[Ctx.int_val(0)] == 0);
+    Slv.add(DummyColInd[Ctx.int_val(0)] == m);
+    Slv.add(DummyVal[Ctx.int_val(0)] != 0);
+    Slv.add(DummyVal[m] != 0);
+    Slv.add(DummyVal[m] == DummyVal[Ctx.int_val(0)]);
+    std::vector<expr> GemvIndParams4 = {Ctx.int_val(0), n-1, m, m+1};
+    Slv.add(GemvNoLoop(GemvIndParams4.size(), GemvIndParams4.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+    auto Case4 = Slv.check();
+    if (Case4 != z3::unsat) {
+      std::stringstream S;
+      S << Case4;
+      LLVM_DEBUG(dbgs() << "[REV] Case4 failed: " << S.str() << "\n");
+      return false;
+    }
+
     return true;
   }
 
@@ -2088,7 +2091,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         dbgs() << "[REV] mapping found\n";
         dbgs() << "Mapping: \n";
         dbgs() << "Input program = GEMV\n";
-        dbgs() << "Storage Format = CSR\n";
+        dbgs() << "Storage Format = " << ValidFormat->FormatName << "\n";
     });
 
     // now actually modify the IR
