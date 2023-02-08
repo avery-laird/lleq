@@ -2112,7 +2112,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     for (auto *V : Scope) ArgTypes.push_back(V->getType());
 
     auto *FType = FunctionType::get(Type::getInt8Ty(C), ArgTypes, false);
-    auto FHandle = F.getParent()->getOrInsertFunction("SPMV_CSR_D", FType);
+    auto FHandle = F.getParent()->getOrInsertFunction("SPMV_" + ValidFormat->FormatName + "_D", FType);
     Value *CallResult = Builder.CreateCall(FHandle, Scope, "dsl.call");
     Value *CmpResult = Builder.CreateICmpEQ(CallResult, ConstantInt::get(Type::getInt8Ty(C), 1), "rt.check");
     Builder.CreateCondBr(CmpResult, NewExit, OldEntry);
