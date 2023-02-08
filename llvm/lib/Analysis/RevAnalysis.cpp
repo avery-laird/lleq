@@ -1517,7 +1517,7 @@ public:
     }
 
     if (!BaseCase) {
-      LLVM_DEBUG(dbgs() << "[REV] BaseCase failed\n");
+      LLVM_DEBUG(dbgs() << "[REV] BaseCase failed for " << Kern->SparseName << "+" << FormatName << "\n");
       return false;
     }
     return checkInductive(*Matrix, ScopeSet, Y, LiveOut, GemvArgs, F, DT);
