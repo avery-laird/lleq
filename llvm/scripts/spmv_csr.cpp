@@ -13,7 +13,7 @@ void spMV_Mul_csr(int n,
   int i, k;
   double sum;
 
-  for (i = 0; i < n % 4; i++) {
+  for (i = 0; i < n; i++) {
     sum = 0.0;
     for (k = rowPtr[i]; k < rowPtr[i + 1]; k++) {
       sum += val[k] * x[col[k]];
