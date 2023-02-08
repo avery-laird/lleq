@@ -842,107 +842,107 @@ static expr_vector MkCSRIdxProperties(context &Ctx, expr_vector const &Ins, expr
   return Props;
 }
 
-static func_decl MkGEMV(context &Ctx, func_decl &A, expr_vector const &Ins) {
-  expr y = Ins[0];
-  expr x = Ins[1];
-  expr n = Ctx.int_const("n");
-  expr m = Ctx.int_const("m");
-  expr i = Ctx.int_const("i");
-  expr j = Ctx.int_const("j");
-  expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
-
-  ArgsGemv.push_back(i); // lower bound
-  ArgsGemv.push_back(n);
-  ArgsGemv.push_back(j); // lower bound
-  ArgsGemv.push_back(m);
-
-  ArgsDot.push_back(n);
-  ArgsDot.push_back(j); // lower bound
-  ArgsDot.push_back(m);
-
-  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
-  func_decl gemv = Ctx.recfun("gemv", GemvSorts.size(), GemvSorts.data(), y.get_sort());
-  std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
-  func_decl dot = Ctx.recfun("dot", DotSorts.size(), DotSorts.data(), y[Ctx.int_val(0)].get_sort());
-  Ctx.recdef(gemv, ArgsGemv, ite(n < i, y, store(gemv(i, n-1, j, m), n, dot(n, j, m-1))));
-  Ctx.recdef(dot, ArgsDot, ite(m < j, Ctx.int_val(0), dot(n, j, m-1) + A(n, m) * x[m]));
-  return gemv;
-}
-
-static func_decl MkGEMVSum(context &Ctx, func_decl &A, expr_vector const &Ins) {
-  expr y = Ins[0];
-  expr x = Ins[1];
-  expr n = Ctx.int_const("n");
-  expr m = Ctx.int_const("m");
-  expr i = Ctx.int_const("i");
-  expr j = Ctx.int_const("j");
-  expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
-
-  ArgsGemv.push_back(i); // lower bound
-  ArgsGemv.push_back(n);
-  ArgsGemv.push_back(j); // lower bound
-  ArgsGemv.push_back(m);
-
-  ArgsDot.push_back(n);
-  ArgsDot.push_back(j); // lower bound
-  ArgsDot.push_back(m);
-
-  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
-  func_decl gemv = Ctx.recfun("gemv", GemvSorts.size(), GemvSorts.data(), y.get_sort());
-  std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
-  func_decl dot = Ctx.recfun("dot", DotSorts.size(), DotSorts.data(), y[Ctx.int_val(0)].get_sort());
-  Ctx.recdef(gemv, ArgsGemv, ite(n < i, y, store(gemv(i, n-1, j, m), n, gemv(i, n-1, j, m)[n] + dot(n, j, m-1))));
-  Ctx.recdef(dot, ArgsDot, ite(m < j, Ctx.int_val(0), dot(n, j, m-1) + A(n, m) * x[m]));
-  return gemv;
-}
-
-static func_decl MkGEMVNoLoop(context &Ctx, expr &A, expr_vector const &Ins) {
-  expr y = Ins[0];
-  expr x = Ins[1];
-  expr n = Ctx.int_const("n");
-  expr m = Ctx.int_const("m");
-  expr i = Ctx.int_const("i");
-  expr j = Ctx.int_const("j");
-  expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
-
-  ArgsGemv.push_back(i); // lower bound
-  ArgsGemv.push_back(n);
-  ArgsGemv.push_back(j); // lower bound
-  ArgsGemv.push_back(m);
-
-  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
-  func_decl gemv = Ctx.recfun("gemv.noloop", GemvSorts.size(), GemvSorts.data(), y.get_sort());
-  Ctx.recdef(gemv, ArgsGemv, ite(n > i,
-                                 ite(m > j,
-                                     store(y, i, select(store(y, i, 0), i) + A[i*m + j]*x[j]),
-                                     y),
-                                 store(y, i, 0)));
-  return gemv;
-}
-
-static func_decl MkGEMVNoLoopSum(context &Ctx, expr &A, expr_vector const &Ins) {
-  expr y = Ins[0];
-  expr x = Ins[1];
-  expr n = Ctx.int_const("n");
-  expr m = Ctx.int_const("m");
-  expr i = Ctx.int_const("i");
-  expr j = Ctx.int_const("j");
-  expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
-
-  ArgsGemv.push_back(i); // lower bound
-  ArgsGemv.push_back(n);
-  ArgsGemv.push_back(j); // lower bound
-  ArgsGemv.push_back(m);
-
-  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
-  func_decl gemv = Ctx.recfun("gemv.noloop", GemvSorts.size(), GemvSorts.data(), y.get_sort());
-  Ctx.recdef(gemv, ArgsGemv, ite(n > i,
-                                 ite(m > j,
-                                     store(y, i, select(y, i) + A[i*m + j]*x[j]),
-                                     y),
-                                 y));
-  return gemv;
-}
+//static func_decl MkGEMV(context &Ctx, func_decl &A, expr_vector const &Ins) {
+//  expr y = Ins[0];
+//  expr x = Ins[1];
+//  expr n = Ctx.int_const("n");
+//  expr m = Ctx.int_const("m");
+//  expr i = Ctx.int_const("i");
+//  expr j = Ctx.int_const("j");
+//  expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+//
+//  ArgsGemv.push_back(i); // lower bound
+//  ArgsGemv.push_back(n);
+//  ArgsGemv.push_back(j); // lower bound
+//  ArgsGemv.push_back(m);
+//
+//  ArgsDot.push_back(n);
+//  ArgsDot.push_back(j); // lower bound
+//  ArgsDot.push_back(m);
+//
+//  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+//  func_decl gemv = Ctx.recfun("gemv", GemvSorts.size(), GemvSorts.data(), y.get_sort());
+//  std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+//  func_decl dot = Ctx.recfun("dot", DotSorts.size(), DotSorts.data(), y[Ctx.int_val(0)].get_sort());
+//  Ctx.recdef(gemv, ArgsGemv, ite(n < i, y, store(gemv(i, n-1, j, m), n, dot(n, j, m-1))));
+//  Ctx.recdef(dot, ArgsDot, ite(m < j, Ctx.int_val(0), dot(n, j, m-1) + A(n, m) * x[m]));
+//  return gemv;
+//}
+//
+//static func_decl MkGEMVSum(context &Ctx, func_decl &A, expr_vector const &Ins) {
+//  expr y = Ins[0];
+//  expr x = Ins[1];
+//  expr n = Ctx.int_const("n");
+//  expr m = Ctx.int_const("m");
+//  expr i = Ctx.int_const("i");
+//  expr j = Ctx.int_const("j");
+//  expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+//
+//  ArgsGemv.push_back(i); // lower bound
+//  ArgsGemv.push_back(n);
+//  ArgsGemv.push_back(j); // lower bound
+//  ArgsGemv.push_back(m);
+//
+//  ArgsDot.push_back(n);
+//  ArgsDot.push_back(j); // lower bound
+//  ArgsDot.push_back(m);
+//
+//  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+//  func_decl gemv = Ctx.recfun("gemv", GemvSorts.size(), GemvSorts.data(), y.get_sort());
+//  std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+//  func_decl dot = Ctx.recfun("dot", DotSorts.size(), DotSorts.data(), y[Ctx.int_val(0)].get_sort());
+//  Ctx.recdef(gemv, ArgsGemv, ite(n < i, y, store(gemv(i, n-1, j, m), n, gemv(i, n-1, j, m)[n] + dot(n, j, m-1))));
+//  Ctx.recdef(dot, ArgsDot, ite(m < j, Ctx.int_val(0), dot(n, j, m-1) + A(n, m) * x[m]));
+//  return gemv;
+//}
+//
+//static func_decl MkGEMVNoLoop(context &Ctx, expr &A, expr_vector const &Ins) {
+//  expr y = Ins[0];
+//  expr x = Ins[1];
+//  expr n = Ctx.int_const("n");
+//  expr m = Ctx.int_const("m");
+//  expr i = Ctx.int_const("i");
+//  expr j = Ctx.int_const("j");
+//  expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+//
+//  ArgsGemv.push_back(i); // lower bound
+//  ArgsGemv.push_back(n);
+//  ArgsGemv.push_back(j); // lower bound
+//  ArgsGemv.push_back(m);
+//
+//  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+//  func_decl gemv = Ctx.recfun("gemv.noloop", GemvSorts.size(), GemvSorts.data(), y.get_sort());
+//  Ctx.recdef(gemv, ArgsGemv, ite(n > i,
+//                                 ite(m > j,
+//                                     store(y, i, select(store(y, i, 0), i) + A[i*m + j]*x[j]),
+//                                     y),
+//                                 store(y, i, 0)));
+//  return gemv;
+//}
+//
+//static func_decl MkGEMVNoLoopSum(context &Ctx, expr &A, expr_vector const &Ins) {
+//  expr y = Ins[0];
+//  expr x = Ins[1];
+//  expr n = Ctx.int_const("n");
+//  expr m = Ctx.int_const("m");
+//  expr i = Ctx.int_const("i");
+//  expr j = Ctx.int_const("j");
+//  expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+//
+//  ArgsGemv.push_back(i); // lower bound
+//  ArgsGemv.push_back(n);
+//  ArgsGemv.push_back(j); // lower bound
+//  ArgsGemv.push_back(m);
+//
+//  std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+//  func_decl gemv = Ctx.recfun("gemv.noloop", GemvSorts.size(), GemvSorts.data(), y.get_sort());
+//  Ctx.recdef(gemv, ArgsGemv, ite(n > i,
+//                                 ite(m > j,
+//                                     store(y, i, select(y, i) + A[i*m + j]*x[j]),
+//                                     y),
+//                                 y));
+//  return gemv;
+//}
 
 SSA2Func ParseInputFile(StringRef Path, StringRef FunctionName, LLVMContext &Context, ScalarEvolution &SE, context &Ctx, MakeZ3 &Converter, std::unique_ptr<Module> &Module) {
   llvm::SMDiagnostic Err;
@@ -1191,7 +1191,128 @@ public:
   }
 };
 
-class Kernel {};
+class Kernel {
+public:
+  Kernel(std::string Name, std::string SparseName)
+      : Name(Name), SparseName(SparseName) {}
+
+  virtual func_decl makeKernel(context &Ctx, func_decl &A, expr_vector const &Ins) = 0;
+  virtual func_decl makeKernelNoLoop(context &Ctx, expr &A, expr_vector const &Ins) = 0;
+
+  std::string Name;
+  std::string SparseName;
+};
+
+class GEMV : public Kernel {
+public:
+  GEMV() : Kernel("GEMV", "SPMV") {}
+
+  func_decl makeKernel(context &Ctx, func_decl &A, expr_vector const &Ins) override {
+    expr y = Ins[0];
+    expr x = Ins[1];
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr i = Ctx.int_const("i");
+    expr j = Ctx.int_const("j");
+    expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+
+    ArgsGemv.push_back(i); // lower bound
+    ArgsGemv.push_back(n);
+    ArgsGemv.push_back(j); // lower bound
+    ArgsGemv.push_back(m);
+
+    ArgsDot.push_back(n);
+    ArgsDot.push_back(j); // lower bound
+    ArgsDot.push_back(m);
+
+    std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+    func_decl gemv = Ctx.recfun(Name.c_str(), GemvSorts.size(), GemvSorts.data(), y.get_sort());
+    std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+    func_decl dot = Ctx.recfun((Name + ".dot").c_str(), DotSorts.size(), DotSorts.data(), y[Ctx.int_val(0)].get_sort());
+    Ctx.recdef(gemv, ArgsGemv, ite(n < i, y, store(gemv(i, n-1, j, m), n, gemv(i, n-1, j, m)[n] + dot(n, j, m-1))));
+    Ctx.recdef(dot, ArgsDot, ite(m < j, Ctx.int_val(0), dot(n, j, m-1) + A(n, m) * x[m]));
+    return gemv;
+  }
+
+  func_decl makeKernelNoLoop(context &Ctx, expr &A, expr_vector const &Ins) override {
+    expr y = Ins[0];
+    expr x = Ins[1];
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr i = Ctx.int_const("i");
+    expr j = Ctx.int_const("j");
+    expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+
+    ArgsGemv.push_back(i); // lower bound
+    ArgsGemv.push_back(n);
+    ArgsGemv.push_back(j); // lower bound
+    ArgsGemv.push_back(m);
+
+    std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+    func_decl gemv = Ctx.recfun((Name + ".noloop").c_str(), GemvSorts.size(), GemvSorts.data(), y.get_sort());
+    Ctx.recdef(gemv, ArgsGemv, ite(n > i,
+                                   ite(m > j,
+                                       store(y, i, select(y, i) + A[i*m + j]*x[j]),
+                                       y),
+                                   y));
+    return gemv;
+  }
+};
+
+class GEMV_reset : public Kernel {
+public:
+  GEMV_reset() : Kernel("GEMV_reset", "SPMV_reset") {}
+
+  func_decl makeKernel(context &Ctx, func_decl &A, expr_vector const &Ins) override {
+    expr y = Ins[0];
+    expr x = Ins[1];
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr i = Ctx.int_const("i");
+    expr j = Ctx.int_const("j");
+    expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+
+    ArgsGemv.push_back(i); // lower bound
+    ArgsGemv.push_back(n);
+    ArgsGemv.push_back(j); // lower bound
+    ArgsGemv.push_back(m);
+
+    ArgsDot.push_back(n);
+    ArgsDot.push_back(j); // lower bound
+    ArgsDot.push_back(m);
+
+    std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+    func_decl gemv = Ctx.recfun(Name.c_str(), GemvSorts.size(), GemvSorts.data(), y.get_sort());
+    std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+    func_decl dot = Ctx.recfun((Name + ".dot").c_str(), DotSorts.size(), DotSorts.data(), y[Ctx.int_val(0)].get_sort());
+    Ctx.recdef(gemv, ArgsGemv, ite(n < i, y, store(gemv(i, n-1, j, m), n, dot(n, j, m-1))));
+    Ctx.recdef(dot, ArgsDot, ite(m < j, Ctx.int_val(0), dot(n, j, m-1) + A(n, m) * x[m]));
+    return gemv;
+  }
+  func_decl makeKernelNoLoop(context &Ctx, expr &A, expr_vector const &Ins) override {
+    expr y = Ins[0];
+    expr x = Ins[1];
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr i = Ctx.int_const("i");
+    expr j = Ctx.int_const("j");
+    expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+
+    ArgsGemv.push_back(i); // lower bound
+    ArgsGemv.push_back(n);
+    ArgsGemv.push_back(j); // lower bound
+    ArgsGemv.push_back(m);
+
+    std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort(), Ctx.int_sort()};
+    func_decl gemv = Ctx.recfun((Name + ".noloop").c_str(), GemvSorts.size(), GemvSorts.data(), y.get_sort());
+    Ctx.recdef(gemv, ArgsGemv, ite(n > i,
+                                   ite(m > j,
+                                       store(y, i, select(store(y, i, 0), i) + A[i*m + j]*x[j]),
+                                       y),
+                                   store(y, i, 0)));
+    return gemv;
+  }
+};
 
 class Format {
 protected:
@@ -1297,6 +1418,7 @@ public:
           dbgs() << "(" << AllNames[i + Vars.size()] << ", " << (i + Vars.size()) << ") -> " << "(" << AllNames[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()] << ", " << Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64() << ")\n";
         }
       });
+      LLVM_DEBUG(dbgs() << "[REV] Format Check for " << FormatName << " succeeded\n");
       return true;
     }
     std::stringstream S;
@@ -1305,32 +1427,17 @@ public:
     return false;
   }
 
-  virtual func_decl makeMatrix(NameMapTy &NameMap) = 0;
-  virtual void makeIndexProperties(expr_vector &Properties, NameMapTy &Ins) = 0;
-  virtual expr makeNumberRows(NameMapTy &NameMap) = 0;
-  virtual expr makeNumberNonZero(NameMapTy &NameMap) = 0;
-  virtual void printSparseMatrix(NameMapTy &NameMap, z3::model &Model) = 0;
-  virtual bool checkInductive(func_decl const &Matrix, NameMapTy &NameMap, SmallPtrSet<Value *, 10> &ScopeSet, Value *Y, Value *LiveOut, expr_vector &GemvArgs, Function &F, DominatorTree &DT) = 0;
+  virtual func_decl makeMatrix() = 0;
+  virtual void makeIndexProperties(expr_vector &Properties) = 0;
+  virtual expr makeNumberRows() = 0;
+  virtual expr makeNumberNonZero() = 0;
+  virtual void printSparseMatrix(z3::model &Model) = 0;
+  virtual bool checkInductive(func_decl const &Matrix, SmallPtrSet<Value *, 10> &ScopeSet, Value *Y, Value *LiveOut, expr_vector &GemvArgs, Function &F, DominatorTree &DT) = 0;
 
   bool checkEquality(Value *LiveOut, Function &F, DominatorTree &DT) {
-    NameMapTy NameMap;
-    for (unsigned i=0; i < CARE; ++i)
-      NameMap[AllNames[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]] = Scope[i];
 
-
-    nnz = makeNumberNonZero(NameMap);
-    n = makeNumberRows(NameMap);
-    // make CSR
-    //    expr_vector Args(Ctx);
-    //    for (unsigned i =0; i < CARE; ++i) {
-    //      LLVM_DEBUG(dbgs() << (i + Vars.size()) << " -> " << Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64() << ", ");
-    //      Args.push_back(Converter.FromVal(
-    //          Scope[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]));
-    //    }
-
-    func_decl Matrix = makeMatrix(NameMap);
     expr_vector IdxProperties(Ctx);
-    makeIndexProperties(IdxProperties, NameMap);
+    makeIndexProperties(IdxProperties);
 
     SmallPtrSet<Value *, 10> ScopeSet;
     for (auto *V : Scope) ScopeSet.insert(V);
@@ -1344,13 +1451,13 @@ public:
     GemvArgs.push_back(Converter.FromVal(*ScopeSet.begin())); // x
 
     // TODO fix this
-    func_decl Gemv = MkGEMVSum(Ctx, Matrix, GemvArgs);
+    func_decl Gemv = Kern->makeKernel(Ctx, *Matrix, GemvArgs);
 
     expr_vector SpMVArgs(Ctx);
     for (auto *V : Scope)
       SpMVArgs.push_back(Converter.FromVal(V));
 
-    std::vector<expr> GemvParams = {Ctx.int_val(0), makeNumberRows(NameMap)-1, Ctx.int_val(0), m};
+    std::vector<expr> GemvParams = {Ctx.int_val(0), makeNumberRows()-1, Ctx.int_val(0), m};
 
     // base cases
     bool BaseCase = true;
@@ -1364,7 +1471,7 @@ public:
     for (auto &Base : Bases) {
       Slv.reset();
       Slv.add(IdxProperties);
-      Slv.add(makeNumberRows(NameMap) == Ctx.int_val(Base[0]));
+      Slv.add(makeNumberRows() == Ctx.int_val(Base[0]));
       Slv.add(m == Ctx.int_val(Base[1]));
       Slv.add(Gemv(GemvParams.size(), GemvParams.data()) != InputKernel(SpMVArgs));
       auto Res = Slv.check();
@@ -1375,18 +1482,18 @@ public:
         dbgs() << BaseModel.to_string() << "\n-------------------------\n";
         int64_t _n = BaseModel.eval(n).as_int64();
         int64_t _m = BaseModel.eval(m).as_int64();
-        int64_t _nnz = BaseModel.eval(makeNumberNonZero(NameMap)).as_int64();
+        int64_t _nnz = BaseModel.eval(makeNumberNonZero()).as_int64();
         dbgs() << "n = " << _n << ", m = " << _m << ", nnz = " << _nnz << "\n";
-        printSparseMatrix(NameMap, BaseModel);
-        expr TestVal = Matrix(Ctx.int_val(0), Ctx.int_val(0));
+        printSparseMatrix(BaseModel);
+        expr TestVal = (*Matrix)(Ctx.int_val(0), Ctx.int_val(0));
         std::stringstream M;
-        M << BaseModel.eval(Matrix(Ctx.int_val(0), Ctx.int_val(0)), true) << "\n";
+        M << BaseModel.eval((*Matrix)(Ctx.int_val(0), Ctx.int_val(0)), true) << "\n";
         dbgs() << M.str();
 
         unsigned I;
         for (I=0; I < _n; ++I) {
           for (unsigned J=0; J < _m; ++J) {
-            dbgs() << BaseModel.eval(Matrix(Ctx.int_val(I), Ctx.int_val(J))).as_int64() << " ";
+            dbgs() << BaseModel.eval((*Matrix)(Ctx.int_val(I), Ctx.int_val(J))).as_int64() << " ";
           }
           dbgs() << "| " << BaseModel.eval(Converter.FromVal(*ScopeSet.begin())[Ctx.int_val(I)]).as_int64();
           if (I == _n / 2)
@@ -1413,7 +1520,18 @@ public:
       LLVM_DEBUG(dbgs() << "[REV] BaseCase failed\n");
       return false;
     }
-    return checkInductive(Matrix, NameMap, ScopeSet, Y, LiveOut, GemvArgs, F, DT);
+    return checkInductive(*Matrix, ScopeSet, Y, LiveOut, GemvArgs, F, DT);
+  }
+
+  void setKernel(Kernel *K) { Kern = K; }
+  void initEqualityChecking() {
+    for (unsigned i=0; i < CARE; ++i)
+      NameMap[AllNames[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]] = Scope[i];
+    // everything below here uses NameMap
+    nnz = makeNumberNonZero();
+    n = makeNumberRows();
+
+    Matrix = makeMatrix();
   }
 
 
@@ -1436,6 +1554,9 @@ public:
   z3::expr m;
   z3::expr nnz;
   z3::model Model;
+  Kernel *Kern = nullptr;
+  std::optional<func_decl> Matrix;
+  NameMapTy NameMap;
 };
 
 class CSRFormat : public Format {
@@ -1487,7 +1608,7 @@ public:
     }
   }
 
-  func_decl makeMatrix(NameMapTy &NameMap) override {
+  func_decl makeMatrix() override {
     expr rptr = Converter.FromVal(NameMap["rowPtr"]);
     expr col = Converter.FromVal(NameMap["col"]);
     expr val = Converter.FromVal(NameMap["val"]);
@@ -1502,12 +1623,12 @@ public:
     return A;
   }
 
-  void makeIndexProperties(expr_vector &Properties, NameMapTy &Ins) override {
+  void makeIndexProperties(expr_vector &Properties) override {
     assert(Properties.size() == 0);
-    expr n = Converter.FromVal(Ins["n"]);
-    expr rptr = Converter.FromVal(Ins["rowPtr"]);
-    expr col = Converter.FromVal(Ins["col"]);
-    expr val = Converter.FromVal(Ins["val"]);
+    expr n = Converter.FromVal(NameMap["n"]);
+    expr rptr = Converter.FromVal(NameMap["rowPtr"]);
+    expr col = Converter.FromVal(NameMap["col"]);
+    expr val = Converter.FromVal(NameMap["val"]);
     expr s = Ctx.int_const("s");
     expr t = Ctx.int_const("t");
     Properties.push_back(nnz > 0);
@@ -1525,21 +1646,21 @@ public:
     return;
   }
 
-  expr makeNumberRows(NameMapTy &NameMap) override {
+  expr makeNumberRows() override {
     return Converter.FromVal(NameMap["n"]);
   }
 
-  expr makeNumberNonZero(NameMapTy &NameMap) override {
+  expr makeNumberNonZero() override {
     return nnz;
   }
 
-  void printSparseMatrix(NameMapTy &NameMap, z3::model &Model) override {}
+  void printSparseMatrix(z3::model &Model) override {}
 
-  bool checkInductive(func_decl const &Matrix, NameMapTy &NameMap, SmallPtrSet<Value *, 10> &ScopeSet, Value *Y, Value *LiveOut, expr_vector &GemvArgs, Function &F, DominatorTree &DT) override {
-    nnz = makeNumberNonZero(NameMap);
-    n = makeNumberRows(NameMap);
+  bool checkInductive(func_decl const &Matrix, SmallPtrSet<Value *, 10> &ScopeSet, Value *Y, Value *LiveOut, expr_vector &GemvArgs, Function &F, DominatorTree &DT) override {
+    nnz = makeNumberNonZero();
+    n = makeNumberRows();
     expr_vector IdxProperties(Ctx);
-    makeIndexProperties(IdxProperties, NameMap);
+    makeIndexProperties(IdxProperties);
 
     // inductive step
     Slv.reset();
@@ -1572,8 +1693,8 @@ public:
         Converter.FromVal(*ScopeSet.begin()),
         Converter.FromVal(Y)
     };
-    std::vector<expr> GemvIndParams = {Ctx.int_val(0), makeNumberRows(NameMap)-1, Ctx.int_val(0), m};
-    func_decl GemvNoLoop = MkGEMVNoLoop(Ctx, DummyVal, GemvArgs);
+    std::vector<expr> GemvIndParams = {Ctx.int_val(0), makeNumberRows()-1, Ctx.int_val(0), m};
+    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx, DummyVal, GemvArgs);
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case1 = Slv.check();
     if (Case1 != z3::unsat) {
@@ -1689,7 +1810,7 @@ public:
     }
   }
 
-  func_decl makeMatrix(NameMapTy &NameMap) override {
+  func_decl makeMatrix() override {
     expr rowind = Converter.FromVal(NameMap["rowind"]);
     expr colind = Converter.FromVal(NameMap["colind"]);
     expr val = Converter.FromVal(NameMap["val"]);
@@ -1723,17 +1844,17 @@ public:
     return A;
   }
 
-  void makeIndexProperties(expr_vector &Properties, NameMapTy &Ins) override {
-    expr nnz = Converter.FromVal(Ins["nz"]);
-    expr rowind = Converter.FromVal(Ins["rowind"]);
-    expr colind = Converter.FromVal(Ins["colind"]);
-    expr val = Converter.FromVal(Ins["val"]);
+  void makeIndexProperties(expr_vector &Properties) override {
+    expr nnz = Converter.FromVal(NameMap["nz"]);
+    expr rowind = Converter.FromVal(NameMap["rowind"]);
+    expr colind = Converter.FromVal(NameMap["colind"]);
+    expr val = Converter.FromVal(NameMap["val"]);
     expr s = Ctx.int_const("s");
     expr t = Ctx.int_const("t");
 
 
     Properties.push_back(nnz > 0);
-    Properties.push_back(nnz <= makeNumberRows(Ins) * m);
+    Properties.push_back(nnz <= makeNumberRows() * m);
 //    Properties.push_back(forall(s, implies(0 <= s && s < nnz, val[s] == 1)));
     Properties.push_back(forall(s, implies(0 <= s && s < nnz, 0 <= rowind[s] && rowind[s] < n)));
     Properties.push_back(forall(s, implies(0 <= s && s < nnz, 0 <= colind[s] && colind[s] < m)));
@@ -1741,12 +1862,12 @@ public:
     // TODO incomplete
   }
 
-  expr makeNumberRows(NameMapTy &NameMap) override { return n; }
-  expr makeNumberNonZero(NameMapTy &NameMap) override {
+  expr makeNumberRows() override { return n; }
+  expr makeNumberNonZero() override {
     return Converter.FromVal(NameMap["nz"]);
   }
 
-  void printSparseMatrix(NameMapTy &NameMap, z3::model &Model) override {
+  void printSparseMatrix(z3::model &Model) override {
 //    LLVM_DEBUG({
        int64_t nnz = Model.eval(Converter.FromVal(NameMap["nz"])).as_int64();
        dbgs() << "val\n";
@@ -1761,16 +1882,16 @@ public:
 //    });
   }
 
-  bool checkInductive(func_decl const &Matrix, NameMapTy &NameMap, SmallPtrSet<Value *, 10> &ScopeSet, Value *Y, Value *LiveOut, expr_vector &GemvArgs, Function &F, DominatorTree &DT) override {
-    nnz = makeNumberNonZero(NameMap);
-    n = makeNumberRows(NameMap);
+  bool checkInductive(func_decl const &Matrix, SmallPtrSet<Value *, 10> &ScopeSet, Value *Y, Value *LiveOut, expr_vector &GemvArgs, Function &F, DominatorTree &DT) override {
+//    nnz = makeNumberNonZero();
+//    n = makeNumberRows();
     expr_vector IdxProperties(Ctx);
-    makeIndexProperties(IdxProperties, NameMap);
+    makeIndexProperties(IdxProperties);
 
     // inductive step
     Slv.reset();
-    expr n = makeNumberRows(NameMap);
-    expr nnz = makeNumberNonZero(NameMap);
+//    expr n = makeNumberRows();
+//    expr nnz = makeNumberNonZero();
     expr rowind = Converter.FromVal(NameMap["rowind"]);
     expr colind = Converter.FromVal(NameMap["colind"]);
     expr val = Converter.FromVal(NameMap["val"]);
@@ -1795,12 +1916,12 @@ public:
         DummyRowInd,
         DummyColInd,
         DummyVal,
-        makeNumberNonZero(NameMap),
+        makeNumberNonZero(),
         Converter.FromVal(*ScopeSet.begin()),
         Converter.FromVal(Y)
     };
-    std::vector<expr> GemvIndParams = {Ctx.int_val(0), makeNumberRows(NameMap)-1, Ctx.int_val(0), m};
-    func_decl GemvNoLoop = MkGEMVNoLoopSum(Ctx, DummyVal, GemvArgs);
+    std::vector<expr> GemvIndParams = {Ctx.int_val(0), makeNumberRows()-1, Ctx.int_val(0), m};
+    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx, DummyVal, GemvArgs);
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) != StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case1 = Slv.check();
     if (Case1 != z3::unsat) {
@@ -1962,7 +2083,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   solver Slv(Ctx);
   Slv.set("smtlib2_log", "spmv_csr_test_log.smt2");
-//  Slv.set("timeout", 2000u);
+  Slv.set("timeout", 2000u);
 //  Value *N = F.getArg(0);
 //  Value *Rptr = F.getArg(1);
 //  Value *Col = F.getArg(2);
@@ -1979,7 +2100,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 //  Slv.add(n == 2);
 //  expr n = Converter.FromVal(N);
   expr m = Ctx.int_const("m");
-  expr nnz = Ctx.int_const("nnz");
+//  expr nnz = Ctx.int_const("nnz");
 //  expr rptr = Converter.FromVal(Rptr);
 //  expr val = Converter.FromVal(Val);
 //  expr col = Converter.FromVal(Col);
@@ -2084,14 +2205,27 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 //    }
 //  });
 
-  bool IsEqual = ValidFormat->checkEquality(LiveOut, F, DT);
+  ValidFormat->initEqualityChecking();
 
-  if (IsEqual) {
+  GEMV MV;
+  GEMV_reset MV_reset;
+  std::vector<Kernel *> Kernels = {&MV, &MV_reset};
+
+  std::optional<std::pair<Format *, Kernel *>> Result;
+  for (auto *K : Kernels) {
+    ValidFormat->setKernel(K);
+    if (ValidFormat->checkEquality(LiveOut, F, DT)) {
+      assert(!Result.has_value() && "Multiple possible formats!");
+      Result = {ValidFormat, K};
+    }
+  }
+
+  if (Result) {
     LLVM_DEBUG({
         dbgs() << "[REV] mapping found\n";
         dbgs() << "Mapping: \n";
-        dbgs() << "Input program = GEMV\n";
-        dbgs() << "Storage Format = " << ValidFormat->FormatName << "\n";
+        dbgs() << "Input program = " << (*Result).second->Name << "\n";
+        dbgs() << "Storage Format = " << (*Result).first->FormatName << "\n";
     });
 
     // now actually modify the IR
@@ -2112,7 +2246,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     for (auto *V : Scope) ArgTypes.push_back(V->getType());
 
     auto *FType = FunctionType::get(Type::getInt8Ty(C), ArgTypes, false);
-    auto FHandle = F.getParent()->getOrInsertFunction("SPMV_" + ValidFormat->FormatName + "_D", FType);
+    auto FHandle = F.getParent()->getOrInsertFunction((*Result).second->SparseName + "_" + (*Result).first->FormatName + "_D", FType);
     Value *CallResult = Builder.CreateCall(FHandle, Scope, "dsl.call");
     Value *CmpResult = Builder.CreateICmpEQ(CallResult, ConstantInt::get(Type::getInt8Ty(C), 1), "rt.check");
     Builder.CreateCondBr(CmpResult, NewExit, OldEntry);
