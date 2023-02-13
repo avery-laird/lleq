@@ -24,30 +24,26 @@ function(add_function_target filename funcname COMPILER)
     add_custom_target(generate_${funcname}_extracted_ll DEPENDS ${funcname}_extracted.ll)
 
     add_custom_command(
-            OUTPUT ${funcname}_opt.ll
+            OUTPUT ${PROJECT_BINARY_DIR}/bin/${funcname}_opt.ll
             COMMAND ${LD_LIBRARY_PATH} ${OPT} ${OPTFLAGS} ${funcname}_extracted.ll -o ${PROJECT_BINARY_DIR}/bin/${funcname}_opt.ll
             DEPENDS ${funcname}_extracted.ll
                     generate_${funcname}_extracted_ll
             VERBATIM)
-    add_custom_target(generate_${funcname}_opt DEPENDS ${funcname}_opt.ll)
+    add_custom_target(generate_${funcname}_opt DEPENDS ${PROJECT_BINARY_DIR}/bin/${funcname}_opt.ll)
 
     add_custom_command(
-            OUTPUT ${funcname}.png
+            OUTPUT ${PROJECT_BINARY_DIR}/bin/${funcname}.png
             COMMAND dot -Tpng .${funcname}.dot -o ${PROJECT_BINARY_DIR}/bin/${funcname}.png
-            DEPENDS ${funcname}_opt.ll
+            DEPENDS ${PROJECT_BINARY_DIR}/bin/${funcname}_opt.ll
                     generate_${funcname}_opt
             VERBATIM)
-    add_custom_target(generate_${funcname}_png DEPENDS ${funcname}.png)
+    add_custom_target(generate_${funcname}_png DEPENDS ${PROJECT_BINARY_DIR}/bin/${funcname}.png)
 
+    add_dependencies(opt generate_${funcname}_png)
 endfunction()
 
 add_function_target(spmv_ell.c spmv_ell ${PROJECT_BINARY_DIR}/bin/clang)
 add_function_target(spmv_csr_nomklheader.cpp spMV_Mul_csr ${PROJECT_BINARY_DIR}/bin/clang++)
 add_function_target(spmv_coo.c spmv_coo ${PROJECT_BINARY_DIR}/bin/clang)
 add_function_target(spmm_csr.cpp spmm_v2 ${PROJECT_BINARY_DIR}/bin/clang++)
-
-add_dependencies(opt
-        generate_spmv_ell_png
-        generate_spMV_Mul_csr_png
-        generate_spmv_coo_png
-        generate_spmm_v2_png)
+add_function_target(spmm_naive.cpp spmm_naive_csr ${PROJECT_BINARY_DIR}/bin/clang++)
