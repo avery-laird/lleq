@@ -60,8 +60,8 @@ void spmm_v1(INDPREC *csr, VALPREC *csrval) {
 
 /** single layer, single liveout, no relu */
 void spmm_v2(INDPREC *csr, VALPREC *csrval) {
-  std::memset(nextfeat, 0, sizeof(FEATPREC) * crbatch * neuron);
-  std::memset(active, 0, sizeof(INDPREC) * crbatch);
+//  std::memset(nextfeat, 0, sizeof(FEATPREC) * crbatch * neuron);
+//  std::memset(active, 0, sizeof(INDPREC) * crbatch);
 
   for (INDPREC i = 0; i < crbatch; i++) {
     for (INDPREC j = 0; j < neuron; j++) {
