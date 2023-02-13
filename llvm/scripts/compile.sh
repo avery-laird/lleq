@@ -10,6 +10,7 @@ LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ../build/debug/bin/clang -S -emi
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ../build/debug/bin/clang++ -S -emit-llvm -O0 -Xclang -disable-O0-optnone -Xclang -analyzer-config -Xclang ipa=dynamic-bifurcate -I/files/eigen/Eigen test_eigen.cpp -o eigen_all.ll
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ../build/debug/bin/llvm-extract --func _ZN5Eigen8internal30sparse_time_dense_product_implINS_12SparseMatrixIdLi0EiEENS_6MatrixIdLin1ELi1ELi0ELin1ELi1EEES5_dLi0ELb1EE3runERKS3_RKS5_RS5_RKd eigen_all.ll -o eigen_spmv.ll
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ../build/debug/bin/clang++ -S -emit-llvm -O0 -Xclang -disable-O0-optnone spmm_csr.cpp -o spmm_csr.ll
+LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ../build/debug/bin/llvm-extract --func spmm_v2 -o spmm_v2_csr.ll
 
 
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ../build/debug/bin/opt -S -mem2reg -loop-rotate -instcombine -simplifycfg -loop-simplify -lcssa -dot-cfg -dot-dom spmv_csr.ll -o spmv_csr_opt.ll
@@ -22,7 +23,7 @@ LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ../build/debug/bin/opt -S -mem2r
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ../build/debug/bin/opt -S -mem2reg -loop-rotate -instcombine -simplifycfg -loop-simplify -lcssa -dot-cfg -dot-dom fib_demo.ll -o fib_demo_opt.ll
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ../build/debug/bin/opt -S -mem2reg -loop-rotate -instcombine -simplifycfg -loop-simplify -lcssa -dot-cfg -dot-dom csr.ll -o csr_opt.ll
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ../build/debug/bin/opt -S -mem2reg -loop-rotate -instcombine -simplifycfg -loop-simplify -lcssa -inline -dot-cfg -dot-dom eigen_spmv.ll -o eigen_spmv_opt.ll
-LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ../build/debug/bin/opt -S -mem2reg -loop-rotate -instcombine -simplifycfg -loop-simplify -lcssa -dot-cfg -dot-dom spmm_csr.ll -o spmm_csr_opt.ll
+LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib ../build/debug/bin/opt -S -mem2reg -loop-rotate -instcombine -simplifycfg -loop-simplify -lcssa -dot-cfg -dot-dom spmm_v2_csr.ll -o spmm_v2_csr_opt.ll
 
 dot -Tpng .spMV_Mul_csr.dot -o spmv_csr.png
 dot -Tpng .spmv_coo.dot -o spmv_coo.png
