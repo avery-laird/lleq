@@ -215,6 +215,7 @@ public:
       llvm_unreachable("unsupported LLVM type.");
     case Type::TypeID::IntegerTyID:
     case Type::TypeID::DoubleTyID:
+    case Type::TypeID::FloatTyID:
       return ToSort(T);
     case Type::TypeID::PointerTyID:
       // try to find a use that we can infer the type from
@@ -237,9 +238,10 @@ public:
     case Type::TypeID::IntegerTyID:
       return c.int_sort();
     case Type::TypeID::DoubleTyID:
+    case Type::TypeID::FloatTyID:
       // TODO remove this debug
-      Mantissa = APFloat::semanticsPrecision(T->getFltSemantics());
-      Exponent = APFloat::semanticsSizeInBits(T->getFltSemantics()) - Mantissa;
+//      Mantissa = APFloat::semanticsPrecision(T->getFltSemantics());
+//      Exponent = APFloat::semanticsSizeInBits(T->getFltSemantics()) - Mantissa;
       //      return c.fpa_sort(Exponent, Mantissa);
       return c.int_sort();
     }
@@ -279,6 +281,7 @@ protected:
     case Type::TypeID::IntegerTyID:
       return c.int_val(dyn_cast<ConstantInt>(V)->getSExtValue());
     case Type::TypeID::DoubleTyID:
+    case Type::TypeID::FloatTyID:
       // TODO remove this debug hack
       dyn_cast<ConstantFP>(V)->getValue().convertToInteger(
           Result, APFloatBase::rmNearestTiesToEven, &isExact);
@@ -1045,21 +1048,28 @@ public:
         dbgs() << E.to_string() << "\n";
     });
 
-    Slv.add(pbeq(Pairs, Weights.data(), CARE));
-
     expr s0 = Ctx.int_const("s0");
     expr s1 = Ctx.int_const("s1");
     int LB = ScopeVars.front();
     int UB = ScopeVars.back();
+
+    Slv.add(atleast(Pairs, CARE));
+//    for (auto A : Vars) {
+//        Slv.add(exists(s0, LB <= s0 && s0 <= UB && EQUAL[s0] == Ctx.int_val(A)));
+//    }
+
     Slv.add(forall(s0, s1,
                    implies(LB <= s0 && s0 <= UB && LB <= s1 && s1 <= UB &&
                                EQUAL[s0] == EQUAL[s1],
                            s0 == s1)));
+    Slv.add(forall(s0,
+                   implies(Ctx.int_val(Vars.size()) <= s0 && s0 <= Ctx.int_val(Vars.size() + CARE - 1),
+                           0 <= EQUAL[s0] && EQUAL[s0] < Ctx.int_val(Vars.size()))));
 
     auto Res = Slv.check();
     if (Res == z3::sat) {
       Model = Slv.get_model();
-      LLVM_DEBUG({
+//      LLVM_DEBUG({
         dbgs() << Model.to_string() << "\n";
         for (unsigned i = 0; i < CARE; ++i)
           dbgs() << Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).to_string()
@@ -1075,7 +1085,7 @@ public:
                  << Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()
                  << ")\n";
         }
-      });
+//      });
       LLVM_DEBUG(dbgs() << "[REV] Format Check for " << FormatName
                         << " succeeded\n");
       return true;
@@ -1220,8 +1230,7 @@ public:
 
   void initEqualityChecking() {
     for (unsigned i = 0; i < CARE; ++i)
-      NameMap[AllNames[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())])
-                           .as_int64()]] = Scope[i];
+      NameMap[AllNames[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]] = Scope[i];
     // everything below here uses NameMap
     nnz = makeNumberNonZero();
     n = makeNumberRows();

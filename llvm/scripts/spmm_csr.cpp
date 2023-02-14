@@ -58,19 +58,19 @@ void spmm_v1(INDPREC *csr, VALPREC *csrval) {
   }
 }
 
-/** single layer, single liveout, no relu */
-void spmm_v2(INDPREC *csr, VALPREC *csrval) {
+/** single layer, single liveout, no relu, no globals */
+void spmm_v2(INDPREC *csr, VALPREC *csrval, INDPREC crbatch2, INDPREC neuron2, FEATPREC *currfeat2, FEATPREC *nextfeat2) {
 //  std::memset(nextfeat, 0, sizeof(FEATPREC) * crbatch * neuron);
 //  std::memset(active, 0, sizeof(INDPREC) * crbatch);
 
-  for (INDPREC i = 0; i < crbatch; i++) {
-    for (INDPREC j = 0; j < neuron; j++) {
+  for (INDPREC i = 0; i < crbatch2; i++) {
+    for (INDPREC j = 0; j < neuron2; j++) {
       VALPREC result = 0;
       for (INDPREC p = csr[j]; p < csr[j + 1]; p++) {
         const INDPREC k = csr[p];
-        result += csrval[p] * currfeat[i * neuron + k];
+        result += csrval[p] * currfeat2[i * neuron2 + k];
       }
-      nextfeat[i * neuron + j] = result;
+      nextfeat2[i * neuron2 + j] = result;
     }
   }
 }
