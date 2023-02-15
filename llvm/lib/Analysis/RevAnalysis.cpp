@@ -1083,7 +1083,7 @@ public:
           dbgs() << "(" << AllNames[i] << ", "
                  << i << ") -> "
                  << "(";
-          if (Model.eval(EQUAL[Ctx.int_val(i)]).as_int64() >= Vars.size()) {
+          if (Model.eval(EQUAL[Ctx.int_val(i)]).as_int64() >= CARE) {
             dbgs() << "<empty>, ";
           } else {
             dbgs() << AllNames[Model.eval(EQUAL[Ctx.int_val(i)]).as_int64()]
@@ -1236,8 +1236,12 @@ public:
   void setKernel(Kernel *K) { Kern = K; }
 
   void initEqualityChecking() {
-    for (unsigned i = 0; i < CARE; ++i)
-      NameMap[AllNames[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]] = Scope[i];
+    for (unsigned i = 0; i < Scope.size(); ++i) {
+      int Src = Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64();
+      if (Src >= CARE)
+        continue;
+      NameMap[AllNames[Src]] = Scope[i];
+    }
     // everything below here uses NameMap
     nnz = makeNumberNonZero();
     n = makeNumberRows();
