@@ -1054,35 +1054,42 @@ public:
     int UB = ScopeVars.back();
 
     Slv.add(atleast(Pairs, CARE));
-//    for (auto A : Vars) {
-//        Slv.add(exists(s0, LB <= s0 && s0 <= UB && EQUAL[s0] == Ctx.int_val(A)));
-//    }
+//    Slv.add(mk_or(Pairs));
+    for (auto A : Vars) {
+        Slv.add(exists(s0, implies(LB <= s0 && s0 <= UB, EQUAL[s0] == Ctx.int_val(A))));
+    }
 
     Slv.add(forall(s0, s1,
                    implies(LB <= s0 && s0 <= UB && LB <= s1 && s1 <= UB &&
                                EQUAL[s0] == EQUAL[s1],
                            s0 == s1)));
-    Slv.add(forall(s0,
-                   implies(Ctx.int_val(Vars.size()) <= s0 && s0 <= Ctx.int_val(Vars.size() + CARE - 1),
-                           0 <= EQUAL[s0] && EQUAL[s0] < Ctx.int_val(Vars.size()))));
+//    Slv.add(forall(s0,
+//                   implies(Ctx.int_val(Vars.size()) <= s0 && s0 <= Ctx.int_val(Vars.size() + CARE - 1),
+//                           0 <= EQUAL[s0] && EQUAL[s0] < Ctx.int_val(Vars.size()))));
+//    Slv.add(forall(s0,
+//                   implies(LB <= s0 && s0 <= UB,
+//                           0 <= EQUAL[s0] && EQUAL[s0] < Ctx.int_val(Vars.size()))));
 
     auto Res = Slv.check();
     if (Res == z3::sat) {
       Model = Slv.get_model();
 //      LLVM_DEBUG({
         dbgs() << Model.to_string() << "\n";
-        for (unsigned i = 0; i < CARE; ++i)
-          dbgs() << Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).to_string()
+        for (unsigned i = LB; i <= UB; ++i)
+          dbgs() << Model.eval(EQUAL[Ctx.int_val(i)]).to_string()
                  << " ";
         dbgs() << "\n";
-        for (unsigned i = 0; i < CARE; ++i) {
-          dbgs() << "(" << AllNames[i + Vars.size()] << ", "
-                 << (i + Vars.size()) << ") -> "
-                 << "("
-                 << AllNames[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())])
-                                 .as_int64()]
-                 << ", "
-                 << Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()
+        for (unsigned i = LB; i <= UB; ++i) {
+          dbgs() << "(" << AllNames[i] << ", "
+                 << i << ") -> "
+                 << "(";
+          if (Model.eval(EQUAL[Ctx.int_val(i)]).as_int64() >= Vars.size()) {
+            dbgs() << "<empty>, ";
+          } else {
+            dbgs() << AllNames[Model.eval(EQUAL[Ctx.int_val(i)]).as_int64()]
+                   << ", ";
+          }
+          dbgs() << Model.eval(EQUAL[Ctx.int_val(i)]).as_int64()
                  << ")\n";
         }
 //      });
