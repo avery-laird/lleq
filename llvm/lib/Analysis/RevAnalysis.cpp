@@ -1122,9 +1122,12 @@ public:
     SmallPtrSet<Value *, 10> ScopeSet;
     for (auto *V : Scope)
       ScopeSet.insert(V);
-    for (unsigned i = 0; i < CARE; ++i)
-      ScopeSet.erase(
-          Scope[Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64()]);
+    for (unsigned i = Vars.size(); i < Vars.size() + Scope.size(); ++i) {
+      int Image = Model.eval(EQUAL[Ctx.int_val(i)]).as_int64();
+      if (Image >= CARE)
+          continue ;
+      ScopeSet.erase(Scope[i-Vars.size()]); // only remove if a mapping exists
+    }
     Value *Y = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LiveOut))
                    ->getPointerOperand();
     ScopeSet.erase(Y);
