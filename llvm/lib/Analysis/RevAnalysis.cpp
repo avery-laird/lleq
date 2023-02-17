@@ -39,6 +39,7 @@ static cl::opt<bool>
     EnableLifting("enable-lifting", cl::init(true), cl::Hidden,
                   cl::desc("Enable lifting of non-affine kernels."));
 
+class Format;
 
 static void GetLiveIns(Loop *L, SmallPtrSet<Value *, 4> &LiveIns) {
   for (auto *BB : L->getBlocks()) {
@@ -824,10 +825,33 @@ public:
   }
 };
 
-class Kernel {
+class FormatManager {
+  using CacheTy = DenseMap<unsigned, DenseMap<unsigned, std::vector<Format*>>>;
+  CacheTy Cache;
 public:
-  Kernel(std::string Name, std::string SparseName)
-      : Name(Name), SparseName(SparseName) {}
+  enum Compression {
+    SPARSE, DENSE
+  };
+  void registerFormat(Format *F, unsigned Dim, Compression C) {
+    Cache[C][Dim].push_back(F);
+  }
+  std::vector<Format*> getFormat(Compression C, unsigned Dim) {
+    if (Cache[C].empty())
+      return {};
+    return Cache[C][Dim];
+  }
+  std::vector<Format*> getFormat(std::pair<Compression, unsigned> &P) {
+    return getFormat(P.first, P.second);
+  }
+};
+
+class Kernel {
+protected:
+  using CType = FormatManager::Compression;
+  using RequiredFormats = std::vector<std::pair<CType, unsigned>>;
+public:
+  Kernel(std::string Name, std::string SparseName, RequiredFormats F)
+      : Name(Name), SparseName(SparseName), Formats(F) {}
 
   virtual func_decl makeKernel(context &Ctx, func_decl &A,
                                expr_vector const &Ins) = 0;
@@ -836,11 +860,12 @@ public:
 
   std::string Name;
   std::string SparseName;
+  RequiredFormats Formats;
 };
 
 class GEMV : public Kernel {
 public:
-  GEMV() : Kernel("GEMV", "SPMV") {}
+  GEMV() : Kernel("GEMV", "SPMV", {{CType::SPARSE, 2}}) {}
 
   func_decl makeKernel(context &Ctx, func_decl &A,
                        expr_vector const &Ins) override {
@@ -907,7 +932,7 @@ public:
 
 class GEMV_reset : public Kernel {
 public:
-  GEMV_reset() : Kernel("GEMV_reset", "SPMV_reset") {}
+  GEMV_reset() : Kernel("GEMV_reset", "SPMV_reset", {{CType::SPARSE, 2}}) {}
 
   func_decl makeKernel(context &Ctx, func_decl &A,
                        expr_vector const &Ins) override {
@@ -1276,6 +1301,43 @@ public:
   NameMapTy NameMap;
 };
 
+
+class DenseMatFormat : public Format {
+public:
+  DenseMatFormat(Properties &Props, z3::context &Ctx,
+            const std::vector<Value *> &Scope, z3::solver &Slv,
+            MakeZ3 &Converter, func_decl InputKernel)
+      : Format(Props, Ctx, Scope, Slv, Converter, InputKernel) {
+    FormatName = "DenseMat";
+    CARE = 2;
+    Names.push_back("M");
+    Names.push_back("B");
+
+    for (unsigned i = 0; i < CARE; ++i) {
+      Vars.push_back(i);
+      Map[Names[i].c_str()] = Vars[i];
+    }
+    AllNames.resize(Vars.size());
+    for (unsigned i = 0; i < CARE; ++i)
+      AllNames[i] = Names[i];
+
+    Sets.resize(Props.Props.size());
+    for (unsigned i = 0; i < Props.Props.size(); ++i) {
+      auto &P = Props.Props[i];
+      if (P.Name == "readonly") {
+        Sets[i].insert(Map["B"]);
+      } else if (P.Name == "int") {
+        Sets[i].insert(Map["M"]);
+      } else if (P.Name == "array") {
+        Sets[i].insert(Map["B"]);
+      } else if (P.Name == "as_address") {
+      } else if (P.Name == "direct_access") {
+      } else if (P.Name == "loop_bounds") {
+      }
+    }
+  }
+};
+
 class CSRFormat : public Format {
 public:
   CSRFormat(Properties &Props, z3::context &Ctx,
@@ -1288,6 +1350,7 @@ public:
     Names.push_back("rowPtr");
     Names.push_back("col");
     Names.push_back("val");
+
     for (unsigned i = 0; i < CARE; ++i) {
       Vars.push_back(i);
       Map[Names[i].c_str()] = Vars[i];
@@ -1722,6 +1785,7 @@ public:
   }
 };
 
+
 PreservedAnalyses RevAnalysisPass::run(Function &F,
                                        FunctionAnalysisManager &AM) {
   if (!EnableLifting)
@@ -1786,34 +1850,61 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     }
   });
 
-  CSRFormat CSR_F(Props, Ctx, Scope, Slv, Converter,
+  CSRFormat CSRF(Props, Ctx, Scope, Slv, Converter,
                   Translate[&F.getEntryBlock()]);
-  COOFormat COO_F(Props, Ctx, Scope, Slv, Converter,
+  COOFormat COOF(Props, Ctx, Scope, Slv, Converter,
                   Translate[&F.getEntryBlock()]);
-  bool Res = false;
-  Format *ValidFormat = nullptr;
-  std::vector<Format *> FormatList = {&CSR_F, &COO_F};
-  for (auto *Cur : FormatList) {
-    if (Cur->validateMapping()) {
-      if (Res)
-        llvm_unreachable("[REV] Multiple valid formats!");
-      Res = true;
-      ValidFormat = Cur;
+
+  FormatManager FM;
+  FM.registerFormat(&CSRF, 2, FormatManager::SPARSE);
+  FM.registerFormat(&COOF, 2, FormatManager::SPARSE);
+  GEMV MV;
+  GEMV_reset MVReset;
+  std::vector<Kernel *> Kernels = {&MV, &MVReset};
+
+
+  Kernel *InferredKernel = nullptr;
+  std::vector<Format *> Formats;
+  for (auto *K : Kernels) {
+    Formats.clear();
+    for (auto &E : K->Formats) {
+      for (auto *Format : FM.getFormat(E)) {
+        if (Format->validateMapping()) {
+            Formats.push_back(Format);
+            break; // TODO make sure the format is the only possible one
+        }
+      }
+    }
+    if (Formats.size() == K->Formats.size()) {
+      InferredKernel = K;
+      break;
     }
   }
 
-  if (!Res) {
+
+//  bool Res = false;
+//  Format *ValidFormat = nullptr;
+//  std::vector<Format *> FormatList = {&CSRF, &COOF};
+//  for (auto *Cur : FormatList) {
+//    if (Cur->validateMapping()) {
+//      if (Res)
+//        llvm_unreachable("[REV] Multiple valid formats!");
+//      Res = true;
+//      ValidFormat = Cur;
+//    }
+//  }
+
+  if (!InferredKernel) {
     LLVM_DEBUG(dbgs() << "[REV] No viable format mappings found\n");
     return PreservedAnalyses::all();
   }
 
+  // TODO quick hack for spmv
+  Format *ValidFormat = Formats[0];
+
   // Now test every possible kernel
 
   ValidFormat->initEqualityChecking();
-
-  GEMV MV;
-  GEMV_reset MV_reset;
-  std::vector<Kernel *> Kernels = {&MV, &MV_reset};
 
   std::optional<std::pair<Format *, Kernel *>> Result;
   for (auto *K : Kernels) {
