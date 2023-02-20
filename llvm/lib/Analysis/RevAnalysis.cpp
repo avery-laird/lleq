@@ -983,9 +983,9 @@ public:
   virtual expr makeNumberRows() = 0;
   virtual expr makeNumberNonZero() = 0;
   virtual void printSparseMatrix(z3::model &Model) = 0;
-  virtual bool checkInductive(SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
-                              Value *LiveOut, expr_vector &GemvArgs,
-                              Function &F, DominatorTree &DT) = 0;
+//  virtual bool checkInductive(SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
+//                              Value *LiveOut, expr_vector &GemvArgs,
+//                              Function &F, DominatorTree &DT) = 0;
 
   //  bool checkEquality(Value *LiveOut, Function &F, DominatorTree &DT) {
   //
@@ -1338,7 +1338,7 @@ public:
     expr_vector IdxProperties(Ctx);
     A->makeIndexProperties(IdxProperties);
     // I know there's 4 cases
-    for (unsigned Case = 0; Case < 1; ++Case) {
+    for (unsigned Case = 0; Case < 4; ++Case) {
       Slv.reset();
       Assertions.resize(0);
       A->getCase(Assertions, Case);
@@ -1355,7 +1355,6 @@ public:
         return false;
       }
     }
-
     return true;
   }
 
@@ -1561,11 +1560,11 @@ public:
 
   void printSparseMatrix(z3::model &Model) override {}
 
-  bool checkInductive(SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
-                      Value *LiveOut, expr_vector &GemvArgs, Function &F,
-                      DominatorTree &DT) override {
-    return true;
-  }
+//  bool checkInductive(SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
+//                      Value *LiveOut, expr_vector &GemvArgs, Function &F,
+//                      DominatorTree &DT) override {
+//    return true;
+//  }
 
   void getCase(expr_vector &Assertions, unsigned Case) override {
     llvm_unreachable("unimplemented!");
@@ -1692,132 +1691,43 @@ public:
 
   void printSparseMatrix(z3::model &Model) override {}
 
-  bool checkInductive(SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
-                      Value *LiveOut, expr_vector &GemvArgs, Function &F,
-                      DominatorTree &DT) override {
 
-    expr_vector IdxProperties(Ctx);
-    makeIndexProperties(IdxProperties);
-
-    // inductive step
-    Slv.reset();
-    expr rptr = Converter.FromVal(NameMap["rowPtr"]);
-    expr val = Converter.FromVal(NameMap["val"]);
-    Slv.add(IdxProperties);
-    Slv.add(n > 2);
-    Slv.add(m > 2);
-
-    SmallVector<std::pair<const BasicBlock *, const BasicBlock *>> Cycles;
-    FindFunctionBackedges(F, Cycles);
-    SSA2Func NoLoopSpMV(Ctx, &DT, &Converter, LiveOut);
-    auto StraightLine = NoLoopSpMV.straightlineFromFunction(&F, &Cycles);
-
-    expr DummyRptr = Ctx.constant(
-        "DummyRptr", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
-    expr DummyCol = Ctx.constant(
-        "DummyCol", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
-    expr DummyVal = Ctx.constant(
-        "DummyVal", Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()));
-
-    // case 1: new elem is zero
-    Slv.add(DummyRptr[Ctx.int_val(0)] == nnz);
-    Slv.add(DummyRptr[Ctx.int_val(1)] == nnz);
-    Slv.add(DummyCol[Ctx.int_val(0)] == 0);
-    Slv.add(DummyVal[Ctx.int_val(0)] == 0);
-    std::vector<expr> StraightlineArgs = {Converter.FromVal(NameMap["n"]),
-                                          DummyRptr,
-                                          DummyCol,
-                                          DummyVal,
-                                          Converter.FromVal(*ScopeSet.begin()),
-                                          Converter.FromVal(Y)};
-    std::vector<expr> GemvIndParams = {Ctx.int_val(0), makeNumberRows() - 1,
-                                       Ctx.int_val(0), m};
-    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx);
-    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) !=
-            StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
-    auto Case1 = Slv.check();
-    if (Case1 != z3::unsat) {
-      std::stringstream S;
-      S << Case1;
-      LLVM_DEBUG(dbgs() << "[REV] Case1 failed: " << S.str() << "\n");
-      return false;
-    }
-
-    Slv.reset(); // Case (2)
-    Slv.add(IdxProperties);
-    Slv.add(n > 2);
-    Slv.add(m > 2);
-    Slv.add(DummyRptr[Ctx.int_val(0)] == 0);
-    Slv.add(DummyRptr[Ctx.int_val(1)] == 1);
-    Slv.add(DummyCol[Ctx.int_val(0)] == 0);
-    Slv.add(DummyVal[Ctx.int_val(0)] != 0);
-    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) !=
-            StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
-    auto Case2 = Slv.check();
-    if (Case2 != z3::unsat) {
-      std::stringstream S;
-      S << Case2;
-      LLVM_DEBUG(dbgs() << "[REV] Case2 failed: " << S.str() << "\n");
-      return false;
-    }
-
-    Slv.reset(); // Case (3) new col element
-    Slv.add(IdxProperties);
-    Slv.add(n > 2);
-    Slv.add(m > 2);
-    Slv.add(DummyRptr[Ctx.int_val(0)] == 0);
-    Slv.add(DummyRptr[Ctx.int_val(1)] == 0);
-    //    Slv.add(DummyCol[Ctx.int_val(0)] == m);
-    Slv.add(DummyVal[Ctx.int_val(0)] == 0);
-    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) !=
-            StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
-    auto Case3 = Slv.check();
-    if (Case3 != z3::unsat) {
-      std::stringstream S;
-      S << Case3;
-      LLVM_DEBUG(dbgs() << "[REV] Case3 failed: " << S.str() << "\n");
-      return false;
-    }
-
-    Slv.reset(); // Case (4) new col element
-    Slv.add(IdxProperties);
-    Slv.add(n > 2);
-    Slv.add(m > 2);
-    Slv.add(DummyRptr[Ctx.int_val(0)] == m);
-    Slv.add(DummyRptr[Ctx.int_val(1)] == m + 1);
-    Slv.add(DummyCol[m] == m);
-    Slv.add(DummyVal[m] != 0);
-    std::vector<expr> GemvIndParams2 = {Ctx.int_val(0), Ctx.int_val(1), m,
-                                        m + 1};
-    Slv.add(GemvNoLoop(GemvIndParams2.size(), GemvIndParams2.data()) !=
-            StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
-    auto Case4 = Slv.check();
-    if (Case4 != z3::unsat) {
-      std::stringstream S;
-      S << Case4;
-      LLVM_DEBUG(dbgs() << "[REV] Case4 failed: " << S.str() << "\n");
-      return false;
-    }
-
-    return true;
-  }
-
+  // TODO instead of hardcoded values, make this a symbolic executor
+  //      to get the postcondition of the format implementation
   void getCase(expr_vector &Assertions, unsigned Case) override {
     expr rptr = Converter.FromVal(NameMap["rowPtr"]);
     expr col = Converter.FromVal(NameMap["col"]);
     expr val = Converter.FromVal(NameMap["val"]);
     expr zero = Ctx.int_val(0);
     expr one = Ctx.int_val(1);
+    Assertions.push_back(n > 2);
+    Assertions.push_back(m > 2);
     switch (Case) {
     default:
       llvm_unreachable("unsupported case! CSR only has 4 inductive cases.");
     case 0:
-      Assertions.push_back(n > 2);
-      Assertions.push_back(m > 2);
       Assertions.push_back(rptr[zero] == nnz);
       Assertions.push_back(rptr[one] == nnz);
       Assertions.push_back(col[zero] == zero);
       Assertions.push_back(val[zero] == zero);
+      return;
+    case 1:
+      Assertions.push_back(rptr[zero] == nnz);
+      Assertions.push_back(rptr[one] == nnz + 1);
+      Assertions.push_back(col[zero] == zero);
+      Assertions.push_back(val[zero] != zero);
+      return;
+    case 2:
+      Assertions.push_back(rptr[zero] == m);
+      Assertions.push_back(rptr[one] == m+1);
+      Assertions.push_back(col[m] == m);
+      Assertions.push_back(val[m] == zero);
+      return;
+    case 3:
+      Assertions.push_back(rptr[zero] == m);
+      Assertions.push_back(rptr[one] == m+1);
+      Assertions.push_back(col[m] == m);
+      Assertions.push_back(val[m] != zero);
       return;
     }
   }
@@ -1943,119 +1853,119 @@ public:
     }
   }
 
-  bool checkInductive(SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
-                      Value *LiveOut, expr_vector &GemvArgs, Function &F,
-                      DominatorTree &DT) override {
-
-    expr_vector IdxProperties(Ctx);
-    makeIndexProperties(IdxProperties);
-
-    // inductive step
-    Slv.reset();
-    //    expr n = makeNumberRows();
-    //    expr nnz = makeNumberNonZero();
-    expr rowind = Converter.FromVal(NameMap["rowind"]);
-    expr colind = Converter.FromVal(NameMap["colind"]);
-    expr val = Converter.FromVal(NameMap["val"]);
-    expr t = Ctx.int_const("t");
-    Slv.add(IdxProperties);
-    Slv.add(n > 2);
-    Slv.add(m > 2);
-
-    SmallVector<std::pair<const BasicBlock *, const BasicBlock *>> Cycles;
-    FindFunctionBackedges(F, Cycles);
-    SSA2Func NoLoopSpMV(Ctx, &DT, &Converter, LiveOut);
-    auto StraightLine = NoLoopSpMV.straightlineFromFunction(&F, &Cycles);
-
-    expr DummyRowInd = Ctx.constant("DummyRowInd", rowind.get_sort());
-    expr DummyColInd = Ctx.constant("DummyColInd", colind.get_sort());
-    expr DummyVal = Ctx.constant("DummyVal", val.get_sort());
-
-    // case 1: new elem is zero
-    Slv.add(nnz == 0);
-    Slv.add(DummyVal[Ctx.int_val(0)] == 0);
-    std::vector<expr> StraightlineArgs = {DummyRowInd,
-                                          DummyColInd,
-                                          DummyVal,
-                                          makeNumberNonZero(),
-                                          Converter.FromVal(*ScopeSet.begin()),
-                                          Converter.FromVal(Y)};
-    std::vector<expr> GemvIndParams = {Ctx.int_val(0), makeNumberRows() - 1,
-                                       Ctx.int_val(0), m};
-    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx);
-    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) !=
-            StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
-    auto Case1 = Slv.check();
-    if (Case1 != z3::unsat) {
-      std::stringstream S;
-      S << Case1;
-      LLVM_DEBUG(dbgs() << "[REV] Case1 failed: " << S.str() << "\n");
-      return false;
-    }
-
-    Slv.reset(); // Case (2)
-    Slv.add(IdxProperties);
-    Slv.add(n > 2);
-    Slv.add(m > 2);
-    Slv.add(nnz == 1);
-    Slv.add(DummyRowInd[Ctx.int_val(0)] == n);
-    Slv.add(DummyColInd[Ctx.int_val(0)] == 0);
-    Slv.add(DummyVal[Ctx.int_val(0)] != 0);
-    Slv.add(DummyVal[n * m] != 0);
-    Slv.add(DummyVal[n * m] == DummyVal[Ctx.int_val(0)]);
-    std::vector<expr> GemvIndParams2 = {n, n + 1, Ctx.int_val(0), m};
-    Slv.add(GemvNoLoop(GemvIndParams2.size(), GemvIndParams2.data()) !=
-            StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
-    auto Case2 = Slv.check();
-    if (Case2 != z3::unsat) {
-      std::stringstream S;
-      S << Case2;
-      LLVM_DEBUG(dbgs() << "[REV] Case2 failed: " << S.str() << "\n");
-      return false;
-    }
-
-    // TODO this is the same as case (1)
-    Slv.reset(); // Case (3) new col element
-    Slv.add(IdxProperties);
-    Slv.add(n > 2);
-    Slv.add(m > 2);
-    Slv.add(nnz == 0);
-    //    Slv.add(DummyRowInd[Ctx.int_val(0)] == 0);
-    //    Slv.add(DummyColInd[Ctx.int_val(0)] == m);
-    //    Slv.add(DummyVal[Ctx.int_val(0)] == 0);
-    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) !=
-            StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
-    auto Case3 = Slv.check();
-    if (Case3 != z3::unsat) {
-      std::stringstream S;
-      S << Case3;
-      LLVM_DEBUG(dbgs() << "[REV] Case3 failed: " << S.str() << "\n");
-      return false;
-    }
-
-    Slv.reset(); // Case (4) new col element
-    Slv.add(IdxProperties);
-    Slv.add(n > 2);
-    Slv.add(m > 2);
-    Slv.add(nnz == 1);
-    Slv.add(DummyRowInd[Ctx.int_val(0)] == 0);
-    Slv.add(DummyColInd[Ctx.int_val(0)] == m);
-    Slv.add(DummyVal[Ctx.int_val(0)] != 0);
-    Slv.add(DummyVal[m] != 0);
-    Slv.add(DummyVal[m] == DummyVal[Ctx.int_val(0)]);
-    std::vector<expr> GemvIndParams4 = {Ctx.int_val(0), n - 1, m, m + 1};
-    Slv.add(GemvNoLoop(GemvIndParams4.size(), GemvIndParams4.data()) !=
-            StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
-    auto Case4 = Slv.check();
-    if (Case4 != z3::unsat) {
-      std::stringstream S;
-      S << Case4;
-      LLVM_DEBUG(dbgs() << "[REV] Case4 failed: " << S.str() << "\n");
-      return false;
-    }
-
-    return true;
-  }
+//  bool checkInductive(SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
+//                      Value *LiveOut, expr_vector &GemvArgs, Function &F,
+//                      DominatorTree &DT) override {
+//
+//    expr_vector IdxProperties(Ctx);
+//    makeIndexProperties(IdxProperties);
+//
+//    // inductive step
+//    Slv.reset();
+//    //    expr n = makeNumberRows();
+//    //    expr nnz = makeNumberNonZero();
+//    expr rowind = Converter.FromVal(NameMap["rowind"]);
+//    expr colind = Converter.FromVal(NameMap["colind"]);
+//    expr val = Converter.FromVal(NameMap["val"]);
+//    expr t = Ctx.int_const("t");
+//    Slv.add(IdxProperties);
+//    Slv.add(n > 2);
+//    Slv.add(m > 2);
+//
+//    SmallVector<std::pair<const BasicBlock *, const BasicBlock *>> Cycles;
+//    FindFunctionBackedges(F, Cycles);
+//    SSA2Func NoLoopSpMV(Ctx, &DT, &Converter, LiveOut);
+//    auto StraightLine = NoLoopSpMV.straightlineFromFunction(&F, &Cycles);
+//
+//    expr DummyRowInd = Ctx.constant("DummyRowInd", rowind.get_sort());
+//    expr DummyColInd = Ctx.constant("DummyColInd", colind.get_sort());
+//    expr DummyVal = Ctx.constant("DummyVal", val.get_sort());
+//
+//    // case 1: new elem is zero
+//    Slv.add(nnz == 0);
+//    Slv.add(DummyVal[Ctx.int_val(0)] == 0);
+//    std::vector<expr> StraightlineArgs = {DummyRowInd,
+//                                          DummyColInd,
+//                                          DummyVal,
+//                                          makeNumberNonZero(),
+//                                          Converter.FromVal(*ScopeSet.begin()),
+//                                          Converter.FromVal(Y)};
+//    std::vector<expr> GemvIndParams = {Ctx.int_val(0), makeNumberRows() - 1,
+//                                       Ctx.int_val(0), m};
+//    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx);
+//    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) !=
+//            StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+//    auto Case1 = Slv.check();
+//    if (Case1 != z3::unsat) {
+//      std::stringstream S;
+//      S << Case1;
+//      LLVM_DEBUG(dbgs() << "[REV] Case1 failed: " << S.str() << "\n");
+//      return false;
+//    }
+//
+//    Slv.reset(); // Case (2)
+//    Slv.add(IdxProperties);
+//    Slv.add(n > 2);
+//    Slv.add(m > 2);
+//    Slv.add(nnz == 1);
+//    Slv.add(DummyRowInd[Ctx.int_val(0)] == n);
+//    Slv.add(DummyColInd[Ctx.int_val(0)] == 0);
+//    Slv.add(DummyVal[Ctx.int_val(0)] != 0);
+//    Slv.add(DummyVal[n * m] != 0);
+//    Slv.add(DummyVal[n * m] == DummyVal[Ctx.int_val(0)]);
+//    std::vector<expr> GemvIndParams2 = {n, n + 1, Ctx.int_val(0), m};
+//    Slv.add(GemvNoLoop(GemvIndParams2.size(), GemvIndParams2.data()) !=
+//            StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+//    auto Case2 = Slv.check();
+//    if (Case2 != z3::unsat) {
+//      std::stringstream S;
+//      S << Case2;
+//      LLVM_DEBUG(dbgs() << "[REV] Case2 failed: " << S.str() << "\n");
+//      return false;
+//    }
+//
+//    // TODO this is the same as case (1)
+//    Slv.reset(); // Case (3) new col element
+//    Slv.add(IdxProperties);
+//    Slv.add(n > 2);
+//    Slv.add(m > 2);
+//    Slv.add(nnz == 0);
+//    //    Slv.add(DummyRowInd[Ctx.int_val(0)] == 0);
+//    //    Slv.add(DummyColInd[Ctx.int_val(0)] == m);
+//    //    Slv.add(DummyVal[Ctx.int_val(0)] == 0);
+//    Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) !=
+//            StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+//    auto Case3 = Slv.check();
+//    if (Case3 != z3::unsat) {
+//      std::stringstream S;
+//      S << Case3;
+//      LLVM_DEBUG(dbgs() << "[REV] Case3 failed: " << S.str() << "\n");
+//      return false;
+//    }
+//
+//    Slv.reset(); // Case (4) new col element
+//    Slv.add(IdxProperties);
+//    Slv.add(n > 2);
+//    Slv.add(m > 2);
+//    Slv.add(nnz == 1);
+//    Slv.add(DummyRowInd[Ctx.int_val(0)] == 0);
+//    Slv.add(DummyColInd[Ctx.int_val(0)] == m);
+//    Slv.add(DummyVal[Ctx.int_val(0)] != 0);
+//    Slv.add(DummyVal[m] != 0);
+//    Slv.add(DummyVal[m] == DummyVal[Ctx.int_val(0)]);
+//    std::vector<expr> GemvIndParams4 = {Ctx.int_val(0), n - 1, m, m + 1};
+//    Slv.add(GemvNoLoop(GemvIndParams4.size(), GemvIndParams4.data()) !=
+//            StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
+//    auto Case4 = Slv.check();
+//    if (Case4 != z3::unsat) {
+//      std::stringstream S;
+//      S << Case4;
+//      LLVM_DEBUG(dbgs() << "[REV] Case4 failed: " << S.str() << "\n");
+//      return false;
+//    }
+//
+//    return true;
+//  }
 
   void getCase(expr_vector &Assertions, unsigned Case) override {
     llvm_unreachable("unimplemented!");
@@ -2171,11 +2081,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     return PreservedAnalyses::all();
   }
 
-  // TODO quick hack for spmv
-//  Format *ValidFormat = Formats[0];
-
   // Now test every possible kernel
-
   std::vector<std::pair<Kernel *, std::vector<Format *>>> PossibleResult;
   for (auto &E : PossibleKernels) {
     Kernel *K = E.first;
