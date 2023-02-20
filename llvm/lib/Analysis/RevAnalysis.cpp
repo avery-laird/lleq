@@ -1131,6 +1131,8 @@ public:
     return;
   }
 
+  virtual void getCase(expr_vector &Assertions, unsigned Case) = 0;
+
   // private:
   std::string FormatName;
   std::vector<unsigned> Vars;
@@ -1164,10 +1166,11 @@ public:
       : Name(Name), SparseName(SparseName), Formats(F), Converter(Conv) {}
 
   virtual func_decl makeKernel(context &Ctx) = 0;
-  virtual func_decl makeKernelNoLoop(context &Ctx, expr &A) = 0;
+  virtual func_decl makeKernelNoLoop(context &Ctx) = 0;
   void setMatchingFormats(std::vector<Format*> *MF) { MatchingFormats = MF; }
   virtual void makeKernelParams(expr_vector &Params) = 0;
   bool checkEquality(Value *LO, Function &F, DominatorTree &DT, z3::context &Ctx, z3::solver &Slv, const std::vector<Value *> &Scope, func_decl &InputKernel) {
+    Value *TopLiveOut = LO;
     // TODO verify the mapping covers the scope set
     LiveOut = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LO))->getPointerOperand();
 
@@ -1283,13 +1286,22 @@ public:
       });
       return false;
     }
-    return true;
-//    return checkInductive(ScopeSet, Y, LiveOut, GemvArgs, F, DT);
+//    return true;
+    return checkInductive(TopLiveOut, SpMVArgs, Slv, Ctx, F, DT);
   }
 
-//  bool checkInductive() {
-//
-//  }
+  bool checkInductive(Value *TopLiveOut, expr_vector &SpMVArgs, z3::solver &Slv, z3::context &Ctx, Function &F, DominatorTree &DT) {
+    // Build the straightline version
+    SmallVector<std::pair<const BasicBlock *, const BasicBlock *>> Cycles;
+    FindFunctionBackedges(F, Cycles);
+    SSA2Func NoLoopSpMV(Ctx, &DT, &Converter, TopLiveOut);
+    auto StraightLine = NoLoopSpMV.straightlineFromFunction(&F, &Cycles);
+
+    // every format has their own inductive step cases
+    return checkInductiveImpl(StraightLine, Ctx, SpMVArgs, Slv);
+  }
+
+  virtual bool checkInductiveImpl(func_decl &, z3::context &, expr_vector &, z3::solver &) = 0;
   std::string Name;
   std::string SparseName;
   RequiredFormats Formats;
@@ -1309,6 +1321,42 @@ public:
     Params.push_back(A->makeNumberRows() - 1);
     Params.push_back(Params.ctx().int_val(0));
     Params.push_back(A->m);
+  }
+
+  bool checkInductiveImpl(func_decl &InputKernelNoLoop, z3::context &Ctx, expr_vector &InputKernelArgs, z3::solver &Slv) override {
+    // I am the kernel, I know how to do the inductive proof
+    // get the cases from matrix A
+    Format *A = (*MatchingFormats)[0];
+    func_decl SpMVNoLoop = makeKernelNoLoop(Ctx);
+    expr_vector SpMVArgs(Ctx);
+    SpMVArgs.push_back(Ctx.int_val(0));
+    SpMVArgs.push_back(A->makeNumberRows() - 1);
+    SpMVArgs.push_back(Ctx.int_val(0));
+    SpMVArgs.push_back(A->m);
+
+    expr_vector Assertions(Ctx);
+    expr_vector IdxProperties(Ctx);
+    A->makeIndexProperties(IdxProperties);
+    // I know there's 4 cases
+    for (unsigned Case = 0; Case < 1; ++Case) {
+      Slv.reset();
+      Assertions.resize(0);
+      A->getCase(Assertions, Case);
+      Slv.add(IdxProperties);
+      Slv.add(Assertions);
+      Slv.add(SpMVNoLoop(SpMVArgs) != InputKernelNoLoop(InputKernelArgs));
+      auto Result = Slv.check();
+      if (Result != z3::unsat) {
+        LLVM_DEBUG({
+          std::stringstream S;
+          S << Result;
+          dbgs() << "[REV] Case " << Case << " failed: " << S.str() << "\n";
+        });
+        return false;
+      }
+    }
+
+    return true;
   }
 
 };
@@ -1355,7 +1403,7 @@ public:
     return gemv;
   }
 
-  func_decl makeKernelNoLoop(context &Ctx, expr &A) override {
+  func_decl makeKernelNoLoop(context &Ctx) override {
     expr y = Converter.FromVal(LiveOut);
     // x is constructed from dense format
     expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
@@ -1379,7 +1427,7 @@ public:
     Ctx.recdef(
         gemv, ArgsGemv,
         ite(n > i,
-            ite(m > j, store(y, i, select(y, i) + A[i * m + j] * x[j]), y), y));
+            ite(m > j, store(y, i, select(y, i) + Matrix(i, j) * x[j]), y), y));
     return gemv;
   }
 };
@@ -1423,9 +1471,11 @@ public:
                ite(m < j, Ctx.int_val(0), dot(n, j, m - 1) + Matrix(n, m) * x[m]));
     return gemv;
   }
-  func_decl makeKernelNoLoop(context &Ctx, expr &A) override {
+  func_decl makeKernelNoLoop(context &Ctx) override {
     expr y = Converter.FromVal(LiveOut);
     expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
+    // matrix is constructed from sparse format
+    func_decl Matrix = (*MatchingFormats)[0]->makeMatrix();
     expr n = Ctx.int_const("n");
     expr m = Ctx.int_const("m");
     expr i = Ctx.int_const("i");
@@ -1445,7 +1495,7 @@ public:
         gemv, ArgsGemv,
         ite(n > i,
             ite(m > j,
-                store(y, i, select(store(y, i, 0), i) + A[i * m + j] * x[j]),
+                store(y, i, select(store(y, i, 0), i) + Matrix(i, j) * x[j]),
                 y),
             store(y, i, 0)));
     return gemv;
@@ -1515,6 +1565,10 @@ public:
                       Value *LiveOut, expr_vector &GemvArgs, Function &F,
                       DominatorTree &DT) override {
     return true;
+  }
+
+  void getCase(expr_vector &Assertions, unsigned Case) override {
+    llvm_unreachable("unimplemented!");
   }
 };
 
@@ -1678,7 +1732,7 @@ public:
                                           Converter.FromVal(Y)};
     std::vector<expr> GemvIndParams = {Ctx.int_val(0), makeNumberRows() - 1,
                                        Ctx.int_val(0), m};
-    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx, DummyVal);
+    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx);
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) !=
             StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case1 = Slv.check();
@@ -1746,6 +1800,26 @@ public:
     }
 
     return true;
+  }
+
+  void getCase(expr_vector &Assertions, unsigned Case) override {
+    expr rptr = Converter.FromVal(NameMap["rowPtr"]);
+    expr col = Converter.FromVal(NameMap["col"]);
+    expr val = Converter.FromVal(NameMap["val"]);
+    expr zero = Ctx.int_val(0);
+    expr one = Ctx.int_val(1);
+    switch (Case) {
+    default:
+      llvm_unreachable("unsupported case! CSR only has 4 inductive cases.");
+    case 0:
+      Assertions.push_back(n > 2);
+      Assertions.push_back(m > 2);
+      Assertions.push_back(rptr[zero] == nnz);
+      Assertions.push_back(rptr[one] == nnz);
+      Assertions.push_back(col[zero] == zero);
+      Assertions.push_back(val[zero] == zero);
+      return;
+    }
   }
 };
 
@@ -1908,7 +1982,7 @@ public:
                                           Converter.FromVal(Y)};
     std::vector<expr> GemvIndParams = {Ctx.int_val(0), makeNumberRows() - 1,
                                        Ctx.int_val(0), m};
-    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx, DummyVal);
+    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx);
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) !=
             StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case1 = Slv.check();
@@ -1981,6 +2055,10 @@ public:
     }
 
     return true;
+  }
+
+  void getCase(expr_vector &Assertions, unsigned Case) override {
+    llvm_unreachable("unimplemented!");
   }
 };
 
