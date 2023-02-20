@@ -40,6 +40,7 @@ static cl::opt<bool>
                   cl::desc("Enable lifting of non-affine kernels."));
 
 class Format;
+class Kernel;
 
 static void GetLiveIns(Loop *L, SmallPtrSet<Value *, 4> &LiveIns) {
   for (auto *BB : L->getBlocks()) {
@@ -845,158 +846,6 @@ public:
   }
 };
 
-class Kernel {
-protected:
-  using CType = FormatManager::Compression;
-  using RequiredFormats = std::vector<std::pair<CType, unsigned>>;
-public:
-  Kernel(std::string Name, std::string SparseName, RequiredFormats F)
-      : Name(Name), SparseName(SparseName), Formats(F) {}
-
-  virtual func_decl makeKernel(context &Ctx, func_decl &A,
-                               expr_vector const &Ins) = 0;
-  virtual func_decl makeKernelNoLoop(context &Ctx, expr &A,
-                                     expr_vector const &Ins) = 0;
-
-  std::string Name;
-  std::string SparseName;
-  RequiredFormats Formats;
-};
-
-class GEMV : public Kernel {
-public:
-  GEMV() : Kernel("GEMV", "SPMV", {{CType::SPARSE, 2}}) {}
-
-  func_decl makeKernel(context &Ctx, func_decl &A,
-                       expr_vector const &Ins) override {
-    expr y = Ins[0];
-    expr x = Ins[1];
-    expr n = Ctx.int_const("n");
-    expr m = Ctx.int_const("m");
-    expr i = Ctx.int_const("i");
-    expr j = Ctx.int_const("j");
-    expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
-
-    ArgsGemv.push_back(i); // lower bound
-    ArgsGemv.push_back(n);
-    ArgsGemv.push_back(j); // lower bound
-    ArgsGemv.push_back(m);
-
-    ArgsDot.push_back(n);
-    ArgsDot.push_back(j); // lower bound
-    ArgsDot.push_back(m);
-
-    std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(),
-                                       Ctx.int_sort(), Ctx.int_sort()};
-    func_decl gemv = Ctx.recfun(Name.c_str(), GemvSorts.size(),
-                                GemvSorts.data(), y.get_sort());
-    std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(),
-                                      Ctx.int_sort()};
-    func_decl dot = Ctx.recfun((Name + ".dot").c_str(), DotSorts.size(),
-                               DotSorts.data(), y[Ctx.int_val(0)].get_sort());
-    Ctx.recdef(gemv, ArgsGemv,
-               ite(n < i, y,
-                   store(gemv(i, n - 1, j, m), n,
-                         gemv(i, n - 1, j, m)[n] + dot(n, j, m - 1))));
-    Ctx.recdef(dot, ArgsDot,
-               ite(m < j, Ctx.int_val(0), dot(n, j, m - 1) + A(n, m) * x[m]));
-    return gemv;
-  }
-
-  func_decl makeKernelNoLoop(context &Ctx, expr &A,
-                             expr_vector const &Ins) override {
-    expr y = Ins[0];
-    expr x = Ins[1];
-    expr n = Ctx.int_const("n");
-    expr m = Ctx.int_const("m");
-    expr i = Ctx.int_const("i");
-    expr j = Ctx.int_const("j");
-    expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
-
-    ArgsGemv.push_back(i); // lower bound
-    ArgsGemv.push_back(n);
-    ArgsGemv.push_back(j); // lower bound
-    ArgsGemv.push_back(m);
-
-    std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(),
-                                       Ctx.int_sort(), Ctx.int_sort()};
-    func_decl gemv = Ctx.recfun((Name + ".noloop").c_str(), GemvSorts.size(),
-                                GemvSorts.data(), y.get_sort());
-    Ctx.recdef(
-        gemv, ArgsGemv,
-        ite(n > i,
-            ite(m > j, store(y, i, select(y, i) + A[i * m + j] * x[j]), y), y));
-    return gemv;
-  }
-};
-
-class GEMV_reset : public Kernel {
-public:
-  GEMV_reset() : Kernel("GEMV_reset", "SPMV_reset", {{CType::SPARSE, 2}}) {}
-
-  func_decl makeKernel(context &Ctx, func_decl &A,
-                       expr_vector const &Ins) override {
-    expr y = Ins[0];
-    expr x = Ins[1];
-    expr n = Ctx.int_const("n");
-    expr m = Ctx.int_const("m");
-    expr i = Ctx.int_const("i");
-    expr j = Ctx.int_const("j");
-    expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
-
-    ArgsGemv.push_back(i); // lower bound
-    ArgsGemv.push_back(n);
-    ArgsGemv.push_back(j); // lower bound
-    ArgsGemv.push_back(m);
-
-    ArgsDot.push_back(n);
-    ArgsDot.push_back(j); // lower bound
-    ArgsDot.push_back(m);
-
-    std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(),
-                                       Ctx.int_sort(), Ctx.int_sort()};
-    func_decl gemv = Ctx.recfun(Name.c_str(), GemvSorts.size(),
-                                GemvSorts.data(), y.get_sort());
-    std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(),
-                                      Ctx.int_sort()};
-    func_decl dot = Ctx.recfun((Name + ".dot").c_str(), DotSorts.size(),
-                               DotSorts.data(), y[Ctx.int_val(0)].get_sort());
-    Ctx.recdef(gemv, ArgsGemv,
-               ite(n < i, y, store(gemv(i, n - 1, j, m), n, dot(n, j, m - 1))));
-    Ctx.recdef(dot, ArgsDot,
-               ite(m < j, Ctx.int_val(0), dot(n, j, m - 1) + A(n, m) * x[m]));
-    return gemv;
-  }
-  func_decl makeKernelNoLoop(context &Ctx, expr &A,
-                             expr_vector const &Ins) override {
-    expr y = Ins[0];
-    expr x = Ins[1];
-    expr n = Ctx.int_const("n");
-    expr m = Ctx.int_const("m");
-    expr i = Ctx.int_const("i");
-    expr j = Ctx.int_const("j");
-    expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
-
-    ArgsGemv.push_back(i); // lower bound
-    ArgsGemv.push_back(n);
-    ArgsGemv.push_back(j); // lower bound
-    ArgsGemv.push_back(m);
-
-    std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(),
-                                       Ctx.int_sort(), Ctx.int_sort()};
-    func_decl gemv = Ctx.recfun((Name + ".noloop").c_str(), GemvSorts.size(),
-                                GemvSorts.data(), y.get_sort());
-    Ctx.recdef(
-        gemv, ArgsGemv,
-        ite(n > i,
-            ite(m > j,
-                store(y, i, select(store(y, i, 0), i) + A[i * m + j] * x[j]),
-                y),
-            store(y, i, 0)));
-    return gemv;
-  }
-};
-
 class Format {
 protected:
   using MapTy = DenseMap<StringRef, unsigned>;
@@ -1079,45 +928,45 @@ public:
     int UB = ScopeVars.back();
 
     Slv.add(atleast(Pairs, CARE));
-//    Slv.add(mk_or(Pairs));
+    //    Slv.add(mk_or(Pairs));
     for (auto A : Vars) {
-        Slv.add(exists(s0, implies(LB <= s0 && s0 <= UB, EQUAL[s0] == Ctx.int_val(A))));
+      Slv.add(exists(s0, implies(LB <= s0 && s0 <= UB, EQUAL[s0] == Ctx.int_val(A))));
     }
 
     Slv.add(forall(s0, s1,
                    implies(LB <= s0 && s0 <= UB && LB <= s1 && s1 <= UB &&
                                EQUAL[s0] == EQUAL[s1],
                            s0 == s1)));
-//    Slv.add(forall(s0,
-//                   implies(Ctx.int_val(Vars.size()) <= s0 && s0 <= Ctx.int_val(Vars.size() + CARE - 1),
-//                           0 <= EQUAL[s0] && EQUAL[s0] < Ctx.int_val(Vars.size()))));
-//    Slv.add(forall(s0,
-//                   implies(LB <= s0 && s0 <= UB,
-//                           0 <= EQUAL[s0] && EQUAL[s0] < Ctx.int_val(Vars.size()))));
+    //    Slv.add(forall(s0,
+    //                   implies(Ctx.int_val(Vars.size()) <= s0 && s0 <= Ctx.int_val(Vars.size() + CARE - 1),
+    //                           0 <= EQUAL[s0] && EQUAL[s0] < Ctx.int_val(Vars.size()))));
+    //    Slv.add(forall(s0,
+    //                   implies(LB <= s0 && s0 <= UB,
+    //                           0 <= EQUAL[s0] && EQUAL[s0] < Ctx.int_val(Vars.size()))));
 
     auto Res = Slv.check();
     if (Res == z3::sat) {
       Model = Slv.get_model();
-//      LLVM_DEBUG({
-        dbgs() << Model.to_string() << "\n";
-        for (unsigned i = LB; i <= UB; ++i)
-          dbgs() << Model.eval(EQUAL[Ctx.int_val(i)]).to_string()
-                 << " ";
-        dbgs() << "\n";
-        for (unsigned i = LB; i <= UB; ++i) {
-          dbgs() << "(" << AllNames[i] << ", "
-                 << i << ") -> "
-                 << "(";
-          if (Model.eval(EQUAL[Ctx.int_val(i)]).as_int64() >= CARE) {
-            dbgs() << "<empty>, ";
-          } else {
-            dbgs() << AllNames[Model.eval(EQUAL[Ctx.int_val(i)]).as_int64()]
-                   << ", ";
-          }
-          dbgs() << Model.eval(EQUAL[Ctx.int_val(i)]).as_int64()
-                 << ")\n";
+      //      LLVM_DEBUG({
+      dbgs() << Model.to_string() << "\n";
+      for (unsigned i = LB; i <= UB; ++i)
+        dbgs() << Model.eval(EQUAL[Ctx.int_val(i)]).to_string()
+               << " ";
+      dbgs() << "\n";
+      for (unsigned i = LB; i <= UB; ++i) {
+        dbgs() << "(" << AllNames[i] << ", "
+               << i << ") -> "
+               << "(";
+        if (Model.eval(EQUAL[Ctx.int_val(i)]).as_int64() >= CARE) {
+          dbgs() << "<empty>, ";
+        } else {
+          dbgs() << AllNames[Model.eval(EQUAL[Ctx.int_val(i)]).as_int64()]
+                 << ", ";
         }
-//      });
+        dbgs() << Model.eval(EQUAL[Ctx.int_val(i)]).as_int64()
+               << ")\n";
+      }
+      //      });
       LLVM_DEBUG(dbgs() << "[REV] Format Check for " << FormatName
                         << " succeeded\n");
       return true;
@@ -1134,132 +983,131 @@ public:
   virtual expr makeNumberRows() = 0;
   virtual expr makeNumberNonZero() = 0;
   virtual void printSparseMatrix(z3::model &Model) = 0;
-  virtual bool checkInductive(func_decl const &Matrix,
-                              SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
+  virtual bool checkInductive(SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
                               Value *LiveOut, expr_vector &GemvArgs,
                               Function &F, DominatorTree &DT) = 0;
 
-  bool checkEquality(Value *LiveOut, Function &F, DominatorTree &DT) {
-
-    expr_vector IdxProperties(Ctx);
-    makeIndexProperties(IdxProperties);
-
-    SmallPtrSet<Value *, 10> ScopeSet;
-    for (auto *V : Scope)
-      ScopeSet.insert(V);
-    for (unsigned i = Vars.size(); i < Vars.size() + Scope.size(); ++i) {
-      int Image = Model.eval(EQUAL[Ctx.int_val(i)]).as_int64();
-      if (Image >= CARE)
-          continue ;
-      ScopeSet.erase(Scope[i-Vars.size()]); // only remove if a mapping exists
-    }
-    Value *Y = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LiveOut))
-                   ->getPointerOperand();
-    ScopeSet.erase(Y);
-    if (ScopeSet.size() != 1)
-      llvm_unreachable("Not all args were mapped to a storage format.");
-    expr_vector GemvArgs(Ctx);
-    GemvArgs.push_back(Converter.FromVal(Y));                 // y
-    GemvArgs.push_back(Converter.FromVal(*ScopeSet.begin())); // x
-
-    // TODO fix this
-    func_decl ReferenceKernel = Kern->makeKernel(Ctx, *Matrix, GemvArgs);
-
-    expr_vector SpMVArgs(Ctx);
-    for (auto *V : Scope)
-      SpMVArgs.push_back(Converter.FromVal(V));
-
-    std::vector<expr> GemvParams = {Ctx.int_val(0), makeNumberRows() - 1,
-                                    Ctx.int_val(0), m};
-
-    // base cases
-    bool BaseCase = true;
-    std::vector<std::vector<unsigned>> Bases = {
-        {1, 1},
-        // TODO: do we need to check all of these? maybe we can get around it.
-        // figure out why COO loops on other cases.
-        //        {1,2},
-        //        {2,1},
-        //        {2,2}
-    };
-    for (auto &Base : Bases) {
-      Slv.reset();
-      Slv.add(IdxProperties);
-      Slv.add(makeNumberRows() == Ctx.int_val(Base[0]));
-      Slv.add(m == Ctx.int_val(Base[1]));
-      Slv.add(ReferenceKernel(GemvParams.size(), GemvParams.data()) !=
-              InputKernel(SpMVArgs));
-      auto Res = Slv.check();
-      if (Res != z3::unsat) {
-        BaseCase = false;
-        LLVM_DEBUG({
-          z3::model BaseModel = Slv.get_model();
-          dbgs() << BaseModel.to_string() << "\n-------------------------\n";
-          int64_t _n = BaseModel.eval(n).as_int64();
-          int64_t _m = BaseModel.eval(m).as_int64();
-          int64_t _nnz = BaseModel.eval(makeNumberNonZero()).as_int64();
-          dbgs() << "n = " << _n << ", m = " << _m << ", nnz = " << _nnz
-                 << "\n";
-          printSparseMatrix(BaseModel);
-          expr TestVal = (*Matrix)(Ctx.int_val(0), Ctx.int_val(0));
-          std::stringstream M;
-          M << BaseModel.eval((*Matrix)(Ctx.int_val(0), Ctx.int_val(0)), true)
-            << "\n";
-          dbgs() << M.str();
-
-          unsigned I;
-          for (I = 0; I < _n; ++I) {
-            for (unsigned J = 0; J < _m; ++J) {
-              dbgs() << BaseModel
-                            .eval((*Matrix)(Ctx.int_val(I), Ctx.int_val(J)))
-                            .as_int64()
-                     << " ";
-            }
-            dbgs() << "| "
-                   << BaseModel
-                          .eval(Converter.FromVal(
-                              *ScopeSet.begin())[Ctx.int_val(I)])
-                          .as_int64();
-            if (I == _n / 2)
-              dbgs() << " = ";
-            else
-              dbgs() << "   ";
-            dbgs() << " "
-                   << BaseModel.eval(Converter.FromVal(Y)[Ctx.int_val(I)])
-                          .as_int64()
-                   << "\n";
-          }
-          for (; I < _m; ++I) {
-            for (unsigned Pad = 0; Pad < (_m * 2 + 7); ++Pad)
-              dbgs() << " ";
-            dbgs() << BaseModel.eval(Converter.FromVal(Y)[Ctx.int_val(I)])
-                          .as_int64()
-                   << "\n";
-          }
-          dbgs() << "GEMV\tInputKernel\n";
-          for (I = 0; I < _m; ++I) {
-            dbgs() << BaseModel
-                          .eval(ReferenceKernel(
-                              GemvParams.size(),
-                              GemvParams.data())[Ctx.int_val(I)])
-                          .as_int64()
-                   << "\t\t";
-            dbgs() << BaseModel.eval(InputKernel(SpMVArgs)[Ctx.int_val(I)])
-                          .as_int64()
-                   << "\n";
-          }
-        });
-        break;
-      }
-    }
-
-    if (!BaseCase) {
-      LLVM_DEBUG(dbgs() << "[REV] BaseCase failed for " << Kern->SparseName
-                        << "+" << FormatName << "\n");
-      return false;
-    }
-    return checkInductive(*Matrix, ScopeSet, Y, LiveOut, GemvArgs, F, DT);
-  }
+  //  bool checkEquality(Value *LiveOut, Function &F, DominatorTree &DT) {
+  //
+  //    expr_vector IdxProperties(Ctx);
+  //    makeIndexProperties(IdxProperties);
+  //
+  //    SmallPtrSet<Value *, 10> ScopeSet;
+  //    for (auto *V : Scope)
+  //      ScopeSet.insert(V);
+  //    for (unsigned i = Vars.size(); i < Vars.size() + Scope.size(); ++i) {
+  //      int Image = Model.eval(EQUAL[Ctx.int_val(i)]).as_int64();
+  //      if (Image >= CARE)
+  //          continue ;
+  //      ScopeSet.erase(Scope[i-Vars.size()]); // only remove if a mapping exists
+  //    }
+  //    Value *Y = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LiveOut))
+  //                   ->getPointerOperand();
+  //    ScopeSet.erase(Y);
+  //    if (ScopeSet.size() != 1)
+  //      llvm_unreachable("Not all args were mapped to a storage format.");
+  //    expr_vector GemvArgs(Ctx);
+  //    GemvArgs.push_back(Converter.FromVal(Y));                 // y
+  //    GemvArgs.push_back(Converter.FromVal(*ScopeSet.begin())); // x
+  //
+  //    // TODO fix this
+  //    func_decl ReferenceKernel = Kern->makeKernel(Ctx, *Matrix, GemvArgs);
+  //
+  //    expr_vector SpMVArgs(Ctx);
+  //    for (auto *V : Scope)
+  //      SpMVArgs.push_back(Converter.FromVal(V));
+  //
+  //    std::vector<expr> GemvParams = {Ctx.int_val(0), makeNumberRows() - 1,
+  //                                    Ctx.int_val(0), m};
+  //
+  //    // base cases
+  //    bool BaseCase = true;
+  //    std::vector<std::vector<unsigned>> Bases = {
+  //        {1, 1},
+  //        // TODO: do we need to check all of these? maybe we can get around it.
+  //        // figure out why COO loops on other cases.
+  //        //        {1,2},
+  //        //        {2,1},
+  //        //        {2,2}
+  //    };
+  //    for (auto &Base : Bases) {
+  //      Slv.reset();
+  //      Slv.add(IdxProperties);
+  //      Slv.add(makeNumberRows() == Ctx.int_val(Base[0]));
+  //      Slv.add(m == Ctx.int_val(Base[1]));
+  //      Slv.add(ReferenceKernel(GemvParams.size(), GemvParams.data()) !=
+  //              InputKernel(SpMVArgs));
+  //      auto Res = Slv.check();
+  //      if (Res != z3::unsat) {
+  //        BaseCase = false;
+  //        LLVM_DEBUG({
+  //          z3::model BaseModel = Slv.get_model();
+  //          dbgs() << BaseModel.to_string() << "\n-------------------------\n";
+  //          int64_t _n = BaseModel.eval(n).as_int64();
+  //          int64_t _m = BaseModel.eval(m).as_int64();
+  //          int64_t _nnz = BaseModel.eval(makeNumberNonZero()).as_int64();
+  //          dbgs() << "n = " << _n << ", m = " << _m << ", nnz = " << _nnz
+  //                 << "\n";
+  //          printSparseMatrix(BaseModel);
+  //          expr TestVal = (*Matrix)(Ctx.int_val(0), Ctx.int_val(0));
+  //          std::stringstream M;
+  //          M << BaseModel.eval((*Matrix)(Ctx.int_val(0), Ctx.int_val(0)), true)
+  //            << "\n";
+  //          dbgs() << M.str();
+  //
+  //          unsigned I;
+  //          for (I = 0; I < _n; ++I) {
+  //            for (unsigned J = 0; J < _m; ++J) {
+  //              dbgs() << BaseModel
+  //                            .eval((*Matrix)(Ctx.int_val(I), Ctx.int_val(J)))
+  //                            .as_int64()
+  //                     << " ";
+  //            }
+  //            dbgs() << "| "
+  //                   << BaseModel
+  //                          .eval(Converter.FromVal(
+  //                              *ScopeSet.begin())[Ctx.int_val(I)])
+  //                          .as_int64();
+  //            if (I == _n / 2)
+  //              dbgs() << " = ";
+  //            else
+  //              dbgs() << "   ";
+  //            dbgs() << " "
+  //                   << BaseModel.eval(Converter.FromVal(Y)[Ctx.int_val(I)])
+  //                          .as_int64()
+  //                   << "\n";
+  //          }
+  //          for (; I < _m; ++I) {
+  //            for (unsigned Pad = 0; Pad < (_m * 2 + 7); ++Pad)
+  //              dbgs() << " ";
+  //            dbgs() << BaseModel.eval(Converter.FromVal(Y)[Ctx.int_val(I)])
+  //                          .as_int64()
+  //                   << "\n";
+  //          }
+  //          dbgs() << "GEMV\tInputKernel\n";
+  //          for (I = 0; I < _m; ++I) {
+  //            dbgs() << BaseModel
+  //                          .eval(ReferenceKernel(
+  //                              GemvParams.size(),
+  //                              GemvParams.data())[Ctx.int_val(I)])
+  //                          .as_int64()
+  //                   << "\t\t";
+  //            dbgs() << BaseModel.eval(InputKernel(SpMVArgs)[Ctx.int_val(I)])
+  //                          .as_int64()
+  //                   << "\n";
+  //          }
+  //        });
+  //        break;
+  //      }
+  //    }
+  //
+  //    if (!BaseCase) {
+  //      LLVM_DEBUG(dbgs() << "[REV] BaseCase failed for " << Kern->SparseName
+  //                        << "+" << FormatName << "\n");
+  //      return false;
+  //    }
+  //    return checkInductive(*Matrix, ScopeSet, Y, LiveOut, GemvArgs, F, DT);
+  //  }
 
   void setKernel(Kernel *K) { Kern = K; }
 
@@ -1275,6 +1123,12 @@ public:
     n = makeNumberRows();
 
     Matrix = makeMatrix();
+  }
+
+  void makeBaseCase(expr_vector &Assertions, std::vector<unsigned> &Base) {
+    Assertions.push_back(makeNumberRows() == Ctx.int_val(Base[0]));
+    Assertions.push_back(m == Ctx.int_val(Base[1]));
+    return;
   }
 
   // private:
@@ -1301,6 +1155,304 @@ public:
   NameMapTy NameMap;
 };
 
+class Kernel {
+protected:
+  using CType = FormatManager::Compression;
+  using RequiredFormats = std::vector<std::pair<CType, unsigned>>;
+public:
+  Kernel(MakeZ3 &Conv, std::string Name, std::string SparseName, RequiredFormats F)
+      : Name(Name), SparseName(SparseName), Formats(F), Converter(Conv) {}
+
+  virtual func_decl makeKernel(context &Ctx) = 0;
+  virtual func_decl makeKernelNoLoop(context &Ctx, expr &A) = 0;
+  void setMatchingFormats(std::vector<Format*> *MF) { MatchingFormats = MF; }
+  virtual void makeKernelParams(expr_vector &Params) = 0;
+  bool checkEquality(Value *LO, Function &F, DominatorTree &DT, z3::context &Ctx, z3::solver &Slv, const std::vector<Value *> &Scope, func_decl &InputKernel) {
+    // TODO verify the mapping covers the scope set
+    LiveOut = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LO))->getPointerOperand();
+
+    expr_vector IdxProperties(Ctx);
+    for (Format *MF : *MatchingFormats) {
+      MF->initEqualityChecking();
+      MF->setKernel(this);
+      MF->makeIndexProperties(IdxProperties);
+    }
+    // verify base case
+    func_decl ReferenceKernel = makeKernel(Ctx);
+    bool BaseCase = true;
+    std::vector<std::vector<unsigned>> Bases = {
+        {1, 1},
+        // TODO: do we need to check all of these? maybe we can get around it.
+        // figure out why COO loops on other cases.
+        //        {1,2},
+        //        {2,1},
+        //        {2,2}
+    };
+
+    expr_vector Params(Ctx);
+    makeKernelParams(Params);
+
+    expr_vector SpMVArgs(Ctx);
+    for (auto *V : Scope)
+      SpMVArgs.push_back(Converter.FromVal(V));
+
+    expr_vector Assertions(Ctx);
+    for (auto &Base : Bases) {
+      Slv.reset();
+      Assertions.resize(0);
+      Slv.add(IdxProperties);
+      for (auto *MF : *MatchingFormats)
+        MF->makeBaseCase(Assertions, Base);
+      Slv.add(Assertions);
+      Slv.add(ReferenceKernel(Params) !=
+              InputKernel(SpMVArgs));
+      auto Res = Slv.check();
+      if (Res != z3::unsat) {
+        BaseCase = false;
+        LLVM_DEBUG({
+          Format *A = (*MatchingFormats)[0];
+          Format *XFormat = (*MatchingFormats)[1];
+          expr x = Converter.FromVal(XFormat->NameMap["B"]);
+          Value *Y = LiveOut;
+          func_decl Matrix = A->makeMatrix();
+          expr n = A->makeNumberRows();
+          expr m = A->m;
+          z3::model BaseModel = Slv.get_model();
+          dbgs() << BaseModel.to_string() << "\n-------------------------\n";
+          int64_t _n = BaseModel.eval(n).as_int64();
+          int64_t _m = BaseModel.eval(m).as_int64();
+          int64_t _nnz = BaseModel.eval(A->makeNumberNonZero()).as_int64();
+          dbgs() << "n = " << _n << ", m = " << _m << ", nnz = " << _nnz
+                 << "\n";
+          A->printSparseMatrix(BaseModel);
+          expr TestVal = Matrix(Ctx.int_val(0), Ctx.int_val(0));
+          std::stringstream M;
+          M << BaseModel.eval(Matrix(Ctx.int_val(0), Ctx.int_val(0)), true)
+            << "\n";
+          dbgs() << M.str();
+
+          unsigned I;
+          for (I = 0; I < _n; ++I) {
+            for (unsigned J = 0; J < _m; ++J) {
+              dbgs() << BaseModel
+                            .eval(Matrix(Ctx.int_val(I), Ctx.int_val(J)))
+                            .as_int64()
+                     << " ";
+            }
+            dbgs() << "| "
+                   << BaseModel
+                          .eval(x[Ctx.int_val(I)])
+                          .as_int64();
+            if (I == _n / 2)
+              dbgs() << " = ";
+            else
+              dbgs() << "   ";
+            dbgs() << " "
+                   << BaseModel.eval(Converter.FromVal(Y)[Ctx.int_val(I)])
+                          .as_int64()
+                   << "\n";
+          }
+          for (; I < _m; ++I) {
+            for (unsigned Pad = 0; Pad < (_m * 2 + 7); ++Pad)
+              dbgs() << " ";
+            dbgs() << BaseModel.eval(Converter.FromVal(Y)[Ctx.int_val(I)])
+                          .as_int64()
+                   << "\n";
+          }
+          dbgs() << "GEMV\tInputKernel\n";
+          for (I = 0; I < _m; ++I) {
+            dbgs() << BaseModel
+                          .eval(ReferenceKernel(Params)[Ctx.int_val(I)])
+                          .as_int64()
+                   << "\t\t";
+            dbgs() << BaseModel.eval(InputKernel(SpMVArgs)[Ctx.int_val(I)])
+                          .as_int64()
+                   << "\n";
+          }
+        });
+        break;
+      }
+    }
+    if (!BaseCase) {
+      LLVM_DEBUG({
+        std::string FormatString;
+        for (auto *MF : *MatchingFormats)
+          FormatString += MF->FormatName + ", ";
+        dbgs() << "[REV] BaseCase failed for " << SparseName << "+"
+                       << FormatString << "\n";
+      });
+      return false;
+    }
+    return true;
+//    return checkInductive(ScopeSet, Y, LiveOut, GemvArgs, F, DT);
+  }
+
+//  bool checkInductive() {
+//
+//  }
+  std::string Name;
+  std::string SparseName;
+  RequiredFormats Formats;
+  std::vector<Format*> *MatchingFormats = nullptr;
+  Value *LiveOut = nullptr;
+  MakeZ3 &Converter;
+};
+
+class SPMVBase : public Kernel {
+public:
+  SPMVBase(MakeZ3 &Conv, std::string Name, std::string SparseName, RequiredFormats F)
+      : Kernel(Conv, Name, SparseName, F) {}
+
+  void makeKernelParams(expr_vector &Params) override {
+    Format *A = (*MatchingFormats)[0];
+    Params.push_back(Params.ctx().int_val(0));
+    Params.push_back(A->makeNumberRows() - 1);
+    Params.push_back(Params.ctx().int_val(0));
+    Params.push_back(A->m);
+  }
+
+};
+
+class GEMV : public SPMVBase {
+public:
+  GEMV(MakeZ3 &Conv) : SPMVBase(Conv, "GEMV", "SPMV", {{CType::SPARSE, 2}, {CType::DENSE, 1}}) {}
+
+  func_decl makeKernel(context &Ctx) override {
+    expr y = Converter.FromVal(LiveOut);
+    // x is constructed from dense format
+    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
+    // matrix is constructed from sparse format
+    func_decl Matrix = (*MatchingFormats)[0]->makeMatrix();
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr i = Ctx.int_const("i");
+    expr j = Ctx.int_const("j");
+    expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+
+    ArgsGemv.push_back(i); // lower bound
+    ArgsGemv.push_back(n);
+    ArgsGemv.push_back(j); // lower bound
+    ArgsGemv.push_back(m);
+
+    ArgsDot.push_back(n);
+    ArgsDot.push_back(j); // lower bound
+    ArgsDot.push_back(m);
+
+    std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(),
+                                       Ctx.int_sort(), Ctx.int_sort()};
+    func_decl gemv = Ctx.recfun(Name.c_str(), GemvSorts.size(),
+                                GemvSorts.data(), y.get_sort());
+    std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(),
+                                      Ctx.int_sort()};
+    func_decl dot = Ctx.recfun((Name + ".dot").c_str(), DotSorts.size(),
+                               DotSorts.data(), y[Ctx.int_val(0)].get_sort());
+    Ctx.recdef(gemv, ArgsGemv,
+               ite(n < i, y,
+                   store(gemv(i, n - 1, j, m), n,
+                         gemv(i, n - 1, j, m)[n] + dot(n, j, m - 1))));
+    Ctx.recdef(dot, ArgsDot,
+               ite(m < j, Ctx.int_val(0), dot(n, j, m - 1) + Matrix(n, m) * x[m]));
+    return gemv;
+  }
+
+  func_decl makeKernelNoLoop(context &Ctx, expr &A) override {
+    expr y = Converter.FromVal(LiveOut);
+    // x is constructed from dense format
+    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
+    // matrix is constructed from sparse format
+    func_decl Matrix = (*MatchingFormats)[0]->makeMatrix();
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr i = Ctx.int_const("i");
+    expr j = Ctx.int_const("j");
+    expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+
+    ArgsGemv.push_back(i); // lower bound
+    ArgsGemv.push_back(n);
+    ArgsGemv.push_back(j); // lower bound
+    ArgsGemv.push_back(m);
+
+    std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(),
+                                       Ctx.int_sort(), Ctx.int_sort()};
+    func_decl gemv = Ctx.recfun((Name + ".noloop").c_str(), GemvSorts.size(),
+                                GemvSorts.data(), y.get_sort());
+    Ctx.recdef(
+        gemv, ArgsGemv,
+        ite(n > i,
+            ite(m > j, store(y, i, select(y, i) + A[i * m + j] * x[j]), y), y));
+    return gemv;
+  }
+};
+
+class GEMV_reset : public SPMVBase {
+public:
+  GEMV_reset(MakeZ3 &Conv) : SPMVBase(Conv, "GEMV_reset", "SPMV_reset", {{CType::SPARSE, 2}, {CType::DENSE, 1}}) {}
+
+  func_decl makeKernel(context &Ctx) override {
+    expr y = Converter.FromVal(LiveOut);
+    // x is constructed from dense format
+    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
+    // matrix is constructed from sparse format
+    func_decl Matrix = (*MatchingFormats)[0]->makeMatrix();
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr i = Ctx.int_const("i");
+    expr j = Ctx.int_const("j");
+    expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+
+    ArgsGemv.push_back(i); // lower bound
+    ArgsGemv.push_back(n);
+    ArgsGemv.push_back(j); // lower bound
+    ArgsGemv.push_back(m);
+
+    ArgsDot.push_back(n);
+    ArgsDot.push_back(j); // lower bound
+    ArgsDot.push_back(m);
+
+    std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(),
+                                       Ctx.int_sort(), Ctx.int_sort()};
+    func_decl gemv = Ctx.recfun(Name.c_str(), GemvSorts.size(),
+                                GemvSorts.data(), y.get_sort());
+    std::vector<z3::sort> DotSorts = {Ctx.int_sort(), Ctx.int_sort(),
+                                      Ctx.int_sort()};
+    func_decl dot = Ctx.recfun((Name + ".dot").c_str(), DotSorts.size(),
+                               DotSorts.data(), y[Ctx.int_val(0)].get_sort());
+    Ctx.recdef(gemv, ArgsGemv,
+               ite(n < i, y, store(gemv(i, n - 1, j, m), n, dot(n, j, m - 1))));
+    Ctx.recdef(dot, ArgsDot,
+               ite(m < j, Ctx.int_val(0), dot(n, j, m - 1) + Matrix(n, m) * x[m]));
+    return gemv;
+  }
+  func_decl makeKernelNoLoop(context &Ctx, expr &A) override {
+    expr y = Converter.FromVal(LiveOut);
+    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr i = Ctx.int_const("i");
+    expr j = Ctx.int_const("j");
+    expr_vector ArgsGemv(Ctx), ArgsDot(Ctx);
+
+    ArgsGemv.push_back(i); // lower bound
+    ArgsGemv.push_back(n);
+    ArgsGemv.push_back(j); // lower bound
+    ArgsGemv.push_back(m);
+
+    std::vector<z3::sort> GemvSorts = {Ctx.int_sort(), Ctx.int_sort(),
+                                       Ctx.int_sort(), Ctx.int_sort()};
+    func_decl gemv = Ctx.recfun((Name + ".noloop").c_str(), GemvSorts.size(),
+                                GemvSorts.data(), y.get_sort());
+    Ctx.recdef(
+        gemv, ArgsGemv,
+        ite(n > i,
+            ite(m > j,
+                store(y, i, select(store(y, i, 0), i) + A[i * m + j] * x[j]),
+                y),
+            store(y, i, 0)));
+    return gemv;
+  }
+};
+
+
 
 class DenseMatFormat : public Format {
 public:
@@ -1310,7 +1462,7 @@ public:
       : Format(Props, Ctx, Scope, Slv, Converter, InputKernel) {
     FormatName = "DenseMat";
     CARE = 2;
-    Names.push_back("M");
+    Names.push_back("M"); // number columns
     Names.push_back("B");
 
     for (unsigned i = 0; i < CARE; ++i) {
@@ -1335,6 +1487,55 @@ public:
       } else if (P.Name == "loop_bounds") {
       }
     }
+  }
+
+  func_decl makeMatrix() override {
+    expr i = Ctx.int_const("i");
+    expr j = Ctx.int_const("j");
+    expr m = Converter.FromVal(NameMap["M"]);
+    expr_vector Args(Ctx);
+    Args.push_back(i);
+    Args.push_back(j);
+    expr BMat = Converter.FromVal(NameMap["B"]);
+    func_decl B = Ctx.recfun("B", Ctx.int_sort(), Ctx.int_sort(),
+                             BMat[Ctx.int_val(0)].get_sort());
+    Ctx.recdef(B, Args, BMat[i*m + j]);
+    return B;
+  }
+
+  void makeIndexProperties(expr_vector &) override { return; }
+
+  expr makeNumberRows() override { return n; }
+
+  expr makeNumberNonZero() override { return nnz; }
+
+  void printSparseMatrix(z3::model &Model) override {}
+
+  bool checkInductive(SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
+                      Value *LiveOut, expr_vector &GemvArgs, Function &F,
+                      DominatorTree &DT) override {
+    return true;
+  }
+};
+
+class DenseVecFormat : public DenseMatFormat {
+public:
+  DenseVecFormat(Properties &Props, z3::context &Ctx,
+                 const std::vector<Value *> &Scope, z3::solver &Slv,
+                 MakeZ3 &Converter, func_decl InputKernel)
+      : DenseMatFormat(Props, Ctx, Scope, Slv, Converter, InputKernel) {
+    FormatName = "DenseVec";
+  }
+
+  func_decl makeMatrix() override {
+    expr i = Ctx.int_const("i");
+    expr_vector Args(Ctx);
+    Args.push_back(i);
+    expr BMat = Converter.FromVal(NameMap["B"]);
+    func_decl B = Ctx.recfun("B", Ctx.int_sort(),
+                             BMat[Ctx.int_val(0)].get_sort());
+    Ctx.recdef(B, Args, BMat[i]);
+    return B;
   }
 };
 
@@ -1404,7 +1605,7 @@ public:
   }
 
   void makeIndexProperties(expr_vector &Properties) override {
-    assert(Properties.size() == 0);
+//    assert(Properties.size() == 0);
     expr n = Converter.FromVal(NameMap["n"]);
     expr rptr = Converter.FromVal(NameMap["rowPtr"]);
     expr col = Converter.FromVal(NameMap["col"]);
@@ -1437,8 +1638,7 @@ public:
 
   void printSparseMatrix(z3::model &Model) override {}
 
-  bool checkInductive(func_decl const &Matrix,
-                      SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
+  bool checkInductive(SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
                       Value *LiveOut, expr_vector &GemvArgs, Function &F,
                       DominatorTree &DT) override {
 
@@ -1478,7 +1678,7 @@ public:
                                           Converter.FromVal(Y)};
     std::vector<expr> GemvIndParams = {Ctx.int_val(0), makeNumberRows() - 1,
                                        Ctx.int_val(0), m};
-    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx, DummyVal, GemvArgs);
+    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx, DummyVal);
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) !=
             StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case1 = Slv.check();
@@ -1669,8 +1869,7 @@ public:
     }
   }
 
-  bool checkInductive(func_decl const &Matrix,
-                      SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
+  bool checkInductive(SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
                       Value *LiveOut, expr_vector &GemvArgs, Function &F,
                       DominatorTree &DT) override {
 
@@ -1709,7 +1908,7 @@ public:
                                           Converter.FromVal(Y)};
     std::vector<expr> GemvIndParams = {Ctx.int_val(0), makeNumberRows() - 1,
                                        Ctx.int_val(0), m};
-    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx, DummyVal, GemvArgs);
+    func_decl GemvNoLoop = Kern->makeKernelNoLoop(Ctx, DummyVal);
     Slv.add(GemvNoLoop(GemvIndParams.size(), GemvIndParams.data()) !=
             StraightLine(StraightlineArgs.size(), StraightlineArgs.data()));
     auto Case1 = Slv.check();
@@ -1850,20 +2049,28 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     }
   });
 
+  func_decl InputKernel = Translate[&F.getEntryBlock()];
+
   CSRFormat CSRF(Props, Ctx, Scope, Slv, Converter,
-                  Translate[&F.getEntryBlock()]);
+                 InputKernel);
   COOFormat COOF(Props, Ctx, Scope, Slv, Converter,
-                  Translate[&F.getEntryBlock()]);
+                 InputKernel);
+  DenseMatFormat DenseMat(Props, Ctx, Scope, Slv, Converter,
+                          InputKernel);
+  DenseVecFormat DenseVec(Props, Ctx, Scope, Slv, Converter,
+                          InputKernel);
 
   FormatManager FM;
   FM.registerFormat(&CSRF, 2, FormatManager::SPARSE);
   FM.registerFormat(&COOF, 2, FormatManager::SPARSE);
-  GEMV MV;
-  GEMV_reset MVReset;
+  FM.registerFormat(&DenseMat, 2, FormatManager::DENSE);
+  FM.registerFormat(&DenseVec, 1, FormatManager::DENSE);
+  GEMV MV(Converter);
+  GEMV_reset MVReset(Converter);
   std::vector<Kernel *> Kernels = {&MV, &MVReset};
 
 
-  Kernel *InferredKernel = nullptr;
+  std::vector<std::pair<Kernel*, std::vector<Format*>>> PossibleKernels;
   std::vector<Format *> Formats;
   for (auto *K : Kernels) {
     Formats.clear();
@@ -1876,52 +2083,44 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       }
     }
     if (Formats.size() == K->Formats.size()) {
-      InferredKernel = K;
-      break;
+      PossibleKernels.push_back({K, Formats});
     }
   }
 
 
-//  bool Res = false;
-//  Format *ValidFormat = nullptr;
-//  std::vector<Format *> FormatList = {&CSRF, &COOF};
-//  for (auto *Cur : FormatList) {
-//    if (Cur->validateMapping()) {
-//      if (Res)
-//        llvm_unreachable("[REV] Multiple valid formats!");
-//      Res = true;
-//      ValidFormat = Cur;
-//    }
-//  }
-
-  if (!InferredKernel) {
+  if (PossibleKernels.empty()) {
     LLVM_DEBUG(dbgs() << "[REV] No viable format mappings found\n");
     return PreservedAnalyses::all();
   }
 
   // TODO quick hack for spmv
-  Format *ValidFormat = Formats[0];
+//  Format *ValidFormat = Formats[0];
 
   // Now test every possible kernel
 
-  ValidFormat->initEqualityChecking();
-
-  std::optional<std::pair<Format *, Kernel *>> Result;
-  for (auto *K : Kernels) {
-    ValidFormat->setKernel(K);
-    if (ValidFormat->checkEquality(LiveOut, F, DT)) {
-      assert(!Result.has_value() && "Multiple possible formats!");
-      Result = {ValidFormat, K};
-    }
+  std::vector<std::pair<Kernel *, std::vector<Format *>>> PossibleResult;
+  for (auto &E : PossibleKernels) {
+    Kernel *K = E.first;
+    K->setMatchingFormats(&E.second);
+    if (K->checkEquality(LiveOut, F, DT, Ctx, Slv, Scope, InputKernel))
+      PossibleResult.push_back(E);
   }
 
-  if (Result) {
+  if (PossibleResult.size() == 1) {
+    Kernel *InputProgram = PossibleResult[0].first;
+    std::vector<Format*> &FormatList = PossibleResult[0].second;
     LLVM_DEBUG({
       dbgs() << "[REV] mapping found\n";
       dbgs() << "Mapping: \n";
-      dbgs() << "Input program = " << (*Result).second->Name << "\n";
-      dbgs() << "Storage Format = " << (*Result).first->FormatName << "\n";
+      dbgs() << "Input program = " << InputProgram->Name << "\n";
+      dbgs() << "Storage Formats = ";
+      for (auto *Format : FormatList)
+        dbgs() << Format->FormatName << ", ";
+      dbgs() << "\n";
     });
+
+    std::string FormatString;
+    for (auto *Format : FormatList) FormatString += Format->FormatName + "_";
 
     // now actually modify the IR
 
@@ -1944,7 +2143,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
     auto *FType = FunctionType::get(Type::getInt8Ty(C), ArgTypes, false);
     auto FHandle = F.getParent()->getOrInsertFunction(
-        (*Result).second->SparseName + "_" + (*Result).first->FormatName + "_D",
+        InputProgram->SparseName + "_" + FormatString + "D",
         FType);
     Value *CallResult = Builder.CreateCall(FHandle, Scope, "dsl.call");
     Value *CmpResult = Builder.CreateICmpEQ(
