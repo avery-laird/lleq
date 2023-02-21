@@ -826,25 +826,6 @@ public:
   }
 };
 
-class FormatManager {
-  using CacheTy = DenseMap<unsigned, DenseMap<unsigned, std::vector<Format*>>>;
-  CacheTy Cache;
-public:
-  enum Compression {
-    SPARSE, DENSE
-  };
-  void registerFormat(Format *F, unsigned Dim, Compression C) {
-    Cache[C][Dim].push_back(F);
-  }
-  std::vector<Format*> getFormat(Compression C, unsigned Dim) {
-    if (Cache[C].empty())
-      return {};
-    return Cache[C][Dim];
-  }
-  std::vector<Format*> getFormat(std::pair<Compression, unsigned> &P) {
-    return getFormat(P.first, P.second);
-  }
-};
 
 class Format {
 protected:
@@ -860,6 +841,26 @@ public:
                            Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()))),
         n(Ctx.int_const("n")), m(Ctx.int_const("m")), nnz(Ctx.int_const("nnz")),
         Model(Ctx) {}
+
+  void printMapping(z3::model &M, unsigned LB, unsigned UB) {
+    LLVM_DEBUG({
+      dbgs() << M.to_string() << "\n";
+      for (unsigned i = LB; i <= UB; ++i)
+        dbgs() << M.eval(EQUAL[Ctx.int_val(i)]).to_string() << " ";
+      dbgs() << "\n";
+      for (unsigned i = LB; i <= UB; ++i) {
+        dbgs() << "(" << AllNames[i] << ", " << i << ") -> "
+               << "(";
+        if (M.eval(EQUAL[Ctx.int_val(i)]).as_int64() >= CARE) {
+          dbgs() << "<empty>, ";
+        } else {
+          dbgs() << AllNames[M.eval(EQUAL[Ctx.int_val(i)]).as_int64()]
+                 << ", ";
+        }
+        dbgs() << M.eval(EQUAL[Ctx.int_val(i)]).as_int64() << ")\n";
+      }
+    });
+  }
 
   bool validateMapping() {
     Slv.reset();
@@ -928,7 +929,7 @@ public:
     int UB = ScopeVars.back();
 
     Slv.add(atleast(Pairs, CARE));
-    //    Slv.add(mk_or(Pairs));
+
     for (auto A : Vars) {
       Slv.add(exists(s0, implies(LB <= s0 && s0 <= UB, EQUAL[s0] == Ctx.int_val(A))));
     }
@@ -937,44 +938,42 @@ public:
                    implies(LB <= s0 && s0 <= UB && LB <= s1 && s1 <= UB &&
                                EQUAL[s0] == EQUAL[s1],
                            s0 == s1)));
-    //    Slv.add(forall(s0,
-    //                   implies(Ctx.int_val(Vars.size()) <= s0 && s0 <= Ctx.int_val(Vars.size() + CARE - 1),
-    //                           0 <= EQUAL[s0] && EQUAL[s0] < Ctx.int_val(Vars.size()))));
-    //    Slv.add(forall(s0,
-    //                   implies(LB <= s0 && s0 <= UB,
-    //                           0 <= EQUAL[s0] && EQUAL[s0] < Ctx.int_val(Vars.size()))));
 
     auto Res = Slv.check();
     if (Res == z3::sat) {
       Model = Slv.get_model();
-      //      LLVM_DEBUG({
-      dbgs() << Model.to_string() << "\n";
-      for (unsigned i = LB; i <= UB; ++i)
-        dbgs() << Model.eval(EQUAL[Ctx.int_val(i)]).to_string()
-               << " ";
-      dbgs() << "\n";
+      printMapping(Model, LB, UB);
+      expr_vector Block(Ctx);
       for (unsigned i = LB; i <= UB; ++i) {
-        dbgs() << "(" << AllNames[i] << ", "
-               << i << ") -> "
-               << "(";
-        if (Model.eval(EQUAL[Ctx.int_val(i)]).as_int64() >= CARE) {
-          dbgs() << "<empty>, ";
-        } else {
-          dbgs() << AllNames[Model.eval(EQUAL[Ctx.int_val(i)]).as_int64()]
-                 << ", ";
-        }
-        dbgs() << Model.eval(EQUAL[Ctx.int_val(i)]).as_int64()
-               << ")\n";
+        int64_t Image = Model.eval(EQUAL[Ctx.int_val(i)]).as_int64();
+        if (0 <= Image && Image < CARE)
+          Block.push_back(EQUAL[Ctx.int_val(i)] !=
+                          Model.eval(EQUAL[Ctx.int_val(i)]));
       }
-      //      });
+      Slv.add(mk_and(Block));
+      auto Unique = Slv.check();
+      if (Unique != z3::unsat) {
+        auto M = Slv.get_model();
+        printMapping(M, LB, UB);
+        LLVM_DEBUG({
+          std::stringstream S;
+          S << Res;
+          dbgs() << "[REV] Format Check for " << FormatName
+                 << " failed because it is not unique! " << S.str() << "\n";
+        });
+        return false;
+      }
       LLVM_DEBUG(dbgs() << "[REV] Format Check for " << FormatName
                         << " succeeded\n");
       return true;
     }
-    std::stringstream S;
-    S << Res;
-    LLVM_DEBUG(dbgs() << "[REV] Format Check for " << FormatName
-                      << " failed: " << S.str() << "\n");
+
+    LLVM_DEBUG({
+      std::stringstream S;
+      S << Res;
+      dbgs() << "[REV] Format Check for " << FormatName
+             << " failed: " << S.str() << "\n";
+    });
     return false;
   }
 
@@ -1157,6 +1156,38 @@ public:
   NameMapTy NameMap;
 };
 
+class FormatManager {
+  using CacheTy = DenseMap<std::pair<unsigned, unsigned>, std::vector<Format*>>;
+  CacheTy Cache;
+public:
+  enum Compression {
+    SPARSE = 0, DENSE = 1
+  };
+  using PairTy = std::pair<Compression, unsigned>;
+  using MappingTy = DenseMap<std::pair<int, unsigned>, bool>;
+  MappingTy Map;
+
+  void registerFormat(Format *F, Compression C, unsigned Dim) {
+    Cache[{C, Dim}].push_back(F);
+  }
+  std::vector<Format*> getFormat(Compression C, unsigned Dim) {
+    if (!Cache.count({C, Dim}))
+      return {};
+    return Cache[{C, Dim}];
+  }
+  std::vector<Format*> getFormat(PairTy &P) {
+    return getFormat(P.first, P.second);
+  }
+  void cacheFormatResult(PairTy &P, bool Result) {
+    Map[{(int)P.first, P.second}] = Result;
+  }
+  bool formatIsValid(PairTy &P) {
+    if (Map.count({(int)P.first, P.second}))
+      return Map[{(int)P.first, P.second}];
+    return false;
+  }
+};
+
 class Kernel {
 protected:
   using CType = FormatManager::Compression;
@@ -1169,10 +1200,14 @@ public:
   virtual func_decl makeKernelNoLoop(context &Ctx) = 0;
   void setMatchingFormats(std::vector<Format*> *MF) { MatchingFormats = MF; }
   virtual void makeKernelParams(expr_vector &Params) = 0;
-  bool checkEquality(Value *LO, Function &F, DominatorTree &DT, z3::context &Ctx, z3::solver &Slv, const std::vector<Value *> &Scope, func_decl &InputKernel) {
+  bool checkEquality(Value *LO, Function &F, DominatorTree &DT,
+                     z3::context &Ctx, z3::solver &Slv,
+                     const std::vector<Value *> &Scope,
+                     func_decl &InputKernel) {
     Value *TopLiveOut = LO;
     // TODO verify the mapping covers the scope set
-    LiveOut = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LO))->getPointerOperand();
+    LiveOut = dyn_cast<GEPOperator>(getLoadStorePointerOperand(LO))
+                  ->getPointerOperand();
 
     expr_vector IdxProperties(Ctx);
     for (Format *MF : *MatchingFormats) {
@@ -1185,7 +1220,7 @@ public:
     bool BaseCase = true;
     std::vector<std::vector<unsigned>> Bases = {
         {1, 1},
-        // TODO: do we need to check all of these? maybe we can get around it.
+        // TODO: do we need to check all of these?
         // figure out why COO loops on other cases.
         //        {1,2},
         //        {2,1},
@@ -1195,9 +1230,9 @@ public:
     expr_vector Params(Ctx);
     makeKernelParams(Params);
 
-    expr_vector SpMVArgs(Ctx);
+    expr_vector InputArgs(Ctx);
     for (auto *V : Scope)
-      SpMVArgs.push_back(Converter.FromVal(V));
+      InputArgs.push_back(Converter.FromVal(V));
 
     expr_vector Assertions(Ctx);
     for (auto &Base : Bases) {
@@ -1207,8 +1242,7 @@ public:
       for (auto *MF : *MatchingFormats)
         MF->makeBaseCase(Assertions, Base);
       Slv.add(Assertions);
-      Slv.add(ReferenceKernel(Params) !=
-              InputKernel(SpMVArgs));
+      Slv.add(ReferenceKernel(Params) != InputKernel(InputArgs));
       auto Res = Slv.check();
       if (Res != z3::unsat) {
         BaseCase = false;
@@ -1237,15 +1271,11 @@ public:
           unsigned I;
           for (I = 0; I < _n; ++I) {
             for (unsigned J = 0; J < _m; ++J) {
-              dbgs() << BaseModel
-                            .eval(Matrix(Ctx.int_val(I), Ctx.int_val(J)))
+              dbgs() << BaseModel.eval(Matrix(Ctx.int_val(I), Ctx.int_val(J)))
                             .as_int64()
                      << " ";
             }
-            dbgs() << "| "
-                   << BaseModel
-                          .eval(x[Ctx.int_val(I)])
-                          .as_int64();
+            dbgs() << "| " << BaseModel.eval(x[Ctx.int_val(I)]).as_int64();
             if (I == _n / 2)
               dbgs() << " = ";
             else
@@ -1264,11 +1294,10 @@ public:
           }
           dbgs() << "GEMV\tInputKernel\n";
           for (I = 0; I < _m; ++I) {
-            dbgs() << BaseModel
-                          .eval(ReferenceKernel(Params)[Ctx.int_val(I)])
+            dbgs() << BaseModel.eval(ReferenceKernel(Params)[Ctx.int_val(I)])
                           .as_int64()
                    << "\t\t";
-            dbgs() << BaseModel.eval(InputKernel(SpMVArgs)[Ctx.int_val(I)])
+            dbgs() << BaseModel.eval(InputKernel(InputArgs)[Ctx.int_val(I)])
                           .as_int64()
                    << "\n";
           }
@@ -1282,12 +1311,11 @@ public:
         for (auto *MF : *MatchingFormats)
           FormatString += MF->FormatName + ", ";
         dbgs() << "[REV] BaseCase failed for " << SparseName << "+"
-                       << FormatString << "\n";
+               << FormatString << "\n";
       });
       return false;
     }
-//    return true;
-    return checkInductive(TopLiveOut, SpMVArgs, Slv, Ctx, F, DT);
+    return checkInductive(TopLiveOut, InputArgs, Slv, Ctx, F, DT);
   }
 
   bool checkInductive(Value *TopLiveOut, expr_vector &SpMVArgs, z3::solver &Slv, z3::context &Ctx, Function &F, DominatorTree &DT) {
@@ -1337,7 +1365,7 @@ public:
     expr_vector Assertions(Ctx);
     expr_vector IdxProperties(Ctx);
     A->makeIndexProperties(IdxProperties);
-    // I know there's 4 cases
+    // I am spmv, I know there's 4 cases
     for (unsigned Case = 0; Case < 4; ++Case) {
       Slv.reset();
       Assertions.resize(0);
@@ -1357,7 +1385,6 @@ public:
     }
     return true;
   }
-
 };
 
 class GEMV : public SPMVBase {
@@ -1500,7 +1527,6 @@ public:
     return gemv;
   }
 };
-
 
 
 class DenseMatFormat : public Format {
@@ -2039,20 +2065,17 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   func_decl InputKernel = Translate[&F.getEntryBlock()];
 
-  CSRFormat CSRF(Props, Ctx, Scope, Slv, Converter,
-                 InputKernel);
-  COOFormat COOF(Props, Ctx, Scope, Slv, Converter,
-                 InputKernel);
-  DenseMatFormat DenseMat(Props, Ctx, Scope, Slv, Converter,
-                          InputKernel);
-  DenseVecFormat DenseVec(Props, Ctx, Scope, Slv, Converter,
-                          InputKernel);
+  CSRFormat CSRF(Props, Ctx, Scope, Slv, Converter, InputKernel);
+  COOFormat COOF(Props, Ctx, Scope, Slv, Converter, InputKernel);
+  DenseMatFormat DenseMat(Props, Ctx, Scope, Slv, Converter, InputKernel);
+  DenseVecFormat DenseVec(Props, Ctx, Scope, Slv, Converter, InputKernel);
 
   FormatManager FM;
-  FM.registerFormat(&CSRF, 2, FormatManager::SPARSE);
-  FM.registerFormat(&COOF, 2, FormatManager::SPARSE);
-  FM.registerFormat(&DenseMat, 2, FormatManager::DENSE);
-  FM.registerFormat(&DenseVec, 1, FormatManager::DENSE);
+  FM.registerFormat(&CSRF, FormatManager::SPARSE, 2);
+  FM.registerFormat(&COOF, FormatManager::SPARSE, 2);
+  FM.registerFormat(&DenseMat, FormatManager::DENSE, 2);
+  FM.registerFormat(&DenseVec, FormatManager::DENSE, 1);
+
   GEMV MV(Converter);
   GEMV_reset MVReset(Converter);
   std::vector<Kernel *> Kernels = {&MV, &MVReset};
@@ -2064,10 +2087,12 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     Formats.clear();
     for (auto &E : K->Formats) {
       for (auto *Format : FM.getFormat(E)) {
-        if (Format->validateMapping()) {
+        if (FM.formatIsValid(E) || Format->validateMapping()) {
             Formats.push_back(Format);
+            FM.cacheFormatResult(E, true);
             break; // TODO make sure the format is the only possible one
         }
+        FM.cacheFormatResult(E, false);
       }
     }
     if (Formats.size() == K->Formats.size()) {
