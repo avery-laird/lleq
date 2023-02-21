@@ -2001,8 +2001,6 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   LLVM_DEBUG(dbgs() << F.getName() << "\n");
 
-  auto start = high_resolution_clock::now();
-
   AssumptionCache AC = AM.getResult<AssumptionAnalysis>(F);
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
   DemandedBits DB(F, AC, DT);
