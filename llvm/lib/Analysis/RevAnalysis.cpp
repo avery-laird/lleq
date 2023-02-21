@@ -1351,28 +1351,31 @@ public:
     Params.push_back(A->m);
   }
 
-  bool checkInductiveImpl(func_decl &InputKernelNoLoop, z3::context &Ctx, expr_vector &InputKernelArgs, z3::solver &Slv) override {
+  bool checkInductiveImpl(func_decl &InputKernelNoLoop, z3::context &Ctx,
+                          expr_vector &InputKernelArgs,
+                          z3::solver &Slv) override {
     // I am the kernel, I know how to do the inductive proof
     // get the cases from matrix A
     Format *A = (*MatchingFormats)[0];
-    func_decl SpMVNoLoop = makeKernelNoLoop(Ctx);
-    expr_vector SpMVArgs(Ctx);
-    SpMVArgs.push_back(Ctx.int_val(0));
-    SpMVArgs.push_back(A->makeNumberRows() - 1);
-    SpMVArgs.push_back(Ctx.int_val(0));
-    SpMVArgs.push_back(A->m);
+    func_decl GEMVNoLoop = makeKernelNoLoop(Ctx);
+    expr_vector GEMVArgs(Ctx);
+    GEMVArgs.push_back(Ctx.int_val(0));
+    GEMVArgs.push_back(A->makeNumberRows() - 1);
+    GEMVArgs.push_back(Ctx.int_val(0));
+    GEMVArgs.push_back(A->m);
 
     expr_vector Assertions(Ctx);
     expr_vector IdxProperties(Ctx);
     A->makeIndexProperties(IdxProperties);
     // I am spmv, I know there's 4 cases
+    // TODO change cases to symbolic input for A
     for (unsigned Case = 0; Case < 4; ++Case) {
       Slv.reset();
       Assertions.resize(0);
       A->getCase(Assertions, Case);
       Slv.add(IdxProperties);
       Slv.add(Assertions);
-      Slv.add(SpMVNoLoop(SpMVArgs) != InputKernelNoLoop(InputKernelArgs));
+      Slv.add(GEMVNoLoop(GEMVArgs) != InputKernelNoLoop(InputKernelArgs));
       auto Result = Slv.check();
       if (Result != z3::unsat) {
         LLVM_DEBUG({
@@ -1424,8 +1427,9 @@ public:
                ite(n < i, y,
                    store(gemv(i, n - 1, j, m), n,
                          gemv(i, n - 1, j, m)[n] + dot(n, j, m - 1))));
-    Ctx.recdef(dot, ArgsDot,
-               ite(m < j, Ctx.int_val(0), dot(n, j, m - 1) + Matrix(n, m) * x[m]));
+    Ctx.recdef(
+        dot, ArgsDot,
+        ite(m < j, Ctx.int_val(0), dot(n, j, m - 1) + Matrix(n, m) * x[m]));
     return gemv;
   }
 
@@ -1493,10 +1497,12 @@ public:
                                DotSorts.data(), y[Ctx.int_val(0)].get_sort());
     Ctx.recdef(gemv, ArgsGemv,
                ite(n < i, y, store(gemv(i, n - 1, j, m), n, dot(n, j, m - 1))));
-    Ctx.recdef(dot, ArgsDot,
-               ite(m < j, Ctx.int_val(0), dot(n, j, m - 1) + Matrix(n, m) * x[m]));
+    Ctx.recdef(
+        dot, ArgsDot,
+        ite(m < j, Ctx.int_val(0), dot(n, j, m - 1) + Matrix(n, m) * x[m]));
     return gemv;
   }
+
   func_decl makeKernelNoLoop(context &Ctx) override {
     expr y = Converter.FromVal(LiveOut);
     expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
@@ -1532,8 +1538,8 @@ public:
 class DenseMatFormat : public Format {
 public:
   DenseMatFormat(Properties &Props, z3::context &Ctx,
-            const std::vector<Value *> &Scope, z3::solver &Slv,
-            MakeZ3 &Converter, func_decl InputKernel)
+                 const std::vector<Value *> &Scope, z3::solver &Slv,
+                 MakeZ3 &Converter, func_decl InputKernel)
       : Format(Props, Ctx, Scope, Slv, Converter, InputKernel) {
     FormatName = "DenseMat";
     CARE = 2;
@@ -1574,7 +1580,7 @@ public:
     expr BMat = Converter.FromVal(NameMap["B"]);
     func_decl B = Ctx.recfun("B", Ctx.int_sort(), Ctx.int_sort(),
                              BMat[Ctx.int_val(0)].get_sort());
-    Ctx.recdef(B, Args, BMat[i*m + j]);
+    Ctx.recdef(B, Args, BMat[i * m + j]);
     return B;
   }
 
@@ -1585,12 +1591,6 @@ public:
   expr makeNumberNonZero() override { return nnz; }
 
   void printSparseMatrix(z3::model &Model) override {}
-
-//  bool checkInductive(SmallPtrSet<Value *, 10> &ScopeSet, Value *Y,
-//                      Value *LiveOut, expr_vector &GemvArgs, Function &F,
-//                      DominatorTree &DT) override {
-//    return true;
-//  }
 
   void getCase(expr_vector &Assertions, unsigned Case) override {
     llvm_unreachable("unimplemented!");
@@ -1611,8 +1611,8 @@ public:
     expr_vector Args(Ctx);
     Args.push_back(i);
     expr BMat = Converter.FromVal(NameMap["B"]);
-    func_decl B = Ctx.recfun("B", Ctx.int_sort(),
-                             BMat[Ctx.int_val(0)].get_sort());
+    func_decl B =
+        Ctx.recfun("B", Ctx.int_sort(), BMat[Ctx.int_val(0)].get_sort());
     Ctx.recdef(B, Args, BMat[i]);
     return B;
   }
@@ -1684,7 +1684,6 @@ public:
   }
 
   void makeIndexProperties(expr_vector &Properties) override {
-//    assert(Properties.size() == 0);
     expr n = Converter.FromVal(NameMap["n"]);
     expr rptr = Converter.FromVal(NameMap["rowPtr"]);
     expr col = Converter.FromVal(NameMap["col"]);
@@ -1800,7 +1799,6 @@ public:
         Sets[i].insert(Map["colind"]);
         Sets[i].insert(Map["val"]);
       } else if (P.Name == "loop_bounds") {
-        //        Sets[i].insert(Map["rowPtr"]);
       }
     }
   }
@@ -1828,10 +1826,7 @@ public:
     SearchArgs.push_back(j);
     Ctx.recdef(
         A, Args,
-        ite(exists(
-                t,
-                0 <= t && t < nnz &&
-                    rowind[t] == i && colind[t] == j),
+        ite(exists(t, 0 <= t && t < nnz && rowind[t] == i && colind[t] == j),
             Ctx.int_val(1), Ctx.int_val(0)));
 
     return A;
@@ -2006,10 +2001,6 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   LLVM_DEBUG(dbgs() << F.getName() << "\n");
 
-  // TODO replace with better legality analysis
-  //  if (F.getName() != "spMV_Mul_csr")
-  //    return PreservedAnalyses::all();
-
   auto start = high_resolution_clock::now();
 
   AssumptionCache AC = AM.getResult<AssumptionAnalysis>(F);
@@ -2080,17 +2071,16 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   GEMV_reset MVReset(Converter);
   std::vector<Kernel *> Kernels = {&MV, &MVReset};
 
-
-  std::vector<std::pair<Kernel*, std::vector<Format*>>> PossibleKernels;
+  std::vector<std::pair<Kernel *, std::vector<Format *>>> PossibleKernels;
   std::vector<Format *> Formats;
   for (auto *K : Kernels) {
     Formats.clear();
     for (auto &E : K->Formats) {
       for (auto *Format : FM.getFormat(E)) {
         if (FM.formatIsValid(E) || Format->validateMapping()) {
-            Formats.push_back(Format);
-            FM.cacheFormatResult(E, true);
-            break; // TODO make sure the format is the only possible one
+          Formats.push_back(Format);
+          FM.cacheFormatResult(E, true);
+          break; // TODO make sure the format is the only possible one
         }
         FM.cacheFormatResult(E, false);
       }
@@ -2099,7 +2089,6 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       PossibleKernels.push_back({K, Formats});
     }
   }
-
 
   if (PossibleKernels.empty()) {
     LLVM_DEBUG(dbgs() << "[REV] No viable format mappings found\n");
@@ -2115,58 +2104,57 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       PossibleResult.push_back(E);
   }
 
-  if (PossibleResult.size() == 1) {
-    Kernel *InputProgram = PossibleResult[0].first;
-    std::vector<Format*> &FormatList = PossibleResult[0].second;
-    LLVM_DEBUG({
-      dbgs() << "[REV] mapping found\n";
-      dbgs() << "Mapping: \n";
-      dbgs() << "Input program = " << InputProgram->Name << "\n";
-      dbgs() << "Storage Formats = ";
-      for (auto *Format : FormatList)
-        dbgs() << Format->FormatName << ", ";
-      dbgs() << "\n";
-    });
-
-    std::string FormatString;
-    for (auto *Format : FormatList) FormatString += Format->FormatName + "_";
-
-    // now actually modify the IR
-
-    // cmp1 = @call(my_special_function)
-    // br i8 cmp1 (exit block), (entry block)
-
-    BasicBlock *OldEntry = &F.getEntryBlock();
-    IRBuilder<> Builder(C);
-    BasicBlock *NewEntry =
-        BasicBlock::Create(C, "rev.entry", &F, &F.getEntryBlock());
-    BasicBlock *NewExit = BasicBlock::Create(C, "rev.exit", &F);
-    Builder.SetInsertPoint(NewExit);
-    Builder.CreateRetVoid();
-
-    Builder.SetInsertPoint(NewEntry);
-
-    SmallVector<Type *> ArgTypes;
-    for (auto *V : Scope)
-      ArgTypes.push_back(V->getType());
-
-    auto *FType = FunctionType::get(Type::getInt8Ty(C), ArgTypes, false);
-    auto FHandle = F.getParent()->getOrInsertFunction(
-        InputProgram->SparseName + "_" + FormatString + "D",
-        FType);
-    Value *CallResult = Builder.CreateCall(FHandle, Scope, "dsl.call");
-    Value *CmpResult = Builder.CreateICmpEQ(
-        CallResult, ConstantInt::get(Type::getInt8Ty(C), 1), "rt.check");
-    Builder.CreateCondBr(CmpResult, NewExit, OldEntry);
-
-    LLVM_DEBUG(dbgs() << *F.getParent());
-    // TODO only abandon the analyses we changed
-    return PreservedAnalyses::none();
+  if (PossibleResult.size() != 1) {
+    LLVM_DEBUG(dbgs() << "[REV] Kernel is not GEMV.\n");
+    return PreservedAnalyses::all();
   }
 
-  LLVM_DEBUG(dbgs() << "[REV] Kernel is not GEMV.\n");
+  Kernel *InputProgram = PossibleResult[0].first;
+  std::vector<Format *> &FormatList = PossibleResult[0].second;
+  LLVM_DEBUG({
+    dbgs() << "[REV] mapping found\n";
+    dbgs() << "Mapping: \n";
+    dbgs() << "Input program = " << InputProgram->Name << "\n";
+    dbgs() << "Storage Formats = ";
+    for (auto *Format : FormatList)
+      dbgs() << Format->FormatName << ", ";
+    dbgs() << "\n";
+  });
 
-  return PreservedAnalyses::all();
+  std::string FormatString;
+  for (auto *Format : FormatList)
+    FormatString += Format->FormatName + "_";
+
+  // now actually modify the IR
+
+  // cmp1 = @call(my_special_function)
+  // br i8 cmp1 (exit block), (entry block)
+
+  BasicBlock *OldEntry = &F.getEntryBlock();
+  IRBuilder<> Builder(C);
+  BasicBlock *NewEntry =
+      BasicBlock::Create(C, "rev.entry", &F, &F.getEntryBlock());
+  BasicBlock *NewExit = BasicBlock::Create(C, "rev.exit", &F);
+  Builder.SetInsertPoint(NewExit);
+  Builder.CreateRetVoid();
+
+  Builder.SetInsertPoint(NewEntry);
+
+  SmallVector<Type *> ArgTypes;
+  for (auto *V : Scope)
+    ArgTypes.push_back(V->getType());
+
+  auto *FType = FunctionType::get(Type::getInt8Ty(C), ArgTypes, false);
+  auto FHandle = F.getParent()->getOrInsertFunction(
+      InputProgram->SparseName + "_" + FormatString + "D", FType);
+  Value *CallResult = Builder.CreateCall(FHandle, Scope, "dsl.call");
+  Value *CmpResult = Builder.CreateICmpEQ(
+      CallResult, ConstantInt::get(Type::getInt8Ty(C), 1), "rt.check");
+  Builder.CreateCondBr(CmpResult, NewExit, OldEntry);
+
+  LLVM_DEBUG(dbgs() << *F.getParent());
+  // TODO only abandon the analyses we changed
+  return PreservedAnalyses::none();
 }
 
 // THE MAGIC COMMAND LINE TEXT:
