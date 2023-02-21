@@ -32,7 +32,6 @@ if (DEFINED LLVM_HAVE_TF_AOT OR DEFINED LLVM_HAVE_TF_API)
   endif()
 endif()
 
-find_package(cvc5 REQUIRED)
 
 add_llvm_component_library(LLVMAnalysis
   AliasAnalysis.cpp
@@ -168,8 +167,6 @@ add_llvm_component_library(LLVMAnalysis
 
   LINK_LIBS
   ${MLLinkDeps}
-  cvc5::cvc5
-  cvc5::cvc5parser
 
   LINK_COMPONENTS
   BinaryFormat
@@ -182,8 +179,9 @@ add_llvm_component_library(LLVMAnalysis
 
 find_package(Z3
         REQUIRED
-        CONFIG)
+        CONFIG
+        PATHS "/files/llvm-rev/z3/debug")
 
 target_include_directories(LLVMAnalysis PRIVATE ${Z3_CXX_INCLUDE_DIRS})
-target_link_libraries(LLVMAnalysis PRIVATE ${Z3_LIBRARIES} cvc5::cvc5 cvc5::cvc5parser)
+target_link_libraries(LLVMAnalysis PRIVATE ${Z3_LIBRARIES})
 target_compile_options(LLVMAnalysis PRIVATE ${Z3_COMPONENT_CXX_FLAGS})

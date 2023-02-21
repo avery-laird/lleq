@@ -23,7 +23,6 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include <chrono>
-#include <cvc5/cvc5.h>
 #include <fstream>
 #include <sstream>
 
@@ -33,7 +32,6 @@ using namespace std::chrono;
 
 using namespace llvm;
 using namespace z3;
-using namespace cvc5;
 
 static cl::opt<bool>
     EnableLifting("enable-lifting", cl::init(true), cl::Hidden,
@@ -120,7 +118,6 @@ private:
   context &c;
   expr_vector Z3Symbols;
   func_decl_vector Z3Functions;
-  std::vector<Term> CVCSymbols;
 
   DenseMap<Value *, unsigned> Z3Map;
   DenseMap<Value *, unsigned> Z3FunMap;
@@ -245,7 +242,7 @@ public:
 //      Mantissa = APFloat::semanticsPrecision(T->getFltSemantics());
 //      Exponent = APFloat::semanticsSizeInBits(T->getFltSemantics()) - Mantissa;
       //      return c.fpa_sort(Exponent, Mantissa);
-      return c.int_sort();
+      return c.real_sort();
     }
   }
 
@@ -277,7 +274,7 @@ protected:
     APSInt Result(64, false); // 64 bits wide, possibly signed
     bool isExact;
     if (isa<UndefValue>(V))
-      return c.int_val(0);
+      return c.real_val(0);
 
     switch (V->getType()->getTypeID()) {
     case Type::TypeID::IntegerTyID:
@@ -287,7 +284,7 @@ protected:
       // TODO remove this debug hack
       dyn_cast<ConstantFP>(V)->getValue().convertToInteger(
           Result, APFloatBase::rmNearestTiesToEven, &isExact);
-      return c.int_val(Result.getSExtValue());
+      return c.real_val(Result.getSExtValue());
       //      return
       //      c.fpa_val(dyn_cast<ConstantFP>(V)->getValue().convertToDouble());
     default:
@@ -840,7 +837,7 @@ public:
         EQUAL(Ctx.constant("EQUAL",
                            Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()))),
         n(Ctx.int_const("n")), m(Ctx.int_const("m")), nnz(Ctx.int_const("nnz")),
-        Model(Ctx) {}
+        Matrix(Ctx), Model(Ctx) {}
 
   void printMapping(z3::model &M, unsigned LB, unsigned UB) {
     LLVM_DEBUG({
@@ -978,6 +975,7 @@ public:
   }
 
   virtual func_decl makeMatrix() = 0;
+  func_decl getMatrix() { return Matrix; };
   virtual void makeIndexProperties(expr_vector &Properties) = 0;
   virtual expr makeNumberRows() = 0;
   virtual expr makeNumberNonZero() = 0;
@@ -1152,7 +1150,7 @@ public:
   z3::expr nnz;
   z3::model Model;
   Kernel *Kern = nullptr;
-  std::optional<func_decl> Matrix;
+  func_decl Matrix;
   NameMapTy NameMap;
 };
 
@@ -1213,7 +1211,6 @@ public:
 
     expr_vector IdxProperties(Ctx);
     for (Format *MF : *MatchingFormats) {
-      MF->initEqualityChecking();
       MF->setKernel(this);
       MF->makeIndexProperties(IdxProperties);
     }
@@ -1253,7 +1250,7 @@ public:
           Format *XFormat = (*MatchingFormats)[1];
           expr x = Converter.FromVal(XFormat->NameMap["B"]);
           Value *Y = LiveOut;
-          func_decl Matrix = A->makeMatrix();
+          func_decl Matrix = A->getMatrix();
           expr n = A->makeNumberRows();
           expr m = A->m;
           z3::model BaseModel = Slv.get_model();
@@ -1401,7 +1398,7 @@ public:
     // x is constructed from dense format
     expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
     // matrix is constructed from sparse format
-    func_decl Matrix = (*MatchingFormats)[0]->makeMatrix();
+    func_decl Matrix = (*MatchingFormats)[0]->getMatrix();
     expr n = Ctx.int_const("n");
     expr m = Ctx.int_const("m");
     expr i = Ctx.int_const("i");
@@ -1431,7 +1428,7 @@ public:
                          gemv(i, n - 1, j, m)[n] + dot(n, j, m - 1))));
     Ctx.recdef(
         dot, ArgsDot,
-        ite(m < j, Ctx.int_val(0), dot(n, j, m - 1) + Matrix(n, m) * x[m]));
+        ite(m < j, Ctx.real_val(0), dot(n, j, m - 1) + Matrix(n, m) * x[m]));
     return gemv;
   }
 
@@ -1440,7 +1437,7 @@ public:
     // x is constructed from dense format
     expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
     // matrix is constructed from sparse format
-    func_decl Matrix = (*MatchingFormats)[0]->makeMatrix();
+    func_decl Matrix = (*MatchingFormats)[0]->getMatrix();
     expr n = Ctx.int_const("n");
     expr m = Ctx.int_const("m");
     expr i = Ctx.int_const("i");
@@ -1473,7 +1470,7 @@ public:
     // x is constructed from dense format
     expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
     // matrix is constructed from sparse format
-    func_decl Matrix = (*MatchingFormats)[0]->makeMatrix();
+    func_decl Matrix = (*MatchingFormats)[0]->getMatrix();
     expr n = Ctx.int_const("n");
     expr m = Ctx.int_const("m");
     expr i = Ctx.int_const("i");
@@ -1501,7 +1498,7 @@ public:
                ite(n < i, y, store(gemv(i, n - 1, j, m), n, dot(n, j, m - 1))));
     Ctx.recdef(
         dot, ArgsDot,
-        ite(m < j, Ctx.int_val(0), dot(n, j, m - 1) + Matrix(n, m) * x[m]));
+        ite(m < j, Ctx.real_val(0), dot(n, j, m - 1) + Matrix(n, m) * x[m]));
     return gemv;
   }
 
@@ -1509,7 +1506,7 @@ public:
     expr y = Converter.FromVal(LiveOut);
     expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
     // matrix is constructed from sparse format
-    func_decl Matrix = (*MatchingFormats)[0]->makeMatrix();
+    func_decl Matrix = (*MatchingFormats)[0]->getMatrix();
     expr n = Ctx.int_const("n");
     expr m = Ctx.int_const("m");
     expr i = Ctx.int_const("i");
@@ -1681,7 +1678,7 @@ public:
                              val[Ctx.int_val(0)].get_sort());
     Ctx.recdef(A, Args,
                ite(exists(t, rptr[n] <= t && t < rptr[n + 1] && col[t] == m),
-                   Ctx.int_val(1), Ctx.int_val(0)));
+                   Ctx.real_val(1), Ctx.real_val(0)));
     return A;
   }
 
@@ -1725,36 +1722,36 @@ public:
     expr rptr = Converter.FromVal(NameMap["rowPtr"]);
     expr col = Converter.FromVal(NameMap["col"]);
     expr val = Converter.FromVal(NameMap["val"]);
-    expr zero = Ctx.int_val(0);
-    expr one = Ctx.int_val(1);
+    expr int_zero = Ctx.int_val(0);
+    expr int_one = Ctx.int_val(1);
     Assertions.push_back(n > 2);
     Assertions.push_back(m > 2);
     switch (Case) {
     default:
       llvm_unreachable("unsupported case! CSR only has 4 inductive cases.");
     case 0:
-      Assertions.push_back(rptr[zero] == nnz);
-      Assertions.push_back(rptr[one] == nnz);
-      Assertions.push_back(col[zero] == zero);
-      Assertions.push_back(val[zero] == zero);
+      Assertions.push_back(rptr[int_zero] == nnz);
+      Assertions.push_back(rptr[int_one] == nnz);
+      Assertions.push_back(col[int_zero] == 0);
+      Assertions.push_back(val[int_zero] == 0);
       return;
     case 1:
-      Assertions.push_back(rptr[zero] == nnz);
-      Assertions.push_back(rptr[one] == nnz + 1);
-      Assertions.push_back(col[zero] == zero);
-      Assertions.push_back(val[zero] != zero);
+      Assertions.push_back(rptr[int_zero] == nnz);
+      Assertions.push_back(rptr[int_one] == nnz + 1);
+      Assertions.push_back(col[int_zero] == 0);
+      Assertions.push_back(val[int_zero] != 0);
       return;
     case 2:
-      Assertions.push_back(rptr[zero] == m);
-      Assertions.push_back(rptr[one] == m+1);
+      Assertions.push_back(rptr[int_zero] == m);
+      Assertions.push_back(rptr[int_one] == m+1);
       Assertions.push_back(col[m] == m);
-      Assertions.push_back(val[m] == zero);
+      Assertions.push_back(val[m] == 0);
       return;
     case 3:
-      Assertions.push_back(rptr[zero] == m);
-      Assertions.push_back(rptr[one] == m+1);
+      Assertions.push_back(rptr[int_zero] == m);
+      Assertions.push_back(rptr[int_one] == m+1);
       Assertions.push_back(col[m] == m);
-      Assertions.push_back(val[m] != zero);
+      Assertions.push_back(val[m] != 0);
       return;
     }
   }
@@ -1829,7 +1826,7 @@ public:
     Ctx.recdef(
         A, Args,
         ite(exists(t, 0 <= t && t < nnz && rowind[t] == i && colind[t] == j),
-            Ctx.int_val(1), Ctx.int_val(0)));
+            Ctx.real_val(1), Ctx.real_val(0)));
 
     return A;
   }
@@ -2077,8 +2074,13 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     Formats.clear();
     for (auto &E : K->Formats) {
       for (auto *Format : FM.getFormat(E)) {
-        if (!FM.isKnown(E))
+        if (!FM.isKnown(E)) {
           FM.cacheFormatResult(E, Format->validateMapping());
+          if (FM.isValid(E)) {
+            // eagerly initialize the format
+            Format->initEqualityChecking();
+          }
+        }
         if (FM.isValid(E)) {
           Formats.push_back(Format);
           break; // TODO make sure the format is the only possible one
