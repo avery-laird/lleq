@@ -1181,11 +1181,13 @@ public:
   void cacheFormatResult(PairTy &P, bool Result) {
     Map[{(int)P.first, P.second}] = Result;
   }
-  bool formatIsValid(PairTy &P) {
-    if (Map.count({(int)P.first, P.second}))
-      return Map[{(int)P.first, P.second}];
-    return false;
+  bool isKnown(PairTy &P) {
+    return Map.count({(int)P.first, P.second});
   }
+  bool isValid(PairTy &P) {
+    return isKnown(P) && Map[{(int)P.first, P.second}];
+  }
+
 };
 
 class Kernel {
@@ -2075,12 +2077,12 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     Formats.clear();
     for (auto &E : K->Formats) {
       for (auto *Format : FM.getFormat(E)) {
-        if (FM.formatIsValid(E) || Format->validateMapping()) {
+        if (!FM.isKnown(E))
+          FM.cacheFormatResult(E, Format->validateMapping());
+        if (FM.isValid(E)) {
           Formats.push_back(Format);
-          FM.cacheFormatResult(E, true);
           break; // TODO make sure the format is the only possible one
         }
-        FM.cacheFormatResult(E, false);
       }
     }
     if (Formats.size() == K->Formats.size()) {
