@@ -1216,14 +1216,12 @@ public:
     }
     // verify base case
     func_decl ReferenceKernel = makeKernel(Ctx);
-    bool BaseCase = true;
     std::vector<std::vector<unsigned>> Bases = {
         {1, 1},
         // TODO: do we need to check all of these?
-        // figure out why COO loops on other cases.
-        //        {1,2},
-        //        {2,1},
-        //        {2,2}
+        {1,2},
+        {2,1},
+        {2,2}
     };
 
     expr_vector Params(Ctx);
@@ -1234,6 +1232,7 @@ public:
       InputArgs.push_back(Converter.FromVal(V));
 
     expr_vector Assertions(Ctx);
+    bool BaseCase = true;
     for (auto &Base : Bases) {
       Slv.reset();
       Assertions.resize(0);
@@ -1324,7 +1323,7 @@ public:
     SSA2Func NoLoopSpMV(Ctx, &DT, &Converter, TopLiveOut);
     auto StraightLine = NoLoopSpMV.straightlineFromFunction(&F, &Cycles);
 
-    // every format has their own inductive step cases
+    // every Kernel coordinates its inductive step cases
     return checkInductiveImpl(StraightLine, Ctx, SpMVArgs, Slv);
   }
 
