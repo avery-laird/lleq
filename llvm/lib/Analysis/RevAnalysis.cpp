@@ -2098,6 +2098,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // Now test every possible kernel
   std::vector<std::pair<Kernel *, std::vector<Format *>>> PossibleResult;
   for (auto &E : PossibleKernels) {
+    // TODO: make sure the mapping covers the whole live-in set,
+    // otherwise the kernel is invalid and skip
     Kernel *K = E.first;
     K->setMatchingFormats(&E.second);
     if (K->checkEquality(LiveOut, F, DT, Ctx, Slv, Scope, InputKernel))
