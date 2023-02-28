@@ -47,3 +47,4 @@ add_function_target(spmv_csr_nomklheader.cpp spMV_Mul_csr ${PROJECT_BINARY_DIR}/
 add_function_target(spmv_coo.c spmv_coo ${PROJECT_BINARY_DIR}/bin/clang)
 add_function_target(spmm_csr.cpp spmm_v2 ${PROJECT_BINARY_DIR}/bin/clang++)
 add_function_target(spmm_naive.cpp spmm_naive_csr ${PROJECT_BINARY_DIR}/bin/clang++)
+add_function_target(hpcg_spmv.cpp ComputeSPMV_ref_nostruct ${PROJECT_BINARY_DIR}/bin/clang++)

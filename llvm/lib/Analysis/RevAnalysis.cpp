@@ -124,13 +124,16 @@ private:
   DenseMap<Value *, unsigned> CVC5Map;
 };
 
-template <typename ExprTy, typename SortTy> class MakeSMT {
+template <typename AExprTy, typename AFuncTy, typename ASortTy> class MakeSMT {
 protected:
   Loop *L = nullptr;
   LoopInfo *LI = nullptr;
   ScalarEvolution &SE;
   LoopNest *LN = nullptr;
   SmallPtrSet<Value *, 5> BuildRecursive;
+  using ExprTy = AExprTy;
+  using FuncTy = AFuncTy;
+  using SortTy = ASortTy;
 
 public:
   MakeSMT(TerminalMap &Map, ScalarEvolution &SE) : SE(SE), Map(Map) {}
@@ -200,12 +203,14 @@ protected:
 
   virtual SortTy ToSort(Value *V) = 0;
   virtual SortTy ToSort(Type *T) = 0;
+  virtual FuncTy getOrMakeTupleCons(StructType *) = 0;
+  virtual ExprTy getTuple(StructType *, expr, unsigned Idx) = 0;
 };
 
-class MakeZ3 : public MakeSMT<expr, z3::sort> {
+class MakeZ3 : public MakeSMT<expr, func_decl, z3::sort> {
 public:
   MakeZ3(TerminalMap &Map, ScalarEvolution &SE, context &c)
-      : MakeSMT(Map, SE), c(c) {}
+      : MakeSMT(Map, SE), c(c), TupleMap(c) {}
 
   z3::sort ToSort(Value *V) override {
     auto *T = V->getType();
@@ -218,12 +223,21 @@ public:
       return ToSort(T);
     case Type::TypeID::PointerTyID:
       // try to find a use that we can infer the type from
+      Type *MemType = nullptr;
       for (auto *Use : V->users()) {
-        if ((isa<LoadInst>(Use) || isa<StoreInst>(Use)))
-          return c.array_sort(c.int_sort(), ToSort(getLoadStoreType(Use)));
-        if (auto *GEP = dyn_cast<GEPOperator>(Use))
-          return c.array_sort(c.int_sort(),
-                              ToSort(GEP->getSourceElementType()));
+        if ((isa<LoadInst>(Use) || isa<StoreInst>(Use))) {
+          MemType = getLoadStoreType(Use);
+          break;
+        }
+        if (auto *GEP = dyn_cast<GEPOperator>(Use)) {
+          MemType = GEP->getSourceElementType();
+          break;
+        }
+      }
+      if (auto *StructTy = dyn_cast<StructType>(MemType)) {
+        return getOrMakeTupleCons(StructTy).range();
+      } else {
+        return c.array_sort(c.int_sort(), ToSort(MemType));
       }
       llvm_unreachable("couldn't infer the type of the pointer.");
     }
@@ -231,9 +245,16 @@ public:
 
   z3::sort ToSort(Type *T) override {
     unsigned Mantissa, Exponent;
+    std::string OutStr;
+    raw_string_ostream OS(OutStr);
     switch (T->getTypeID()) {
     default:
-      llvm_unreachable("unsupported LLVM type.");
+      T->print(OS);
+      // TODO have a better way to handle this
+      LLVM_DEBUG({
+        dbgs() << "[REV] WARNING: treating unknown type as uninterpreted sort.\n";
+      });
+      return c.uninterpreted_sort(OutStr.c_str());
     case Type::TypeID::IntegerTyID:
       return c.int_sort();
     case Type::TypeID::DoubleTyID:
@@ -243,6 +264,12 @@ public:
 //      Exponent = APFloat::semanticsSizeInBits(T->getFltSemantics()) - Mantissa;
       //      return c.fpa_sort(Exponent, Mantissa);
       return c.real_sort();
+    case Type::TypeID::PointerTyID:
+      // TODO treat all pointers as int, and have one heap only.
+      LLVM_DEBUG({
+          dbgs() << "[REV] WARNING: treating anonymous pointer as int.\n";
+      });
+      return c.int_sort();
     }
   }
 
@@ -263,6 +290,8 @@ public:
 
 protected:
   context &c;
+  func_decl_vector TupleMap;
+  std::vector<func_decl_vector> Projections;
 
   unsigned count(Value *V) override { return Map.countZ3(V); }
 
@@ -378,6 +407,43 @@ protected:
   expr FromPHIorArg(Value *V) override {
     return c.constant(V->getName().str().c_str(), ToSort(V));
   }
+
+  int findTuple(StructType *T) {
+    for (unsigned I = 0; I < TupleMap.size(); ++I)
+      if (TupleMap[I].name().str() == T->getStructName())
+        return I;
+    return -1;
+  }
+
+  FuncTy getOrMakeTupleCons(StructType *T) override {
+      int Idx = findTuple(T);
+      if (Idx > -1) return TupleMap[Idx];
+
+      std::vector<const char *> Names;
+      std::vector<z3::sort> Sorts;
+      for (auto *FieldTy : T->elements()) {
+        std::string FieldName;
+        raw_string_ostream OS(FieldName);
+        FieldTy->print(OS);
+        Names.push_back(OS.str().c_str());
+        Sorts.push_back(ToSort(FieldTy));
+      }
+      func_decl_vector Projs(c);
+      func_decl NewTuple = c.tuple_sort(
+          T->getStructName().str().c_str(),
+          T->getNumElements(),
+          Names.data(),
+          Sorts.data(),
+          Projs);
+      Projections.push_back(Projs);
+      return NewTuple;
+  };
+  ExprTy getTuple(StructType *T, expr E, unsigned Idx) override {
+      int Tuple = findTuple(T);
+      assert(Tuple > -1 && "no tuple exists for this type.");
+      func_decl Get = Projections[Tuple][Idx];
+      return Get(E);
+  };
 };
 
 class SSA2Func {
@@ -1162,7 +1228,7 @@ public:
     SPARSE = 0, DENSE = 1
   };
   using PairTy = std::pair<Compression, unsigned>;
-  using MappingTy = DenseMap<std::pair<int, unsigned>, bool>;
+  using MappingTy = DenseMap<Format *, bool>;
   MappingTy Map;
 
   void registerFormat(Format *F, Compression C, unsigned Dim) {
@@ -1176,14 +1242,14 @@ public:
   std::vector<Format*> getFormat(PairTy &P) {
     return getFormat(P.first, P.second);
   }
-  void cacheFormatResult(PairTy &P, bool Result) {
-    Map[{(int)P.first, P.second}] = Result;
+  void cacheFormatResult(Format *F, bool Result) {
+    Map[F] = Result;
   }
-  bool isKnown(PairTy &P) {
-    return Map.count({(int)P.first, P.second});
+  bool isKnown(Format *F) {
+    return Map.count(F);
   }
-  bool isValid(PairTy &P) {
-    return isKnown(P) && Map[{(int)P.first, P.second}];
+  bool isValid(Format *F) {
+    return isKnown(F) && Map[F];
   }
 
 };
@@ -1219,9 +1285,9 @@ public:
     std::vector<std::vector<unsigned>> Bases = {
         {1, 1},
         // TODO: do we need to check all of these?
-        {1,2},
-        {2,1},
-        {2,2}
+//        {1,2},
+//        {2,1},
+//        {2,2}
     };
 
     expr_vector Params(Ctx);
@@ -1268,9 +1334,10 @@ public:
 
           unsigned I;
           for (I = 0; I < _n; ++I) {
+            dbgs() << BaseModel.eval(Converter.FromVal(Y)[Ctx.int_val(I)]).as_double() << " + ";
             for (unsigned J = 0; J < _m; ++J) {
               dbgs() << BaseModel.eval(Matrix(Ctx.int_val(I), Ctx.int_val(J)))
-                            .as_int64()
+                            .to_string()
                      << " ";
             }
             dbgs() << "| " << BaseModel.eval(x[Ctx.int_val(I)]).as_int64();
@@ -1279,24 +1346,24 @@ public:
             else
               dbgs() << "   ";
             dbgs() << " "
-                   << BaseModel.eval(Converter.FromVal(Y)[Ctx.int_val(I)])
-                          .as_int64()
+                   << BaseModel.eval(ReferenceKernel(Params)[Ctx.int_val(I)])
+                          .as_double()
                    << "\n";
           }
           for (; I < _m; ++I) {
             for (unsigned Pad = 0; Pad < (_m * 2 + 7); ++Pad)
               dbgs() << " ";
-            dbgs() << BaseModel.eval(Converter.FromVal(Y)[Ctx.int_val(I)])
-                          .as_int64()
+            dbgs() << BaseModel.eval(ReferenceKernel(Params)[Ctx.int_val(I)])
+                          .as_double()
                    << "\n";
           }
           dbgs() << "GEMV\tInputKernel\n";
           for (I = 0; I < _m; ++I) {
             dbgs() << BaseModel.eval(ReferenceKernel(Params)[Ctx.int_val(I)])
-                          .as_int64()
+                          .as_double()
                    << "\t\t";
             dbgs() << BaseModel.eval(InputKernel(InputArgs)[Ctx.int_val(I)])
-                          .as_int64()
+                          .as_double()
                    << "\n";
           }
         });
@@ -1988,6 +2055,28 @@ public:
 
   void getCase(expr_vector &Assertions, unsigned Case) override {
     llvm_unreachable("unimplemented!");
+    expr val = Converter.FromVal(NameMap["val"]);
+    expr rowind = Converter.FromVal(NameMap["rowind"]);
+    expr colind = Converter.FromVal(NameMap["colind"]);
+    expr zero = Ctx.int_val(0);
+
+    Assertions.push_back(n > 2);
+    Assertions.push_back(m > 2);
+    switch (Case) {
+      default:
+        llvm_unreachable("invalid inductive case.");
+      case 0:
+        Assertions.push_back(nnz == 0);
+        Assertions.push_back(val[zero] == 0);
+        return;
+      case 1:
+        Assertions.push_back(rowind[zero] == n);
+        Assertions.push_back(colind[zero] == 0);
+        Assertions.push_back(val[zero] != 0);
+        Assertions.push_back(val[n*m] != 0);
+        Assertions.push_back(val[n*m] == val[zero]);
+        return;
+    }
   }
 };
 
@@ -2073,14 +2162,14 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     Formats.clear();
     for (auto &E : K->Formats) {
       for (auto *Format : FM.getFormat(E)) {
-        if (!FM.isKnown(E)) {
-          FM.cacheFormatResult(E, Format->validateMapping());
-          if (FM.isValid(E)) {
+        if (!FM.isKnown(Format)) {
+          FM.cacheFormatResult(Format, Format->validateMapping());
+          if (FM.isValid(Format)) {
             // eagerly initialize the format
             Format->initEqualityChecking();
           }
         }
-        if (FM.isValid(E)) {
+        if (FM.isValid(Format)) {
           Formats.push_back(Format);
           break; // TODO make sure the format is the only possible one
         }
