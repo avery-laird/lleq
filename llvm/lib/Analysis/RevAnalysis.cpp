@@ -852,25 +852,22 @@ public:
              return false;
            for (const Loop *L : LN.getLoops()) {
              auto Bounds = L->getBounds(SE);
-             LoadInst *LowInstr =
-                 dyn_cast<LoadInst>(&Bounds->getInitialIVValue());
-             LoadInst *UpInstr = dyn_cast<LoadInst>(&Bounds->getFinalIVValue());
-             if (!LowInstr || !UpInstr)
+             Value *LowerBound = &Bounds->getInitialIVValue();
+             while (isa_and_nonnull<CastInst>(LowerBound)) LowerBound = static_cast<CastInst*>(LowerBound)->getOperand(0);
+             LoadInst *LowInstr = dyn_cast<LoadInst>(LowerBound);
+
+             Value *UpperBound = &Bounds->getFinalIVValue();
+             while (isa_and_nonnull<CastInst>(UpperBound)) UpperBound = static_cast<CastInst*>(UpperBound)->getOperand(0);
+             LoadInst *UpInstr = dyn_cast<LoadInst>(UpperBound);
+             if (!LowInstr && !UpInstr)
                continue;
-             Value *LowPtr = getLoadStorePointerOperand(LowInstr);
-             Value *UpPtr = getLoadStorePointerOperand(UpInstr);
-             auto *LowGEP = dyn_cast<GetElementPtrInst>(LowPtr);
-             auto *HighGEP = dyn_cast<GetElementPtrInst>(UpPtr);
-             if (!LowGEP || !HighGEP)
+             LoadInst *Candidate = LowInstr ? LowInstr : UpInstr;
+             Value *GEPVal = getLoadStorePointerOperand(Candidate);
+             if (!isa_and_nonnull<GEPOperator>(GEPVal))
                continue;
-             Value *LowPtrBase = LowGEP->getPointerOperand();
-             Value *HighPtrBase = HighGEP->getPointerOperand();
-             const SCEV *LowIndex = SE.getSCEV(LowGEP->getOperand(1));
-             const SCEV *HighIndex = SE.getSCEV(HighGEP->getOperand(1));
-             const SCEV *OffsetIndex = SE.getMinusSCEV(HighIndex, LowIndex);
-             if (LowPtrBase != HighPtrBase)
-               continue;
-             if (LowPtrBase == V)
+             auto *GEPInst = dyn_cast<GEPOperator>(GEPVal);
+             Value *PtrBase = GEPInst->getPointerOperand();
+             if (PtrBase == V)
                return true;
            }
            return false;
