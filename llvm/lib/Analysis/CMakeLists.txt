@@ -177,11 +177,28 @@ add_llvm_component_library(LLVMAnalysis
   Support
   )
 
+set(Z3_ROOT ${PROJECT_SOURCE_DIR})
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(Z3_DIR ${PROJECT_SOURCE_DIR}/z3/debug)
+else()
+  set(Z3_DIR ${PROJECT_SOURCE_DIR}/z3/build)
+endif()
+message("${Z3_DIR}")
 find_package(Z3
         REQUIRED
         CONFIG
-        PATHS "/files/llvm-rev/z3/debug")
+        NO_DEFAULT_PATH
+        NO_CMAKE_PATH
+        NO_CMAKE_ENVIRONMENT_PATH
+        NO_CMAKE_PACKAGE_REGISTRY
+        NO_CMAKE_SYSTEM_PATH
+        PATHS ${PROJECT_SOURCE_DIR}/z3)
+message("Found z3 at: ${Z3_CXX_INCLUDE_DIRS}")
 
+add_library(z3 SHARED IMPORTED)
+set_target_properties(z3 PROPERTIES IMPORTED_LOCATION ${Z3_DIR}/libz3.so)
+install(IMPORTED_RUNTIME_ARTIFACTS z3)
+
+target_link_libraries(LLVMAnalysis PRIVATE z3)
 target_include_directories(LLVMAnalysis PRIVATE ${Z3_CXX_INCLUDE_DIRS})
-target_link_libraries(LLVMAnalysis PRIVATE ${Z3_LIBRARIES})
 target_compile_options(LLVMAnalysis PRIVATE ${Z3_COMPONENT_CXX_FLAGS})
