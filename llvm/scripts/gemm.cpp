@@ -4,17 +4,16 @@
 
 extern "C" {
 
-void gemm(int m, int n, int k, double *a, int lda, double *b, int ldb,
-          double *c, int ldc) {
-  int i, j, p;
+void gemm(int n, int m, double *a, int colsA, double *b,
+          double *c) {
+  int i, j, k;
 
-  for (i = 0; i < m; ++i) { /* Loop over the rows of C */
-    for (j = 0; j < n; ++j) {   /* Loop over the columns of C */
-      for (p=0; p<k; ++p){
-        c[i*ldc + j] += a[i*lda + p] * b[p*ldb + j];
+  for (i = 0; i < n; ++i) {   /* Loop over the rows of C */
+    for (j = 0; j < m; ++j) { /* Loop over the columns of C */
+      for (k = 0; k < colsA; ++k) {
+        c[i * m + j] += a[i * colsA + k] * b[k * m + j];
       }
     }
   }
 }
-
 }

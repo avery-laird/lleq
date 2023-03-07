@@ -125,6 +125,7 @@ private:
 };
 
 template <typename AExprTy, typename AFuncTy, typename ASortTy> class MakeSMT {
+  friend class Kernel;
 protected:
   Loop *L = nullptr;
   LoopInfo *LI = nullptr;
@@ -695,43 +696,43 @@ SSA2Func ParseInputFile(StringRef Path, StringRef FunctionName,
 
   SSA2Func File(Ctx, &DT, &Converter, Stores);
   File.fromFunction(F);
-  // let's try something interesting...
-  solver Slv(Ctx);
-  expr n = Converter.FromVal(F->getArg(0));
-  expr m = Converter.FromVal(F->getArg(1));
-  expr A = Converter.FromVal(F->getArg(2));
-  expr rptr = Converter.FromVal(F->getArg(3));
-  expr cols = Converter.FromVal(F->getArg(4));
-  expr vals = Converter.FromVal(F->getArg(5));
-  auto mki = [&](int i) { return Ctx.int_val(i); };
-  Slv.add(n == 2);
-  Slv.add(m == 2);
-  Slv.add(A[mki(0)] == 0);
-  Slv.add(A[mki(1)] == 1);
-  Slv.add(A[mki(2)] == 1);
-  Slv.add(A[mki(3)] == 0);
-  Slv.add(forall(n, rptr[n] == 0));
-  auto Result = Slv.check();
-  if (Result == z3::sat) {
-    auto Model = Slv.get_model();
-    std::vector<expr> Args = {n, m, A, rptr, cols, vals};
-    auto Output = File[&F->getEntryBlock()](Args.size(), Args.data());
-    //    LLVM_DEBUG({
-    dbgs() << "Concrete Test output: \n";
-    std::vector<unsigned> lens = {2, 2, 3};
-    for (int idx : {0, 1, 2}) {
-      auto array = Model.eval(File.getNth(idx)(Output).simplify());
-      for (int i = 0; i < lens[idx]; ++i) {
-        auto elem = Model.eval(array[mki(i)].simplify());
-        if (elem.is_fpa())
-          dbgs() << Z3_get_numeral_string(Ctx, elem) << " ";
-        else
-          dbgs() << elem.to_string() << " ";
-      }
-      dbgs() << "\n";
-    }
-    //    });
-  }
+//  // let's try something interesting...
+//  solver Slv(Ctx);
+//  expr n = Converter.FromVal(F->getArg(0));
+//  expr m = Converter.FromVal(F->getArg(1));
+//  expr A = Converter.FromVal(F->getArg(2));
+//  expr rptr = Converter.FromVal(F->getArg(3));
+//  expr cols = Converter.FromVal(F->getArg(4));
+//  expr vals = Converter.FromVal(F->getArg(5));
+//  auto mki = [&](int i) { return Ctx.int_val(i); };
+//  Slv.add(n == 2);
+//  Slv.add(m == 2);
+//  Slv.add(A[mki(0)] == 0);
+//  Slv.add(A[mki(1)] == 1);
+//  Slv.add(A[mki(2)] == 1);
+//  Slv.add(A[mki(3)] == 0);
+//  Slv.add(forall(n, rptr[n] == 0));
+//  auto Result = Slv.check();
+//  if (Result == z3::sat) {
+//    auto Model = Slv.get_model();
+//    std::vector<expr> Args = {n, m, A, rptr, cols, vals};
+//    auto Output = File[&F->getEntryBlock()](Args.size(), Args.data());
+//    //    LLVM_DEBUG({
+//    dbgs() << "Concrete Test output: \n";
+//    std::vector<unsigned> lens = {2, 2, 3};
+//    for (int idx : {0, 1, 2}) {
+//      auto array = Model.eval(File.getNth(idx)(Output).simplify());
+//      for (int i = 0; i < lens[idx]; ++i) {
+//        auto elem = Model.eval(array[mki(i)].simplify());
+//        if (elem.is_fpa())
+//          dbgs() << Z3_get_numeral_string(Ctx, elem) << " ";
+//        else
+//          dbgs() << elem.to_string() << " ";
+//      }
+//      dbgs() << "\n";
+//    }
+//    //    });
+//  }
   return File;
 }
 
@@ -821,7 +822,7 @@ public:
            return false;
          }},
         {"direct_access",
-         [](Value *V) {
+         [&](Value *V) {
            if (V->getType()->getTypeID() != Type::TypeID::PointerTyID)
              return false;
            // do GEPs have only 1 dimension?
@@ -833,16 +834,22 @@ public:
                      "GEPOperators with multiple indices are not supported.");
                auto &Idx = *GEP->indices().begin();
                Instruction *Inst = dyn_cast<Instruction>(&Idx);
-               while (Inst != nullptr &&
-                      (isa<SExtInst>(Inst) || isa<ZExtInst>(Inst) ||
-                       isa<BitCastInst>(Inst))) {
-                 Instruction *Tmp = dyn_cast<Instruction>(Inst->getOperand(0));
-                 if (Tmp == nullptr)
-                   break;
-                 Inst = Tmp;
+               const SCEV *S = SE.getSCEV(Idx);
+               if (auto *AR = dyn_cast<SCEVAddRecExpr>(S)) {
+                 if (AR->isAffine())
+                   continue ;
                }
-               if (getLoadStorePointerOperand(Inst))
-                 return false;
+               return false;
+//               while (Inst != nullptr &&
+//                      (isa<SExtInst>(Inst) || isa<ZExtInst>(Inst) ||
+//                       isa<BitCastInst>(Inst))) {
+//                 Instruction *Tmp = dyn_cast<Instruction>(Inst->getOperand(0));
+//                 if (Tmp == nullptr)
+//                   break;
+//                 Inst = Tmp;
+//               }
+//               if (getLoadStorePointerOperand(Inst))
+//                 return false;
              }
            }
            return true;
@@ -1310,7 +1317,7 @@ public:
         LLVM_DEBUG({
           Format *A = (*MatchingFormats)[0];
           Format *XFormat = (*MatchingFormats)[1];
-          expr x = Converter.FromVal(XFormat->NameMap["B"]);
+          expr x = Converter.FromVal(XFormat->NameMap["x"]);
           Value *Y = LiveOut;
           func_decl Matrix = A->getMatrix();
           expr n = A->makeNumberRows();
@@ -1459,7 +1466,7 @@ public:
   func_decl makeKernel(context &Ctx) override {
     expr y = Converter.FromVal(LiveOut);
     // x is constructed from dense format
-    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
+    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["x"]);
     // matrix is constructed from sparse format
     func_decl Matrix = (*MatchingFormats)[0]->getMatrix();
     expr n = Ctx.int_const("n");
@@ -1498,7 +1505,7 @@ public:
   func_decl makeKernelNoLoop(context &Ctx) override {
     expr y = Converter.FromVal(LiveOut);
     // x is constructed from dense format
-    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
+    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["x"]);
     // matrix is constructed from sparse format
     func_decl Matrix = (*MatchingFormats)[0]->getMatrix();
     expr n = Ctx.int_const("n");
@@ -1531,7 +1538,7 @@ public:
   func_decl makeKernel(context &Ctx) override {
     expr y = Converter.FromVal(LiveOut);
     // x is constructed from dense format
-    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
+    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["x"]);
     // matrix is constructed from sparse format
     func_decl Matrix = (*MatchingFormats)[0]->getMatrix();
     expr n = Ctx.int_const("n");
@@ -1567,7 +1574,7 @@ public:
 
   func_decl makeKernelNoLoop(context &Ctx) override {
     expr y = Converter.FromVal(LiveOut);
-    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["B"]);
+    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["x"]);
     // matrix is constructed from sparse format
     func_decl Matrix = (*MatchingFormats)[0]->getMatrix();
     expr n = Ctx.int_const("n");
@@ -1594,6 +1601,37 @@ public:
             store(y, i, 0)));
     return gemv;
   }
+};
+
+class SPMM : public Kernel {
+public:
+  SPMM(MakeZ3 &Conv, LLVMContext &C, ScalarEvolution &SE, z3::context &Ctx, std::string Name, std::string SparseName)
+      : Kernel(Conv, Name, SparseName, {{CType::SPARSE, 2}, {CType::DENSE, 2}}), GEMM(ParseInputFile("gemm_opt.ll", "gemm", C, SE, Ctx, Conv, Mod)) {
+    // C(i, j) = C(i, j) + A(i, k) * B(k, j)
+    Function *F = Mod->getFunction("gemm");
+    func_decl G = GEMM[&F->getEntryBlock()];
+
+  }
+
+  void makeKernelParams(expr_vector &Params) override {
+    Format *A = (*MatchingFormats)[0];
+    Format *B = (*MatchingFormats)[1];
+    expr C = Converter.FromVal(LiveOut);
+    z3::context &Ctx = Params.ctx();
+    Params.push_back(A->n); // rows of C
+    Params.push_back(B->m); // cols of C
+    Params.push_back(Converter.FromVal(A->NameMap["B"])); // Dense A
+    Params.push_back(A->m); // cols of A
+    Params.push_back(Converter.FromVal(B->NameMap["B"])); // Dense B
+    Params.push_back(C); // Dense C
+  }
+  func_decl makeKernel(context &Ctx) override {}
+  func_decl makeKernelNoLoop(context &Ctx) override {}
+  bool checkInductiveImpl(func_decl &, z3::context &, expr_vector &, z3::solver &) override {}
+
+protected:
+  std::unique_ptr<Module> Mod;
+  SSA2Func GEMM;
 };
 
 
@@ -1659,24 +1697,59 @@ public:
   }
 };
 
-class DenseVecFormat : public DenseMatFormat {
+class DenseVecFormat : public Format {
 public:
   DenseVecFormat(Properties &Props, z3::context &Ctx,
                  const std::vector<Value *> &Scope, z3::solver &Slv,
                  MakeZ3 &Converter, func_decl InputKernel)
-      : DenseMatFormat(Props, Ctx, Scope, Slv, Converter, InputKernel) {
+      : Format(Props, Ctx, Scope, Slv, Converter, InputKernel) {
     FormatName = "DenseVec";
+    CARE = 1;
+    Names.push_back("x");
+
+    for (unsigned i = 0; i < CARE; ++i) {
+      Vars.push_back(i);
+      Map[Names[i].c_str()] = Vars[i];
+    }
+    AllNames.resize(CARE);
+    for (unsigned i = 0; i < CARE; ++i)
+      AllNames[i] = Names[i];
+
+    Sets.resize(Props.Props.size());
+    for (unsigned i = 0; i < Props.Props.size(); ++i) {
+      auto &P = Props.Props[i];
+      if (P.Name == "readonly") {
+        Sets[i].insert(Map["x"]);
+      } else if (P.Name == "int") {
+      } else if (P.Name == "array") {
+        Sets[i].insert(Map["x"]);
+      } else if (P.Name == "as_address") {
+      } else if (P.Name == "direct_access") {
+      } else if (P.Name == "loop_bounds") {}
+    }
   }
 
   func_decl makeMatrix() override {
     expr i = Ctx.int_const("i");
     expr_vector Args(Ctx);
     Args.push_back(i);
-    expr BMat = Converter.FromVal(NameMap["B"]);
-    func_decl B =
-        Ctx.recfun("B", Ctx.int_sort(), BMat[Ctx.int_val(0)].get_sort());
-    Ctx.recdef(B, Args, BMat[i]);
-    return B;
+    expr BMat = Converter.FromVal(NameMap["x"]);
+    func_decl x =
+        Ctx.recfun("x", Ctx.int_sort(), BMat[Ctx.int_val(0)].get_sort());
+    Ctx.recdef(x, Args, BMat[i]);
+    return x;
+  }
+
+  void makeIndexProperties(expr_vector &) override { return; }
+
+  expr makeNumberRows() override { return n; }
+
+  expr makeNumberNonZero() override { return nnz; }
+
+  void printSparseMatrix(z3::model &Model) override {}
+
+  void getCase(expr_vector &Assertions, unsigned Case) override {
+    llvm_unreachable("unimplemented!");
   }
 };
 
@@ -2151,7 +2224,8 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   GEMV MV(Converter);
   GEMV_reset MVReset(Converter);
-  std::vector<Kernel *> Kernels = {&MV, &MVReset};
+  SPMM GEMM(Converter, C, SE, Ctx, "GEMM", "SPMM");
+  std::vector<Kernel *> Kernels = {&MV, &MVReset, &GEMM};
 
   std::vector<std::pair<Kernel *, std::vector<Format *>>> PossibleKernels;
   std::vector<Format *> Formats;
