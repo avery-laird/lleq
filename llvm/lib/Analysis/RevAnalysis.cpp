@@ -878,6 +878,9 @@ public:
                return true;
            }
            return false;
+         }},
+        {"accessed_by", [&](Value *V) {
+           return false;
          }}};
   }
 
@@ -1645,6 +1648,50 @@ public:
     CARE = 2;
     Names.push_back("M"); // number columns
     Names.push_back("B");
+
+    class DomainElement {};
+    class Relation {
+      friend class RelationMgr;
+    protected:
+      func_decl compile() {}
+    };
+    class UnaryRelation : public Relation {};
+    class IsInt : public UnaryRelation {
+      bool execute(Value *A) {}
+    };
+    class AccessedBy : public Relation {
+      bool execute(Value *A, Value *B) {}
+    };
+    class RelationMgr {
+    public:
+      RelationMgr(z3::context &Ctx) : Ctx(Ctx), AllRelations(Ctx) {}
+      z3::context &Ctx;
+      std::vector<Relation> Relations;
+      func_decl_vector AllRelations;
+      void registerRelation() {}
+    };
+    RelationMgr RM(Ctx);
+
+    for (auto &Rel : RM.Relations) {
+      for (auto Var : ScopeVars) {
+        Rel()
+      }
+    }
+
+    // class CSRRelations : public Relations {
+    //
+    // }
+    // for (auto &Rel : RelationMgr)
+    //   Rel
+
+    // RelationMgr RM;
+    // Relation accessedBy;
+    // RM.register(accessedBy::Create(A, B));
+
+    // accessedBy(B, M)
+    // B.accessedBy(M)
+    // M.isInt()
+    // B.isArray()
 
     for (unsigned i = 0; i < CARE; ++i) {
       Vars.push_back(i);
