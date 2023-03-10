@@ -797,6 +797,25 @@ protected:
 //   store cases where pred. is true
 //
 
+struct Object {
+  enum ObjectKind {ABSTRACT, CONCRETE};
+  const ObjectKind Kind;
+  Object(ObjectKind K) : Kind(K) {}
+  virtual ~Object() {}
+};
+struct ConcreteObject : Object {
+  Value *Val;
+  ConcreteObject(Value *V) : Object(CONCRETE), Val(V) {}
+  static bool classof(const Object *O) {
+    return O->Kind == CONCRETE;
+  }
+};
+struct AbstractObject : Object {
+  AbstractObject() : Object(ABSTRACT) {}
+  static bool classof(const Object *O) {
+    return O->Kind == ABSTRACT;
+  }
+};
 class Relation {
 public:
   enum RelationKind {
@@ -808,7 +827,7 @@ public:
       : Kind(Kind), Name(Name), Predicates(P) {}
   virtual ~Relation() {};
   virtual void checkVars(std::vector<Value*> &) = 0;
-  unsigned map(Value *V) { return 0; } // TODO fix this
+//  unsigned map(Value *V) { return 0; } // TODO fix this
   std::string getName() { return Name; }
 protected:
   std::string Name;
@@ -830,6 +849,7 @@ public:
   }
 //protected:
   DenseSet<Value *> List;
+//  DenseSet<
 };
 class BinaryRelation : public Relation {
 public:
@@ -1080,10 +1100,11 @@ public:
     Slv.reset();
 
     func_decl_vector AllRelations(Ctx);
+    //
     for (unsigned i = 0; i < Props.Props.size(); ++i)
       AllRelations.push_back(Ctx.function(Props.Props[i].Name.c_str(),
                                           Ctx.int_sort(), Ctx.bool_sort()));
-
+    // constraints from format
     for (unsigned i = 0; i < Props.Props.size(); ++i) {
       expr_vector List(Ctx);
       for (unsigned j = 0; j < Vars.size(); ++j)
@@ -1098,7 +1119,7 @@ public:
 
       Slv.add(List);
     }
-
+    // constraints from input program
     // make mapping for scope args
     std::vector<unsigned> ScopeVars;
 
@@ -1784,7 +1805,7 @@ protected:
 
 class DenseMatFormat : public Format {
 public:
-  DenseMatFormat(Properties &Props, z3::context &Ctx,
+  DenseMatFormat(RelationManager &RM, Properties &Props, z3::context &Ctx,
                  const std::vector<Value *> &Scope, z3::solver &Slv,
                  MakeZ3 &Converter, func_decl InputKernel)
       : Format(Props, Ctx, Scope, Slv, Converter, InputKernel) {
@@ -1792,6 +1813,8 @@ public:
     CARE = 2;
     Names.push_back("M"); // number columns
     Names.push_back("B");
+
+//    RM.accessedBy.add()
 
     // class CSRRelations : public Relations {
     //
@@ -2393,7 +2416,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   CSRFormat CSRF(Props, Ctx, Scope, Slv, Converter, InputKernel);
   COOFormat COOF(Props, Ctx, Scope, Slv, Converter, InputKernel);
-  DenseMatFormat DenseMat(Props, Ctx, Scope, Slv, Converter, InputKernel);
+  DenseMatFormat DenseMat(RM, Props, Ctx, Scope, Slv, Converter, InputKernel);
   DenseVecFormat DenseVec(Props, Ctx, Scope, Slv, Converter, InputKernel);
 
   FormatManager FM;
