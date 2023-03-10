@@ -736,6 +736,160 @@ SSA2Func ParseInputFile(StringRef Path, StringRef FunctionName,
   return File;
 }
 
+class Predicate {
+public:
+  Predicate(ScalarEvolution &SE, LoopNest &LN) : SE(SE), LN(LN) {}
+  bool isInt(Value *A) {
+    return A->getType()->getTypeID() == Type::TypeID::IntegerTyID;
+  }
+  bool isArray(Value *A) {
+    return A->getType()->getTypeID() == Type::TypeID::PointerTyID;
+  }
+  bool isAccessedBy(Value *A, Value *B) {
+    if (!isInt(A) || !isArray(B))
+      return false;
+    for (auto *U : A->users()) {
+      if (auto *GEP = dyn_cast<GEPOperator>(U)) {
+        // get the index
+        if (GEP->getNumIndices() > 1)
+          llvm_unreachable(
+              "GEPOperators with multiple indices are not supported.");
+        auto &Idx = *GEP->indices().begin();
+        Instruction *Inst = dyn_cast<Instruction>(&Idx);
+        const SCEV *S = SE.getSCEV(Idx);
+//        return SCEVExprContains(S, );
+        return false;
+      }
+    }
+    return false;
+  }
+  bool isReadOnly(Value *A) {
+    if (A->getType()->getTypeID() != Type::TypeID::PointerTyID)
+      return false;
+    // V is never the ptr operand for any store
+    std::vector<Value *> Stack;
+    SmallPtrSet<Value *, 10> Visited;
+    DenseMap<Value *, Value *> ParentOf;
+    Stack.push_back(A);
+    while (!Stack.empty()) {
+      Value *E = Stack.back();
+      Visited.insert(E);
+      Stack.pop_back();
+      if (auto *Store = dyn_cast<StoreInst>(E))
+        if (Store->getPointerOperand() == ParentOf[E])
+          return false;
+      for (auto *U : E->users())
+        if (!Visited.contains(U)) {
+          Stack.push_back(U);
+          ParentOf[U] = E;
+        }
+    }
+    return true;
+  }
+protected:
+  ScalarEvolution &SE;
+  LoopNest &LN;
+};
+
+// Predicates:
+//   isXXX
+// Relations:
+//   store cases where pred. is true
+//
+
+class Relation {
+public:
+  enum RelationKind {
+    UNARY, BINARY
+  };
+  const RelationKind Kind;
+  Relation();
+  explicit Relation(RelationKind Kind, std::string Name, Predicate &P)
+      : Kind(Kind), Name(Name), Predicates(P) {}
+  virtual ~Relation() {};
+  virtual void checkVars(std::vector<Value*> &) = 0;
+  unsigned map(Value *V) { return 0; } // TODO fix this
+  std::string getName() { return Name; }
+protected:
+  std::string Name;
+  Predicate &Predicates;
+};
+class UnaryRelation : public Relation {
+public:
+  UnaryRelation(std::string Name, Predicate &P) : Relation(UNARY, Name, P) {}
+  virtual bool test(Value *) = 0;
+  void add(Value *A) { List.insert(A); };
+  void checkVars(std::vector<Value *> &Vars) override {
+    for (auto *V : Vars) {
+      if (test(V))
+        add(V);
+    }
+  }
+  static bool classof(const Relation *R) {
+    return R->Kind == UNARY;
+  }
+//protected:
+  DenseSet<Value *> List;
+};
+class BinaryRelation : public Relation {
+public:
+  BinaryRelation(std::string Name, Predicate &P) : Relation(BINARY, Name, P) {}
+  virtual bool test(Value *, Value *) = 0;
+  void add(Value *A, Value *B) { List.insert({A, B}); };
+  void checkVars(std::vector<Value *> &Vars) override {
+    // TODO improve this so that the complexity
+    // is not n^2, and also so that formats can
+    // rely on vars that are not live-ins.
+    for (auto *A : Vars) {
+      for (auto *B : Vars) {
+        if (test(A, B))
+          add(A, B);
+      }
+    }
+  }
+  static bool classof(const Relation *R) {
+    return R->Kind == BINARY;
+  }
+//protected:
+  DenseSet<std::pair<Value *, Value *>> List;
+};
+class ReadOnly : public UnaryRelation {
+  using UnaryRelation::UnaryRelation;
+public:
+  bool test(Value *A) override { return Predicates.isReadOnly(A); }
+};
+class IsInt : public UnaryRelation {
+  using UnaryRelation::UnaryRelation;
+public:
+  bool test(Value *A) override { return Predicates.isInt(A); }
+};
+class IsArray : public UnaryRelation {
+  using UnaryRelation::UnaryRelation;
+public:
+  bool test(Value *A) override { return Predicates.isArray(A); }
+};
+class AccessedBy : public BinaryRelation {
+  using BinaryRelation::BinaryRelation;
+public:
+  bool test(Value *A, Value *B) override { return Predicates.isAccessedBy(A, B); }
+};
+
+class RelationManager {
+public:
+  RelationManager(Predicate &P) {
+    readOnly = new ReadOnly("readonly", P);
+    isInt = new IsInt("isint", P);
+    isArray = new IsArray("isarray", P);
+    accessedBy = new AccessedBy("accessedby", P);
+    Relations = {readOnly, isInt, isArray, accessedBy};
+  }
+public:
+  std::vector<Relation*> Relations;
+  ReadOnly *readOnly;
+  IsInt *isInt;
+  IsArray *isArray;
+  AccessedBy *accessedBy;
+};
 
 class Properties {
 protected:
@@ -840,16 +994,6 @@ public:
                    continue ;
                }
                return false;
-//               while (Inst != nullptr &&
-//                      (isa<SExtInst>(Inst) || isa<ZExtInst>(Inst) ||
-//                       isa<BitCastInst>(Inst))) {
-//                 Instruction *Tmp = dyn_cast<Instruction>(Inst->getOperand(0));
-//                 if (Tmp == nullptr)
-//                   break;
-//                 Inst = Tmp;
-//               }
-//               if (getLoadStorePointerOperand(Inst))
-//                 return false;
              }
            }
            return true;
@@ -1649,35 +1793,6 @@ public:
     Names.push_back("M"); // number columns
     Names.push_back("B");
 
-    class DomainElement {};
-    class Relation {
-      friend class RelationMgr;
-    protected:
-      func_decl compile() {}
-    };
-    class UnaryRelation : public Relation {};
-    class IsInt : public UnaryRelation {
-      bool execute(Value *A) {}
-    };
-    class AccessedBy : public Relation {
-      bool execute(Value *A, Value *B) {}
-    };
-    class RelationMgr {
-    public:
-      RelationMgr(z3::context &Ctx) : Ctx(Ctx), AllRelations(Ctx) {}
-      z3::context &Ctx;
-      std::vector<Relation> Relations;
-      func_decl_vector AllRelations;
-      void registerRelation() {}
-    };
-    RelationMgr RM(Ctx);
-
-    for (auto &Rel : RM.Relations) {
-      for (auto Var : ScopeVars) {
-        Rel()
-      }
-    }
-
     // class CSRRelations : public Relations {
     //
     // }
@@ -2243,7 +2358,6 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   // Goal: match array inputs to storage formats
   // array inputs: some subset of Scopes[header]
   // need to figure out which belong in the storage set or not
-
   Properties Props(LN, SE);
   auto &Scope = Translate.Scopes[&F.getEntryBlock()];
   Props.buildSets(Scope);
@@ -2254,6 +2368,25 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
         dbgs() << *V << " ";
       dbgs() << "\n";
     }
+  });
+  Predicate Predicates(SE, LN);
+  RelationManager RM(Predicates);
+  for (auto &R : RM.Relations)
+    R->checkVars(Scope);
+  LLVM_DEBUG({
+      for (auto R : RM.Relations) {
+        dbgs() << R->getName() << ": ";
+        if (auto *Unary = dyn_cast<UnaryRelation>(R)) {
+          for (auto *V : Unary->List) {
+            dbgs() << *V << " ";
+          }
+        } else if (auto *Binary = dyn_cast<BinaryRelation>(R)) {
+          for (auto &Pair : Binary->List) {
+            dbgs() << "(" << *Pair.first << ", " << *Pair.second << ") ";
+          }
+        }
+        dbgs() << "\n";
+      }
   });
 
   func_decl InputKernel = Translate[&F.getEntryBlock()];
