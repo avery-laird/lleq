@@ -1090,6 +1090,88 @@ public:
 };
 
 
+// TODO if I end up using this strategy, move it to a better place
+struct Element {
+  unsigned ID;
+  std::string Name;
+  Value *Val = nullptr;
+};
+struct Constraint {
+  enum CType {
+    IS_INT,
+    IS_DOUBLE_PTR,
+    IS_INT_PTR,
+    INDEXED_BY
+  };
+  const CType Kind;
+  std::vector<Element*> Operands;
+};
+
+class ConstraintCompiler {
+  enum ATYPE { ABSTRACT = 0, CONCRETE = 1 };
+
+public:
+  ConstraintCompiler(std::vector<Constraint> &C, std::vector<Element> &D,
+                     std::vector<Element> &R, z3::context &Ctx)
+      : Ctx(Ctx), Constraints(C), Domain(D), Range(R), Val(Ctx.uninterpreted_sort("Value")) {  }
+
+  void compileConstraints() {
+    expr_vector domain(Ctx), range(Ctx);
+    for (unsigned i = 0; i < Domain.size(); ++i) {
+      Domain[i].ID = i;
+      domain.push_back(Ctx.constant(Domain[i].Name.c_str(), Val));
+    }
+    for (unsigned i = 0; i < Range.size(); ++i) {
+      Range[i].ID = i + Domain.size();
+      range.push_back(Ctx.constant(Range[i].Name.c_str(), Val));
+    }
+//    std::vector<Constraint*> Unary, Binary;
+//    for (auto &C : Constraints) {
+//      size_t Size = C.Operands.size();
+//      if (Size == 0) {
+//        Unary.push_back(&C);
+//      } else if (Size == 1) {
+//        Binary.push_back(&C);
+//      } else {
+//        llvm_unreachable("unsupported constraint arity.");
+//      }
+//    }
+    // create relations
+    for (auto &C : Constraints) {
+      for (auto &D : Domain) {
+        Relations[ABSTRACT] = mkBase(C, Domain);
+        Relations[CONCRETE] = mkBase(C, Range);
+      }
+    }
+
+  }
+
+  expr_vector mkBase(Constraint &C, std::vector<Element> &Set) {
+    expr_vector Elements(Ctx);
+    switch (C.Kind) {
+      default:
+      llvm_unreachable("unknown constraint type.");
+      case Constraint::IS_INT:
+      case Constraint::IS_DOUBLE_PTR:
+      case Constraint::IS_INT_PTR:
+      Elements.push_back(const_array(Val, Ctx.bool_val(false)));
+      return Elements;
+      case Constraint::INDEXED_BY:
+      for (auto &D : Set)
+        Elements.push_back(const_array(Val, Ctx.bool_val(false)));
+      return Elements;
+    }
+  }
+
+protected:
+  z3::context &Ctx;
+  expr_vector Relations[2] = {expr_vector(Ctx), expr_vector(Ctx)};
+  std::vector<Constraint> &Constraints;
+  std::vector<Element> &Domain;
+  std::vector<Element> &Range;
+  z3::sort Val;
+};
+
 class Format {
 protected:
   using MapTy = DenseMap<StringRef, unsigned>;
@@ -1125,8 +1207,34 @@ public:
     });
   }
 
+//  virtual void makeAbstractObjects(expr_vector &) = 0;
+//  virtual void makeConcreteObjects(expr_vector &) = 0;
+
   bool validateMapping() {
-    Slv.push();
+
+    // (1) make abstract relations
+    //     (1.1) define abstract objects
+    //     (1.2) define the abstract relations
+    // output:
+    // (2) make concrete relations
+    //     (2.1) output from abstract relations gives a list of relations to test
+    //     (2.2) concrete relations are defined by static analysis
+    //     (2.3)
+    //
+    // makeAbstractConstraints(expr_vector AbsRels, std::vector<RelType> RelTypes)
+    // makeConcreteConstraints(expr_vector ConRels, RelTypes) {
+    //   for rel in RelTypes:
+    //     new rel R
+    //     for elem in LiveIns:
+    //       defineRel(elem, rel)
+    // }
+
+    Slv.reset();
+
+//    expr_vector AbsObjs(Ctx), ConObjs(Ctx);
+//    makeAbstractObjects(AbsObjs);
+//    makeConcreteObjects(ConObjs);
+
 
     func_decl_vector AllRelations(Ctx);
     //
@@ -1291,12 +1399,10 @@ public:
           dbgs() << "[REV] Format Check for " << FormatName
                  << " failed because it is not unique! " << S.str() << "\n";
         });
-        Slv.pop();
         return false;
       }
       LLVM_DEBUG(dbgs() << "[REV] Format Check for " << FormatName
                         << " succeeded\n");
-      Slv.pop();
       return true;
     }
 
@@ -1306,7 +1412,6 @@ public:
       dbgs() << "[REV] Format Check for " << FormatName
              << " failed: " << S.str() << "\n";
     });
-    Slv.pop();
     return false;
   }
 
@@ -2059,6 +2164,13 @@ public:
     readOnly->add(&col);
     readOnly->add(&val);
 
+    // register(Relation::isInt(n))
+    // register(Relation:isIndexedBy(B, m))
+    // struct Relation {
+    //  enum R_Type { IS_INT, INDEXED_BY, .. }
+    //  static Relation isInt(AbstractObject n) {
+    // }
+    // (1)
 
     for (unsigned i = 0; i < CARE; ++i) {
       Vars.push_back(i);
