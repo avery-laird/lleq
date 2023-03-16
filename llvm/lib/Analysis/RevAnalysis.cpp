@@ -745,10 +745,11 @@ public:
   bool isArray(Value *A) {
     return A->getType()->getTypeID() == Type::TypeID::PointerTyID;
   }
-  bool isAccessedBy(Value *A, Value *B) {
-    if (!isArray(A) || (!isInt(B) && !isArray(B)))
-      return false;
+  void isAccessedBy(Value *A, std::vector<Value*> &Set) {
+    if (!isArray(A))
+      return;
     for (auto *U : A->users()) {
+      // all possible uses of A:
       if (auto *GEP = dyn_cast<GEPOperator>(U)) {
         // get the index
         if (GEP->getNumIndices() > 1)
@@ -756,14 +757,23 @@ public:
               "GEPOperators with multiple indices are not supported.");
         auto &Idx = *GEP->indices().begin();
         Instruction *Inst = dyn_cast<Instruction>(&Idx);
-        const SCEV *S = SE.getSCEV(Idx);
-        const SCEV *BSCEV = SE.getSCEV(B);
-        return SCEVExprContains(S, [BSCEV](const SCEV *S) {
-          return BSCEV == S;
-        });
+        std::vector<Value*> WorkList;
+        SmallPtrSet<Value*, 10> Visited;
+        while (WorkList.size()) {
+          Value *Current = WorkList.back();
+          WorkList.pop_back();
+          if (Visited.count(Current))
+            continue;
+          if (isArray(Current) || isInt(Current))
+            Set.push_back(Current);
+          if (auto *Next = dyn_cast<Instruction>(Current))
+            for (auto &V : Next->operands())
+              if (!Visited.count(V))
+                WorkList.push_back(V);
+        }
       }
     }
-    return false;
+    return;
   }
   bool isReadOnly(Value *A) {
     if (A->getType()->getTypeID() != Type::TypeID::PointerTyID)
@@ -799,129 +809,129 @@ protected:
 //   store cases where pred. is true
 //
 
-struct Object {
-  enum ObjectKind {ABSTRACT, CONCRETE};
-  const ObjectKind Kind;
-  Object(ObjectKind K) : Kind(K) {}
-  virtual ~Object() {}
-};
-struct ConcreteObject : Object {
-  Value *Val;
-  ConcreteObject(Value *V) : Object(CONCRETE), Val(V) {}
-  static bool classof(const Object *O) {
-    return O->Kind == CONCRETE;
-  }
-};
-struct AbstractObject : Object {
-  std::string Name;
-  AbstractObject(std::string Name) : Name(Name), Object(ABSTRACT) {}
-  static bool classof(const Object *O) {
-    return O->Kind == ABSTRACT;
-  }
-};
-
-namespace llvm {
-
-template <> struct DenseMapInfo<AbstractObject> {
-  static bool isEqual(const Object &LHS, const Object &RHS) {
-    if (isa<AbstractObject>(LHS) && isa<AbstractObject>(RHS))
-      return cast<AbstractObject>(LHS).Name == cast<AbstractObject>(RHS).Name;
-    if (isa<ConcreteObject>(LHS) && isa<ConcreteObject>(RHS))
-      return DenseMapInfo<Value *>::isEqual(cast<ConcreteObject>(LHS).Val,
-                                            cast<ConcreteObject>(RHS).Val);
-    return false;
-  }
-};
-
-} // end namespace llvm
-
-class Relation {
-public:
-  enum RelationKind {
-    UNARY, BINARY
-  };
-  const RelationKind Kind;
-  Relation();
-  explicit Relation(RelationKind Kind, std::string Name, Predicate &P)
-      : Kind(Kind), Name(Name), Predicates(P) {}
-  virtual ~Relation() {};
-  virtual void buildTable(const std::vector<Value*> &) = 0;
-  virtual func_decl compile(z3::context &) = 0;
-//  unsigned map(Value *V) { return 0; } // TODO fix this
-  std::string getName() { return Name; }
-protected:
-  std::string Name;
-  Predicate &Predicates;
-};
-class UnaryRelation : public Relation {
-public:
-  UnaryRelation(std::string Name, Predicate &P) : Relation(UNARY, Name, P) {}
-  virtual bool test(Value *) = 0;
-  void add(Value *A) { ConcreteSet.insert(A); };
-  void add(AbstractObject *A) { AbstractSet.insert(A); };
-  func_decl compile(z3::context &Ctx) override {
-    return Ctx.function(Name.c_str(), Ctx.int_sort(), Ctx.bool_sort());
-  }
-  void buildTable(const std::vector<Value *> &Vars) override {
-    for (auto *V : Vars) {
-      if (test(V))
-        add(V);
-    }
-  }
-  static bool classof(const Relation *R) {
-    return R->Kind == UNARY;
-  }
+//struct Object {
+//  enum ObjectKind {ABSTRACT, CONCRETE};
+//  const ObjectKind Kind;
+//  Object(ObjectKind K) : Kind(K) {}
+//  virtual ~Object() {}
+//};
+//struct ConcreteObject : Object {
+//  Value *Val;
+//  ConcreteObject(Value *V) : Object(CONCRETE), Val(V) {}
+//  static bool classof(const Object *O) {
+//    return O->Kind == CONCRETE;
+//  }
+//};
+//struct AbstractObject : Object {
+//  std::string Name;
+//  AbstractObject(std::string Name) : Name(Name), Object(ABSTRACT) {}
+//  static bool classof(const Object *O) {
+//    return O->Kind == ABSTRACT;
+//  }
+//};
+//
+//namespace llvm {
+//
+//template <> struct DenseMapInfo<AbstractObject> {
+//  static bool isEqual(const Object &LHS, const Object &RHS) {
+//    if (isa<AbstractObject>(LHS) && isa<AbstractObject>(RHS))
+//      return cast<AbstractObject>(LHS).Name == cast<AbstractObject>(RHS).Name;
+//    if (isa<ConcreteObject>(LHS) && isa<ConcreteObject>(RHS))
+//      return DenseMapInfo<Value *>::isEqual(cast<ConcreteObject>(LHS).Val,
+//                                            cast<ConcreteObject>(RHS).Val);
+//    return false;
+//  }
+//};
+//
+//} // end namespace llvm
+//
+//class Relation {
+//public:
+//  enum RelationKind {
+//    UNARY, BINARY
+//  };
+//  const RelationKind Kind;
+//  Relation();
+//  explicit Relation(RelationKind Kind, std::string Name, Predicate &P)
+//      : Kind(Kind), Name(Name), Predicates(P) {}
+//  virtual ~Relation() {};
+//  virtual void buildTable(const std::vector<Value*> &) = 0;
+//  virtual func_decl compile(z3::context &) = 0;
+////  unsigned map(Value *V) { return 0; } // TODO fix this
+//  std::string getName() { return Name; }
 //protected:
-  DenseSet<Value *> ConcreteSet;
-  DenseSet<AbstractObject *> AbstractSet;
-};
-class BinaryRelation : public Relation {
-public:
-  BinaryRelation(std::string Name, Predicate &P) : Relation(BINARY, Name, P) {}
-  virtual bool test(Value *, Value *) = 0;
-  void add(Value *A, Value *B) { ConcreteSet.insert({A, B}); };
-  void add(AbstractObject *A, AbstractObject *B) { AbstractSet.insert({A, B}); };
-  func_decl compile(z3::context &Ctx) override {
-    return Ctx.function(Name.c_str(), Ctx.int_sort(), Ctx.int_sort(), Ctx.bool_sort());
-  }
-  void buildTable(const std::vector<Value *> &Vars) override {
-    // TODO improve this so that the complexity
-    // is not n^2, and also so that formats can
-    // rely on vars that are not live-ins.
-    for (auto *A : Vars) {
-      for (auto *B : Vars) {
-        if (test(A, B))
-          add(A, B);
-      }
-    }
-  }
-  static bool classof(const Relation *R) {
-    return R->Kind == BINARY;
-  }
-//protected:
-  DenseSet<std::pair<Value *, Value *>> ConcreteSet;
-  DenseSet<std::pair<AbstractObject*, AbstractObject*>> AbstractSet;
-};
-class ReadOnly : public UnaryRelation {
-public:
-  ReadOnly(Predicate &P) : UnaryRelation("readonly", P) {};
-  bool test(Value *A) override { return Predicates.isReadOnly(A); }
-};
-class IsInt : public UnaryRelation {
-public:
-  IsInt(Predicate &P) : UnaryRelation("isint", P) {};
-  bool test(Value *A) override { return Predicates.isInt(A); }
-};
-class IsArray : public UnaryRelation {
-public:
-  IsArray(Predicate &P) : UnaryRelation("isarray", P) {};
-  bool test(Value *A) override { return Predicates.isArray(A); }
-};
-class AccessedBy : public BinaryRelation {
-public:
-  AccessedBy(Predicate &P) : BinaryRelation("accessedby", P) {};
-  bool test(Value *A, Value *B) override { return Predicates.isAccessedBy(A, B); }
-};
+//  std::string Name;
+//  Predicate &Predicates;
+//};
+//class UnaryRelation : public Relation {
+//public:
+//  UnaryRelation(std::string Name, Predicate &P) : Relation(UNARY, Name, P) {}
+//  virtual bool test(Value *) = 0;
+//  void add(Value *A) { ConcreteSet.insert(A); };
+//  void add(AbstractObject *A) { AbstractSet.insert(A); };
+//  func_decl compile(z3::context &Ctx) override {
+//    return Ctx.function(Name.c_str(), Ctx.int_sort(), Ctx.bool_sort());
+//  }
+//  void buildTable(const std::vector<Value *> &Vars) override {
+//    for (auto *V : Vars) {
+//      if (test(V))
+//        add(V);
+//    }
+//  }
+//  static bool classof(const Relation *R) {
+//    return R->Kind == UNARY;
+//  }
+////protected:
+//  DenseSet<Value *> ConcreteSet;
+//  DenseSet<AbstractObject *> AbstractSet;
+//};
+//class BinaryRelation : public Relation {
+//public:
+//  BinaryRelation(std::string Name, Predicate &P) : Relation(BINARY, Name, P) {}
+//  virtual bool test(Value *, Value *) = 0;
+//  void add(Value *A, Value *B) { ConcreteSet.insert({A, B}); };
+//  void add(AbstractObject *A, AbstractObject *B) { AbstractSet.insert({A, B}); };
+//  func_decl compile(z3::context &Ctx) override {
+//    return Ctx.function(Name.c_str(), Ctx.int_sort(), Ctx.int_sort(), Ctx.bool_sort());
+//  }
+//  void buildTable(const std::vector<Value *> &Vars) override {
+//    // TODO improve this so that the complexity
+//    // is not n^2, and also so that formats can
+//    // rely on vars that are not live-ins.
+//    for (auto *A : Vars) {
+//      for (auto *B : Vars) {
+//        if (test(A, B))
+//          add(A, B);
+//      }
+//    }
+//  }
+//  static bool classof(const Relation *R) {
+//    return R->Kind == BINARY;
+//  }
+////protected:
+//  DenseSet<std::pair<Value *, Value *>> ConcreteSet;
+//  DenseSet<std::pair<AbstractObject*, AbstractObject*>> AbstractSet;
+//};
+//class ReadOnly : public UnaryRelation {
+//public:
+//  ReadOnly(Predicate &P) : UnaryRelation("readonly", P) {};
+//  bool test(Value *A) override { return Predicates.isReadOnly(A); }
+//};
+//class IsInt : public UnaryRelation {
+//public:
+//  IsInt(Predicate &P) : UnaryRelation("isint", P) {};
+//  bool test(Value *A) override { return Predicates.isInt(A); }
+//};
+//class IsArray : public UnaryRelation {
+//public:
+//  IsArray(Predicate &P) : UnaryRelation("isarray", P) {};
+//  bool test(Value *A) override { return Predicates.isArray(A); }
+//};
+//class AccessedBy : public BinaryRelation {
+//public:
+//  AccessedBy(Predicate &P) : BinaryRelation("accessedby", P) {};
+//  bool test(Value *A, Value *B) override { return Predicates.isAccessedBy(A, B); }
+//};
 
 //class RelationManager {
 //public:
@@ -1092,19 +1102,21 @@ public:
 
 // TODO if I end up using this strategy, move it to a better place
 struct Element {
+  Element(std::string Name) : Name(Name) {}
+  Element(std::string Name, Value *V) : Name(Name), Val(V) {}
   unsigned ID;
   std::string Name;
   Value *Val = nullptr;
 };
 struct Constraint {
   enum CType {
-    IS_INT,
-    IS_DOUBLE_PTR,
-    IS_INT_PTR,
-    INDEXED_BY
+    IS_INT = 0,
+    IS_DOUBLE_PTR = 1,
+    IS_INT_PTR = 2,
+    INDEXED_BY = 3
   };
   const CType Kind;
-  std::vector<Element*> Operands;
+  std::vector<Element> Operands;
 };
 
 class ConstraintCompiler {
@@ -1112,8 +1124,8 @@ class ConstraintCompiler {
 
 public:
   ConstraintCompiler(std::vector<Constraint> &C, std::vector<Element> &D,
-                     std::vector<Element> &R, z3::context &Ctx)
-      : Ctx(Ctx), Constraints(C), Domain(D), Range(R), Val(Ctx.uninterpreted_sort("Value")) {  }
+                     std::vector<Element> &R, z3::context &Ctx, Predicate &P)
+      : Ctx(Ctx), Constraints(C), Domain(D), Range(R), Val(Ctx.uninterpreted_sort("Value")), Predicates(P) {  }
 
   void compileConstraints() {
     expr_vector domain(Ctx), range(Ctx);
@@ -1136,14 +1148,39 @@ public:
 //        llvm_unreachable("unsupported constraint arity.");
 //      }
 //    }
+    std::set<Constraint::CType> UniqueConstraints;
     // create relations
-    for (auto &C : Constraints) {
-      for (auto &D : Domain) {
-        Relations[ABSTRACT] = mkBase(C, Domain);
-        Relations[CONCRETE] = mkBase(C, Range);
+    for (auto &C : Constraints)
+      UniqueConstraints.insert(C.Kind);
+    std::vector<Constraint> RangeConstraints;
+    for (auto C : UniqueConstraints) {
+      for (auto &E : Range) {
+        populateConstraints(C, E, RangeConstraints);
       }
     }
+  }
 
+  void populateConstraints(Constraint::CType C, Element &E,
+                           std::vector<Constraint> &Concrete) {
+    switch (C) {
+    default:
+      llvm_unreachable("unknown constraint type");
+    case Constraint::IS_INT:
+      if (Predicates.isInt(E.Val))
+        Concrete.push_back({C, {E}});
+      break;
+    case Constraint::IS_INT_PTR:
+    case Constraint::IS_DOUBLE_PTR:
+      if (Predicates.isArray(E.Val))
+        Concrete.push_back({C, {E}});
+      break;
+    case Constraint::INDEXED_BY:
+      std::vector<Value *> Set;
+      Predicates.isAccessedBy(E.Val, Set);
+      for (auto *V : Set)
+        Concrete.push_back({C, {E, Element(V->getNameOrAsOperand(), V)}});
+      break;
+    }
   }
 
   expr_vector mkBase(Constraint &C, std::vector<Element> &Set) {
@@ -1170,6 +1207,7 @@ protected:
   std::vector<Element> &Domain;
   std::vector<Element> &Range;
   z3::sort Val;
+  Predicate &Predicates;
 };
 
 class Format {
@@ -1178,14 +1216,14 @@ protected:
   using NameMapTy = DenseMap<StringRef, Value *>;
 
 public:
-  Format(Properties &Props, z3::context &Ctx, const std::vector<Value *> &Scope,
+  Format(Predicate &P, Properties &Props, z3::context &Ctx, const std::vector<Value *> &Scope,
          z3::solver &Slv, MakeZ3 &Converter, func_decl InputKernel)
       : Props(Props), Ctx(Ctx), Scope(Scope), Slv(Slv), Converter(Converter),
         InputKernel(InputKernel),
         EQUAL(Ctx.constant("EQUAL",
                            Ctx.array_sort(Ctx.int_sort(), Ctx.int_sort()))),
         n(Ctx.int_const("n")), m(Ctx.int_const("m")), nnz(Ctx.int_const("nnz")),
-        Matrix(Ctx), Model(Ctx) {}
+        Matrix(Ctx), Model(Ctx), Predicates(P) {}
 
   void printMapping(z3::model &M, unsigned LB, unsigned UB) {
     LLVM_DEBUG({
@@ -1231,10 +1269,11 @@ public:
 
     Slv.reset();
 
-//    expr_vector AbsObjs(Ctx), ConObjs(Ctx);
-//    makeAbstractObjects(AbsObjs);
-//    makeConcreteObjects(ConObjs);
-
+    std::vector<Element> Range;
+    for (auto *V : Scope)
+      Range.push_back(Element(V->getNameOrAsOperand(), V));
+    ConstraintCompiler CC(Constraints, Domain, Range, Ctx, Predicates);
+    CC.compileConstraints();
 
     func_decl_vector AllRelations(Ctx);
     //
@@ -1258,61 +1297,6 @@ public:
     }
 
 
-    func_decl_vector AllRelations2(Ctx);
-    DenseMap<Relation*, unsigned> Rel2Func;
-    for (unsigned Idx = 0; Idx < Relations.size(); ++Idx) {
-      AllRelations2.push_back(Relations[Idx]->compile(Ctx));
-      Rel2Func[Relations[Idx]] = Idx;
-    }
-
-    // constraints from format, V2
-    for (unsigned Idx = 0; Idx < Relations.size(); ++Idx) {
-      expr_vector List(Ctx);
-      Relation *R = Relations[Idx];
-      unsigned Func = Rel2Func[R];
-      unsigned NumObjs = 0;
-      for (auto *O : Objects) {
-        if (auto *U = dyn_cast<UnaryRelation>(R)) {
-          List.push_back(AllRelations2[Func](NumObjs) ==
-                         Ctx.bool_val(U->AbstractSet.contains(O)));
-        } else if (auto *B = dyn_cast<BinaryRelation>(R)) {
-          unsigned NumJs = 0;
-          for (auto *J : Objects) {
-            List.push_back(AllRelations2[Func](Ctx.int_val(NumObjs), Ctx.int_val(NumJs)) ==
-                           Ctx.bool_val(B->AbstractSet.contains({O, J})));
-            NumJs++;
-          }
-        }
-        NumObjs++;
-      }
-
-      LLVM_DEBUG({
-        for (auto const &E : List)
-          dbgs() << E.to_string() << ", ";
-        dbgs() << "\n";
-      });
-
-      R->buildTable(Scope);
-      for (unsigned S = 0; S < Scope.size(); ++S) {
-        if (auto *U = dyn_cast<UnaryRelation>(R)) {
-          List.push_back(AllRelations2[Func](NumObjs + S) ==
-                         Ctx.bool_val(U->ConcreteSet.contains(Scope[S])));
-        }
-        else if (auto *B = dyn_cast<BinaryRelation>(R)) {
-          for (unsigned J = 0; J < Scope.size(); ++J) {
-            List.push_back(AllRelations2[Func](Ctx.int_val(NumObjs + S), Ctx.int_val(NumObjs + J)) ==
-                           Ctx.bool_val(B->ConcreteSet.contains({Scope[S], Scope[J]})));
-          }
-        }
-      }
-      LLVM_DEBUG({
-        for (auto const &E : List)
-          dbgs() << E.to_string() << ", ";
-        dbgs() << "\n";
-      });
-
-//      Slv.add(List);
-    }
 
     // constraints from input program
     // make mapping for scope args
@@ -1339,18 +1323,10 @@ public:
     // product of ScopeVars and CSRVars
     expr_vector Pairs(Ctx);
     std::vector<int> Weights;
-    for (unsigned A = 0; A < Objects.size(); ++A)
-      for (auto B = Objects.size(); B < Objects.size() + Scope.size(); ++B) {
+    for (auto A : Vars)
+      for (auto B : ScopeVars) {
         expr_vector AllRels(Ctx);
-        for (auto *Rel : Relations) {
-          unsigned Idx = Rel2Func[Rel];
-          if (auto *U = dyn_cast<UnaryRelation>(Relations[Idx])) {
-            AllRels.push_back(AllRelations2[Idx](A) == AllRelations2[Idx](B));
-          } else if (auto *V = dyn_cast<BinaryRelation>(Relations[Idx])) {
-//            for (unsigned J = 0; J <)
-          }
-        }
-        for (auto const &Rel : AllRelations2)
+        for (auto const &Rel : AllRelations)
           AllRels.push_back(Rel(A) == Rel(B));
         AllRels.push_back(EQUAL[Ctx.int_val(B)] == Ctx.int_val(A));
         Pairs.push_back(mk_and(AllRels));
@@ -1593,8 +1569,9 @@ public:
   Kernel *Kern = nullptr;
   func_decl Matrix;
   NameMapTy NameMap;
-  std::vector<Relation*> Relations;
-  std::vector<AbstractObject*> Objects;
+  std::vector<Constraint> Constraints;
+  std::vector<Element> Domain;
+  Predicate &Predicates;
 };
 
 class FormatManager {
@@ -2013,24 +1990,11 @@ public:
   DenseMatFormat(Predicate &P, Properties &Props, z3::context &Ctx,
                  const std::vector<Value *> &Scope, z3::solver &Slv,
                  MakeZ3 &Converter, func_decl InputKernel)
-      : Format(Props, Ctx, Scope, Slv, Converter, InputKernel) {
+      : Format(P, Props, Ctx, Scope, Slv, Converter, InputKernel) {
     FormatName = "DenseMat";
     CARE = 2;
     Names.push_back("M"); // number columns
     Names.push_back("B");
-
-    AbstractObject *m = new AbstractObject("m");
-    AbstractObject *B = new AbstractObject("B");
-    Objects = {m, B};
-    ReadOnly *readOnly = new ReadOnly(P);
-    IsInt *isInt = new IsInt(P);
-    IsArray *isArray = new IsArray(P);
-    AccessedBy *accessedBy = new AccessedBy(P);
-    Relations = {readOnly, isInt, isArray, accessedBy};
-    readOnly->add(B);
-    isInt->add(m);
-    isArray->add(B);
-    accessedBy->add(B, m);
 
     for (unsigned i = 0; i < CARE; ++i) {
       Vars.push_back(i);
@@ -2085,10 +2049,10 @@ public:
 
 class DenseVecFormat : public Format {
 public:
-  DenseVecFormat(Properties &Props, z3::context &Ctx,
+  DenseVecFormat(Predicate &P, Properties &Props, z3::context &Ctx,
                  const std::vector<Value *> &Scope, z3::solver &Slv,
                  MakeZ3 &Converter, func_decl InputKernel)
-      : Format(Props, Ctx, Scope, Slv, Converter, InputKernel) {
+      : Format(P, Props, Ctx, Scope, Slv, Converter, InputKernel) {
     FormatName = "DenseVec";
     CARE = 1;
     Names.push_back("x");
@@ -2144,7 +2108,7 @@ public:
   CSRFormat(Predicate &P, Properties &Props, z3::context &Ctx,
             const std::vector<Value *> &Scope, z3::solver &Slv,
             MakeZ3 &Converter, func_decl InputKernel)
-      : Format(Props, Ctx, Scope, Slv, Converter, InputKernel) {
+      : Format(P, Props, Ctx, Scope, Slv, Converter, InputKernel) {
     FormatName = "CSR";
     CARE = 4;
     Names.push_back("n");
@@ -2152,25 +2116,16 @@ public:
     Names.push_back("col");
     Names.push_back("val");
 
-    AbstractObject n("n");
-    AbstractObject rowPtr("rowPtr");
-    AbstractObject col("col");
-    AbstractObject val("val");
-    ReadOnly *readOnly = new ReadOnly(P);
-    IsInt *isInt = new IsInt(P);
-    IsArray *isArray = new IsArray(P);
-    Relations = {readOnly, isInt, isArray};
-    readOnly->add(&rowPtr);
-    readOnly->add(&col);
-    readOnly->add(&val);
+    Element n("n");
+    Element rowPtr("rowPtr");
+    Element col("col");
+    Element val("val");
+    Constraints.push_back({Constraint::IS_INT, {n}});
+    Constraints.push_back({Constraint::IS_DOUBLE_PTR, {rowPtr}});
+    Constraints.push_back({Constraint::IS_DOUBLE_PTR, {val}});
+    Constraints.push_back({Constraint::IS_INT_PTR, {col}});
+    Domain = {n, rowPtr, col, val};
 
-    // register(Relation::isInt(n))
-    // register(Relation:isIndexedBy(B, m))
-    // struct Relation {
-    //  enum R_Type { IS_INT, INDEXED_BY, .. }
-    //  static Relation isInt(AbstractObject n) {
-    // }
-    // (1)
 
     for (unsigned i = 0; i < CARE; ++i) {
       Vars.push_back(i);
@@ -2301,10 +2256,10 @@ public:
 
 class COOFormat : public Format {
 public:
-  COOFormat(Properties &Props, z3::context &Ctx,
+  COOFormat(Predicate &P, Properties &Props, z3::context &Ctx,
             const std::vector<Value *> &Scope, z3::solver &Slv,
             MakeZ3 &Converter, func_decl InputKernel)
-      : Format(Props, Ctx, Scope, Slv, Converter, InputKernel) {
+      : Format(P, Props, Ctx, Scope, Slv, Converter, InputKernel) {
     FormatName = "COO";
     CARE = 4;
     Names.push_back("nz");
@@ -2636,9 +2591,9 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   func_decl InputKernel = Translate[&F.getEntryBlock()];
 
   CSRFormat CSRF(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
-  COOFormat COOF(Props, Ctx, Scope, Slv, Converter, InputKernel);
+  COOFormat COOF(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
   DenseMatFormat DenseMat(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
-  DenseVecFormat DenseVec(Props, Ctx, Scope, Slv, Converter, InputKernel);
+  DenseVecFormat DenseVec(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
 
   FormatManager FM;
   FM.registerFormat(&CSRF, FormatManager::SPARSE, 2);
