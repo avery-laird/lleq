@@ -748,6 +748,8 @@ public:
   void isAccessedBy(Value *A, std::vector<Value*> &Set) {
     if (!isArray(A))
       return;
+    std::vector<Value*> WorkList;
+    SmallPtrSet<Value*, 10> Visited;
     for (auto *U : A->users()) {
       // all possible uses of A:
       if (auto *GEP = dyn_cast<GEPOperator>(U)) {
@@ -757,13 +759,13 @@ public:
               "GEPOperators with multiple indices are not supported.");
         auto &Idx = *GEP->indices().begin();
         Instruction *Inst = dyn_cast<Instruction>(&Idx);
-        std::vector<Value*> WorkList;
-        SmallPtrSet<Value*, 10> Visited;
+        WorkList.push_back(Inst);
         while (WorkList.size()) {
           Value *Current = WorkList.back();
           WorkList.pop_back();
           if (Visited.count(Current))
             continue;
+          Visited.insert(Current);
           if (isArray(Current) || isInt(Current))
             Set.push_back(Current);
           if (auto *Next = dyn_cast<Instruction>(Current))
@@ -798,6 +800,44 @@ public:
     }
     return true;
   }
+
+  bool asAddress(Value *V) {
+    if (!isArray(V))
+      return false;
+    // V is a GEP ptr operand
+    // -> used in a load
+    // -> used as a GEP index
+    std::vector<Value *> Stack;
+    SmallPtrSet<Value *, 10> Visited;
+    DenseMap<Value *, Value *> ParentOf;
+    Stack.push_back(V);
+    Value *GEPPtr = nullptr;
+    Value *LoadUser = nullptr;
+    Value *GEPIdx = nullptr;
+    while (!Stack.empty()) {
+      Value *E = Stack.back();
+      Visited.insert(E);
+      Stack.pop_back();
+      if (auto *GEP = dyn_cast<GEPOperator>(E)) {
+        if (GEP->getPointerOperand() == V)
+          GEPPtr = GEP;
+        else if (GEPPtr && LoadUser && (*GEP->indices().begin() == ParentOf[E]))
+          GEPIdx = GEP;
+      }
+      if (auto *Load = dyn_cast<LoadInst>(E))
+        if (GEPPtr && Load->getPointerOperand() == GEPPtr)
+          LoadUser = Load;
+      if (GEPPtr && LoadUser && GEPIdx)
+        return true;
+      for (auto *U : E->users())
+        if (!Visited.contains(U)) {
+          Stack.push_back(U);
+          ParentOf[U] = E;
+        }
+    }
+    return false;
+  }
+
 protected:
   ScalarEvolution &SE;
   LoopNest &LN;
@@ -1105,49 +1145,56 @@ struct Element {
   Element(std::string Name) : Name(Name) {}
   Element(std::string Name, Value *V) : Name(Name), Val(V) {}
   unsigned ID;
+  unsigned Base;
   std::string Name;
   Value *Val = nullptr;
 };
 struct Constraint {
   enum CType {
     IS_INT = 0,
-    IS_DOUBLE_PTR = 1,
-    IS_INT_PTR = 2,
-    INDEXED_BY = 3
+    IS_ARRAY = 1,
+    INDEXED_BY = 2,
+    AS_ADDRESS = 3
   };
   const CType Kind;
-  std::vector<Element> Operands;
+  std::vector<Element*> Operands;
+
+  static std::string print(const CType K) {
+    switch (K) {
+    default:
+      llvm_unreachable("unsupported constraint kind.");
+    case IS_INT:
+      return "IS_INT";
+    case IS_ARRAY:
+      return "IS_ARRAY";
+    case INDEXED_BY:
+      return "INDEXED_BY";
+    case AS_ADDRESS:
+      return "AS_ADDRESS";
+    }
+  }
 };
 
 class ConstraintCompiler {
-  enum ATYPE { ABSTRACT = 0, CONCRETE = 1 };
+  enum FType { DOMAIN = 0, RANGE = 1 };
 
 public:
   ConstraintCompiler(std::vector<Constraint> &C, std::vector<Element> &D,
                      std::vector<Element> &R, z3::context &Ctx, Predicate &P)
       : Ctx(Ctx), Constraints(C), Domain(D), Range(R), Val(Ctx.uninterpreted_sort("Value")), Predicates(P) {  }
 
-  void compileConstraints() {
+  void compileConstraints(const z3::expr &equal, expr_vector &Output) {
     expr_vector domain(Ctx), range(Ctx);
     for (unsigned i = 0; i < Domain.size(); ++i) {
       Domain[i].ID = i;
-      domain.push_back(Ctx.constant(Domain[i].Name.c_str(), Val));
+      Domain[i].Base = i;
+      domain.push_back(Ctx.constant((Domain[i].Name + "_domain").c_str(), Val));
     }
     for (unsigned i = 0; i < Range.size(); ++i) {
       Range[i].ID = i + Domain.size();
-      range.push_back(Ctx.constant(Range[i].Name.c_str(), Val));
+      Range[i].Base = i;
+      range.push_back(Ctx.constant((Range[i].Name + "_range").c_str(), Val));
     }
-//    std::vector<Constraint*> Unary, Binary;
-//    for (auto &C : Constraints) {
-//      size_t Size = C.Operands.size();
-//      if (Size == 0) {
-//        Unary.push_back(&C);
-//      } else if (Size == 1) {
-//        Binary.push_back(&C);
-//      } else {
-//        llvm_unreachable("unsupported constraint arity.");
-//      }
-//    }
     std::set<Constraint::CType> UniqueConstraints;
     // create relations
     for (auto &C : Constraints)
@@ -1155,54 +1202,142 @@ public:
     std::vector<Constraint> RangeConstraints;
     for (auto C : UniqueConstraints) {
       for (auto &E : Range) {
-        populateConstraints(C, E, RangeConstraints);
+        populateConstraints(C, &E, RangeConstraints);
       }
+    }
+    std::unordered_map<Constraint::CType, expr_vector > DomainRelations;
+    std::unordered_map<Constraint::CType, expr_vector > RangeRelations;
+//    expr_vector AllElements(Ctx);
+//    for (auto &E : Domain) AllElements.push_back(Ctx.constant(E.Name.c_str(), Val));
+//    for (auto &E : Range) AllElements.push_back(Ctx.constant(E.Name.c_str(), Val));
+    for (auto C : UniqueConstraints) {
+      expr_vector D(Ctx), R(Ctx);
+      size_t DSize = arity(C) == 1 ? 1 : Domain.size();
+      size_t RSize = arity(C) == 1 ? 1 : Range.size();
+      for (size_t i = 0; i < DSize; ++i) D.push_back(const_array(Val, Ctx.bool_val(false)));
+      for (size_t i = 0; i < RSize; ++i) R.push_back(const_array(Val, Ctx.bool_val(false)));
+      DomainRelations.emplace(C, D);
+      RangeRelations.emplace(C, R);
+    }
+    for (auto &C : Constraints)
+      addAllRelations(DomainRelations, domain, C);
+    for (auto &C : RangeConstraints)
+      addAllRelations(RangeRelations, range, C);
+    LLVM_DEBUG({
+      dbgs() << "Domain ---------------------\n";
+      for (auto &C : Constraints) {
+        dbgs() << Constraint::print(C.Kind) << ": ";
+        for (auto &O : C.Operands)
+          dbgs() << O->Name << " ";
+        dbgs() << "\n";
+      }
+      dbgs() << "Range ----------------------\n";
+      for (auto &C : RangeConstraints) {
+        dbgs() << Constraint::print(C.Kind) << ": ";
+        for (auto &O : C.Operands)
+          dbgs() << *O->Val << " ";
+        dbgs() << "\n";
+      }
+    });
+
+    expr_vector CollectEquivs(Ctx);
+    std::vector<int> Coeffs;
+    for (auto &D : Domain) {
+      for (auto &R : Range) {
+        expr_vector And(Ctx);
+        And.push_back(domain[D.Base] == range[R.Base]);
+        for (auto &C : UniqueConstraints) {
+          expr_vector &Left = DomainRelations.at(C);
+          expr_vector &Right = RangeRelations.at(C);
+          if (arity(C) == 1)
+            And.push_back(Left[0][domain[D.Base]] ==
+                          Right[0][range[R.Base]]);
+          else if (arity(C) == 2)
+            And.push_back(Left[D.Base] == Right[R.Base]);
+          else
+            llvm_unreachable("unsupported arity.");
+        }
+        And.push_back(equal[Ctx.int_val(D.ID)] == Ctx.int_val(R.ID));
+        Coeffs.push_back(1);
+        CollectEquivs.push_back(mk_and(And));
+      }
+    }
+    Output.push_back(pbeq(CollectEquivs, Coeffs.data(), Domain.size()));
+    Output.push_back(distinct(domain));
+    Output.push_back(distinct(range));
+    expr x = Ctx.int_const("x");
+    expr y = Ctx.int_const("y");
+    Output.push_back(forall(x, implies(equal[x] == equal[y], x == y)));
+  }
+
+  void
+  addAllRelations(std::unordered_map<Constraint::CType, expr_vector> &RelMap,
+                  expr_vector &Elements, Constraint &C) {
+    if (auto Encoding = RelMap.find(C.Kind); Encoding != RelMap.end()) {
+      expr_vector &Update = Encoding->second;
+      if (arity(C.Kind) == 1) {
+        expr Store =
+            store(Update[0], Elements[C.Operands[0]->Base], Ctx.bool_val(true));
+        Update.set(0, Store);
+      } else if (arity(C.Kind) == 2) {
+        expr Store = store(Update[C.Operands[0]->Base],
+                           Elements[C.Operands[1]->Base], Ctx.bool_val(true));
+        Update.set(C.Operands[0]->Base, Store);
+      }
+      RelMap.emplace(C.Kind, Update);
     }
   }
 
-  void populateConstraints(Constraint::CType C, Element &E,
+  unsigned arity(Constraint::CType C) {
+    switch (C) {
+    default:
+      llvm_unreachable("unsupported constraint.");
+    case Constraint::IS_INT:
+    case Constraint::IS_ARRAY:
+    case Constraint::AS_ADDRESS:
+      return 1;
+    case Constraint::INDEXED_BY:
+      return 2;
+    }
+  }
+
+  Element *getRangeElement(Value * V) {
+    for (auto &R : Range) {
+      if (R.Val == V)
+        return &R;
+    }
+    return nullptr;
+  }
+
+  void populateConstraints(Constraint::CType C, Element *E,
                            std::vector<Constraint> &Concrete) {
     switch (C) {
     default:
       llvm_unreachable("unknown constraint type");
     case Constraint::IS_INT:
-      if (Predicates.isInt(E.Val))
+      if (Predicates.isInt(E->Val))
         Concrete.push_back({C, {E}});
       break;
-    case Constraint::IS_INT_PTR:
-    case Constraint::IS_DOUBLE_PTR:
-      if (Predicates.isArray(E.Val))
+    case Constraint::IS_ARRAY:
+      if (Predicates.isArray(E->Val))
+        Concrete.push_back({C, {E}});
+      break;
+    case Constraint::AS_ADDRESS:
+      if (Predicates.asAddress(E->Val))
         Concrete.push_back({C, {E}});
       break;
     case Constraint::INDEXED_BY:
       std::vector<Value *> Set;
-      Predicates.isAccessedBy(E.Val, Set);
+      Predicates.isAccessedBy(E->Val, Set);
       for (auto *V : Set)
-        Concrete.push_back({C, {E, Element(V->getNameOrAsOperand(), V)}});
+        if (auto *Target = getRangeElement(V))
+          Concrete.push_back({C, {E, Target}});
       break;
-    }
-  }
-
-  expr_vector mkBase(Constraint &C, std::vector<Element> &Set) {
-    expr_vector Elements(Ctx);
-    switch (C.Kind) {
-      default:
-      llvm_unreachable("unknown constraint type.");
-      case Constraint::IS_INT:
-      case Constraint::IS_DOUBLE_PTR:
-      case Constraint::IS_INT_PTR:
-      Elements.push_back(const_array(Val, Ctx.bool_val(false)));
-      return Elements;
-      case Constraint::INDEXED_BY:
-      for (auto &D : Set)
-        Elements.push_back(const_array(Val, Ctx.bool_val(false)));
-      return Elements;
     }
   }
 
 protected:
   z3::context &Ctx;
-  expr_vector Relations[2] = {expr_vector(Ctx), expr_vector(Ctx)};
   std::vector<Constraint> &Constraints;
   std::vector<Element> &Domain;
   std::vector<Element> &Range;
@@ -1273,86 +1408,87 @@ public:
     for (auto *V : Scope)
       Range.push_back(Element(V->getNameOrAsOperand(), V));
     ConstraintCompiler CC(Constraints, Domain, Range, Ctx, Predicates);
-    CC.compileConstraints();
+    expr_vector Output(Ctx);
+    CC.compileConstraints(EQUAL, Output);
 
-    func_decl_vector AllRelations(Ctx);
-    //
-    for (unsigned i = 0; i < Props.Props.size(); ++i)
-      AllRelations.push_back(Ctx.function(Props.Props[i].Name.c_str(),
-                                          Ctx.int_sort(), Ctx.bool_sort()));
-    // constraints from format
-    for (unsigned i = 0; i < Props.Props.size(); ++i) {
-      expr_vector List(Ctx);
-      for (unsigned j = 0; j < Vars.size(); ++j)
-        List.push_back(AllRelations[i](Vars[j]) ==
-                       Ctx.bool_val(Sets[i].contains(Vars[j])));
-
-      LLVM_DEBUG({
-        for (auto const &E : List)
-          dbgs() << E.to_string() << ", ";
-        dbgs() << "\n";
-      });
-
-      Slv.add(List);
-    }
-
-
-
-    // constraints from input program
-    // make mapping for scope args
+//    func_decl_vector AllRelations(Ctx);
+//    //
+//    for (unsigned i = 0; i < Props.Props.size(); ++i)
+//      AllRelations.push_back(Ctx.function(Props.Props[i].Name.c_str(),
+//                                          Ctx.int_sort(), Ctx.bool_sort()));
+//    // constraints from format
+//    for (unsigned i = 0; i < Props.Props.size(); ++i) {
+//      expr_vector List(Ctx);
+//      for (unsigned j = 0; j < Vars.size(); ++j)
+//        List.push_back(AllRelations[i](Vars[j]) ==
+//                       Ctx.bool_val(Sets[i].contains(Vars[j])));
+//
+//      LLVM_DEBUG({
+//        for (auto const &E : List)
+//          dbgs() << E.to_string() << ", ";
+//        dbgs() << "\n";
+//      });
+//
+//      Slv.add(List);
+//    }
+//
+//
+//
+//    // constraints from input program
+//    // make mapping for scope args
     std::vector<unsigned> ScopeVars;
 
     for (unsigned i = 0; i < Scope.size(); ++i) {
       ScopeVars.push_back(i + Vars.size());
       AllNames.push_back(Scope[i]->getName().str());
     }
-
-    for (unsigned i = 0; i < Props.Props.size(); ++i) {
-      expr_vector List(Ctx);
-      for (unsigned j = 0; j < Scope.size(); ++j)
-        List.push_back(AllRelations[i](ScopeVars[j]) ==
-                       Ctx.bool_val(Props.Props[i].Set->contains(Scope[j])));
-      LLVM_DEBUG({
-        for (auto const &E : List)
-          dbgs() << E.to_string() << ", ";
-        dbgs() << "\n";
-      });
-      Slv.add(List);
-    }
-
-    // product of ScopeVars and CSRVars
-    expr_vector Pairs(Ctx);
-    std::vector<int> Weights;
-    for (auto A : Vars)
-      for (auto B : ScopeVars) {
-        expr_vector AllRels(Ctx);
-        for (auto const &Rel : AllRelations)
-          AllRels.push_back(Rel(A) == Rel(B));
-        AllRels.push_back(EQUAL[Ctx.int_val(B)] == Ctx.int_val(A));
-        Pairs.push_back(mk_and(AllRels));
-        Weights.push_back(1);
-      }
-    LLVM_DEBUG({
-      for (auto const &E : Pairs)
-        dbgs() << E.to_string() << "\n";
-    });
-
-    expr s0 = Ctx.int_const("s0");
-    expr s1 = Ctx.int_const("s1");
+//
+//    for (unsigned i = 0; i < Props.Props.size(); ++i) {
+//      expr_vector List(Ctx);
+//      for (unsigned j = 0; j < Scope.size(); ++j)
+//        List.push_back(AllRelations[i](ScopeVars[j]) ==
+//                       Ctx.bool_val(Props.Props[i].Set->contains(Scope[j])));
+//      LLVM_DEBUG({
+//        for (auto const &E : List)
+//          dbgs() << E.to_string() << ", ";
+//        dbgs() << "\n";
+//      });
+//      Slv.add(List);
+//    }
+//
+//    // product of ScopeVars and CSRVars
+//    expr_vector Pairs(Ctx);
+//    std::vector<int> Weights;
+//    for (auto A : Vars)
+//      for (auto B : ScopeVars) {
+//        expr_vector AllRels(Ctx);
+//        for (auto const &Rel : AllRelations)
+//          AllRels.push_back(Rel(A) == Rel(B));
+//        AllRels.push_back(EQUAL[Ctx.int_val(B)] == Ctx.int_val(A));
+//        Pairs.push_back(mk_and(AllRels));
+//        Weights.push_back(1);
+//      }
+//    LLVM_DEBUG({
+//      for (auto const &E : Pairs)
+//        dbgs() << E.to_string() << "\n";
+//    });
+//
+//    expr s0 = Ctx.int_const("s0");
+//    expr s1 = Ctx.int_const("s1");
     int LB = ScopeVars.front();
     int UB = ScopeVars.back();
-
-    Slv.add(atleast(Pairs, CARE));
-
-    for (auto A : Vars) {
-      Slv.add(exists(s0, implies(LB <= s0 && s0 <= UB, EQUAL[s0] == Ctx.int_val(A))));
-    }
-
-    Slv.add(forall(s0, s1,
-                   implies(LB <= s0 && s0 <= UB && LB <= s1 && s1 <= UB &&
-                               EQUAL[s0] == EQUAL[s1],
-                           s0 == s1)));
-
+//
+//    Slv.add(atleast(Pairs, CARE));
+//
+//    for (auto A : Vars) {
+//      Slv.add(exists(s0, implies(LB <= s0 && s0 <= UB, EQUAL[s0] == Ctx.int_val(A))));
+//    }
+//
+//    Slv.add(forall(s0, s1,
+//                   implies(LB <= s0 && s0 <= UB && LB <= s1 && s1 <= UB &&
+//                               EQUAL[s0] == EQUAL[s1],
+//                           s0 == s1)));
+    Slv.add(Output);
     auto Res = Slv.check();
     if (Res == z3::sat) {
       Model = Slv.get_model();
@@ -2105,10 +2241,16 @@ public:
 
 class CSRFormat : public Format {
 public:
+  Element _n;
+  Element _rowPtr;
+  Element _col;
+  Element _val;
+
   CSRFormat(Predicate &P, Properties &Props, z3::context &Ctx,
             const std::vector<Value *> &Scope, z3::solver &Slv,
             MakeZ3 &Converter, func_decl InputKernel)
-      : Format(P, Props, Ctx, Scope, Slv, Converter, InputKernel) {
+      : Format(P, Props, Ctx, Scope, Slv, Converter, InputKernel), _n("n"),
+        _rowPtr("rowPtr"), _col("col"), _val("val") {
     FormatName = "CSR";
     CARE = 4;
     Names.push_back("n");
@@ -2116,15 +2258,16 @@ public:
     Names.push_back("col");
     Names.push_back("val");
 
-    Element n("n");
-    Element rowPtr("rowPtr");
-    Element col("col");
-    Element val("val");
-    Constraints.push_back({Constraint::IS_INT, {n}});
-    Constraints.push_back({Constraint::IS_DOUBLE_PTR, {rowPtr}});
-    Constraints.push_back({Constraint::IS_DOUBLE_PTR, {val}});
-    Constraints.push_back({Constraint::IS_INT_PTR, {col}});
-    Domain = {n, rowPtr, col, val};
+
+    Domain = {_n, _rowPtr, _col, _val};
+    Constraints.push_back({Constraint::IS_INT, {&_n}});
+    Constraints.push_back({Constraint::IS_ARRAY, {&_rowPtr}});
+    Constraints.push_back({Constraint::IS_ARRAY, {&_val}});
+    Constraints.push_back({Constraint::IS_ARRAY, {&_col}});
+    Constraints.push_back({Constraint::INDEXED_BY, {&_val, &_rowPtr}});
+    Constraints.push_back({Constraint::INDEXED_BY, {&_col, &_rowPtr}});
+    Constraints.push_back({Constraint::AS_ADDRESS, {&_col}});
+    Constraints.push_back({Constraint::AS_ADDRESS, {&_rowPtr}});
 
 
     for (unsigned i = 0; i < CARE; ++i) {
