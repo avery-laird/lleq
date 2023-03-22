@@ -1179,16 +1179,17 @@ class ConstraintCompiler {
   enum FType { DOMAIN = 0, RANGE = 1 };
 
 public:
-  ConstraintCompiler(std::vector<Constraint> &C, std::vector<Element> &D,
+  ConstraintCompiler(std::vector<Constraint> &C, std::vector<Element *> &D,
                      std::vector<Element> &R, z3::context &Ctx, Predicate &P)
-      : Ctx(Ctx), Constraints(C), Domain(D), Range(R), Val(Ctx.uninterpreted_sort("Value")), Predicates(P) {  }
+      : Ctx(Ctx), Constraints(C), Domain(D), Range(R),
+        Val(Ctx.uninterpreted_sort("Value")), Predicates(P), domain(Ctx),
+        range(Ctx) {}
 
   void compileConstraints(const z3::expr &equal, expr_vector &Output) {
-    expr_vector domain(Ctx), range(Ctx);
     for (unsigned i = 0; i < Domain.size(); ++i) {
-      Domain[i].ID = i;
-      Domain[i].Base = i;
-      domain.push_back(Ctx.constant((Domain[i].Name + "_domain").c_str(), Val));
+      Domain[i]->ID = i;
+      Domain[i]->Base = i;
+      domain.push_back(Ctx.constant((Domain[i]->Name + "_domain").c_str(), Val));
     }
     for (unsigned i = 0; i < Range.size(); ++i) {
       Range[i].ID = i + Domain.size();
@@ -1207,9 +1208,6 @@ public:
     }
     std::unordered_map<Constraint::CType, expr_vector > DomainRelations;
     std::unordered_map<Constraint::CType, expr_vector > RangeRelations;
-//    expr_vector AllElements(Ctx);
-//    for (auto &E : Domain) AllElements.push_back(Ctx.constant(E.Name.c_str(), Val));
-//    for (auto &E : Range) AllElements.push_back(Ctx.constant(E.Name.c_str(), Val));
     for (auto C : UniqueConstraints) {
       expr_vector D(Ctx), R(Ctx);
       size_t DSize = arity(C) == 1 ? 1 : Domain.size();
@@ -1245,19 +1243,19 @@ public:
     for (auto &D : Domain) {
       for (auto &R : Range) {
         expr_vector And(Ctx);
-        And.push_back(domain[D.Base] == range[R.Base]);
+        And.push_back(domain[D->Base] == range[R.Base]);
         for (auto &C : UniqueConstraints) {
           expr_vector &Left = DomainRelations.at(C);
           expr_vector &Right = RangeRelations.at(C);
           if (arity(C) == 1)
-            And.push_back(Left[0][domain[D.Base]] ==
+            And.push_back(Left[0][domain[D->Base]] ==
                           Right[0][range[R.Base]]);
           else if (arity(C) == 2)
-            And.push_back(Left[D.Base] == Right[R.Base]);
+            And.push_back(Left[D->Base] == Right[R.Base]);
           else
             llvm_unreachable("unsupported arity.");
         }
-        And.push_back(equal[Ctx.int_val(D.ID)] == Ctx.int_val(R.ID));
+        And.push_back(equal[Ctx.int_val(D->ID)] == Ctx.int_val(R.ID));
         Coeffs.push_back(1);
         CollectEquivs.push_back(mk_and(And));
       }
@@ -1336,13 +1334,45 @@ public:
     }
   }
 
+  void printMapping(const z3::model &M, const z3::expr &EQUAL) {
+    LLVM_DEBUG({
+      dbgs() << M.to_string() << "\n";
+      for (auto &D : Domain)
+        dbgs() << M.eval(EQUAL[Ctx.int_val(D->ID)]).to_string() << " ";
+      dbgs() << "\n";
+      for (auto &D : Domain) {
+        dbgs() << "(" << domain[D->Base].to_string() << ", " << D->ID
+               << ") -> (";
+        int64_t Eq = M.eval(EQUAL[Ctx.int_val(D->ID)]).as_int64();
+        if (Range.front().ID <= Eq && Eq <= Range.back().ID) {
+          dbgs() << range[Eq - Domain.size()].to_string() << ", ";
+        } else {
+          dbgs() << "<empty>, ";
+        }
+        dbgs() << Eq << ")\n";
+      }
+    });
+  }
+
+  void makeBlock(const z3::model &M, const expr &EQUAL, expr_vector &Block) {
+    for (auto &D : Domain) {
+      int64_t Image = M.eval(EQUAL[Ctx.int_val(D->ID)]).as_int64();
+      if (Range.front().ID <= Image && Image <= Range.back().ID) {
+        Block.push_back(EQUAL[Ctx.int_val(D->ID)] !=
+                        M.eval(EQUAL[Ctx.int_val(D->ID)]));
+      }
+    }
+  }
+
 protected:
   z3::context &Ctx;
   std::vector<Constraint> &Constraints;
-  std::vector<Element> &Domain;
+  std::vector<Element*> &Domain;
   std::vector<Element> &Range;
   z3::sort Val;
   Predicate &Predicates;
+  expr_vector domain;
+  expr_vector range;
 };
 
 class Format {
@@ -1492,14 +1522,16 @@ public:
     auto Res = Slv.check();
     if (Res == z3::sat) {
       Model = Slv.get_model();
-      printMapping(Model, LB, UB);
+      CC.printMapping(Model, EQUAL);
+//      printMapping(Model, LB, UB);
       expr_vector Block(Ctx);
-      for (unsigned i = LB; i <= UB; ++i) {
-        int64_t Image = Model.eval(EQUAL[Ctx.int_val(i)]).as_int64();
-        if (0 <= Image && Image < CARE)
-          Block.push_back(EQUAL[Ctx.int_val(i)] !=
-                          Model.eval(EQUAL[Ctx.int_val(i)]));
-      }
+//      for (unsigned i = LB; i <= UB; ++i) {
+//        int64_t Image = Model.eval(EQUAL[Ctx.int_val(i)]).as_int64();
+//        if (0 <= Image && Image < CARE)
+//          Block.push_back(EQUAL[Ctx.int_val(i)] !=
+//                          Model.eval(EQUAL[Ctx.int_val(i)]));
+//      }
+      CC.makeBlock(Model, EQUAL, Block);
       Slv.add(mk_and(Block));
       auto Unique = Slv.check();
       if (Unique != z3::unsat) {
@@ -1706,7 +1738,7 @@ public:
   func_decl Matrix;
   NameMapTy NameMap;
   std::vector<Constraint> Constraints;
-  std::vector<Element> Domain;
+  std::vector<Element*> Domain;
   Predicate &Predicates;
 };
 
@@ -2259,7 +2291,7 @@ public:
     Names.push_back("val");
 
 
-    Domain = {_n, _rowPtr, _col, _val};
+    Domain = {&_n, &_rowPtr, &_col, &_val};
     Constraints.push_back({Constraint::IS_INT, {&_n}});
     Constraints.push_back({Constraint::IS_ARRAY, {&_rowPtr}});
     Constraints.push_back({Constraint::IS_ARRAY, {&_val}});

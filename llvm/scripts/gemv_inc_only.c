@@ -8,4 +8,3 @@ void gemv(int n, int m, double *y, double *A, double *x)
     }
   }
 }
-

@@ -13,13 +13,13 @@ function(add_function_target filename funcname COMPILER)
             COMMAND ${LD_LIBRARY_PATH} ${COMPILER} ${LLFLAGS} ${CMAKE_CURRENT_LIST_DIR}/${filename} -o ${filename_noext}.ll
             DEPENDS ${filename}
             VERBATIM)
-    add_custom_target(generate_${filename_noext}_ll DEPENDS ${filename_noext}.ll)
+    add_custom_target(generate_${filename_noext}_${funcname}_ll DEPENDS ${filename_noext}.ll)
 
     add_custom_command(
             OUTPUT ${funcname}_extracted.ll
             COMMAND ${LD_LIBRARY_PATH} ${EXTRACT} --func ${funcname} ${filename_noext}.ll -o ${funcname}_extracted.ll
             DEPENDS ${filename_noext}.ll
-                    generate_${filename_noext}_ll
+                    generate_${filename_noext}_${funcname}_ll
             VERBATIM)
     add_custom_target(generate_${funcname}_extracted_ll DEPENDS ${funcname}_extracted.ll)
 
@@ -49,3 +49,7 @@ add_function_target(spmm_csr.cpp spmm_v2 ${PROJECT_BINARY_DIR}/bin/clang++)
 add_function_target(spmm_naive.cpp spmm_naive_csr ${PROJECT_BINARY_DIR}/bin/clang++)
 add_function_target(hpcg_spmv.cpp ComputeSPMV_ref_nostruct ${PROJECT_BINARY_DIR}/bin/clang++)
 add_function_target(gemm.cpp gemm ${PROJECT_BINARY_DIR}/bin/clang++)
+add_function_target(gemv.c gemv ${PROJECT_BINARY_DIR}/bin/clang)
+add_function_target(gemv.c GEMV_ComputeElem ${PROJECT_BINARY_DIR}/bin/clang)
+add_function_target(gemv.c GEMV_AddColElem ${PROJECT_BINARY_DIR}/bin/clang)
+add_function_target(spmv_csr_nomklheader.cpp SpMV_CSR_ComputeElem ${PROJECT_BINARY_DIR}/bin/clang++)

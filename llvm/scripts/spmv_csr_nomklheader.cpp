@@ -20,6 +20,42 @@ void spMV_Mul_csr(int n,
     y[i] = sum;
   }
 }
+
+void SpMV_CSR_ComputeElem(int i, int n, int *rowPtr, int *col, double *val,
+                          double *x, double *y) {
+  int k;
+  double sum;
+
+  if (n > 0) {
+    sum = 0.0;
+    if (rowPtr[i + 1] > rowPtr[i]) {
+      k = rowPtr[i];
+      sum += val[k] * x[col[k]];
+    }
+    y[i] = sum;
+  }
+}
+
+void SpMV_CSR_AddColElem(int n,
+                         int *rowPtr,
+                         int *col,
+                         double *val,
+                         double *x,
+                         double *y) {
+  int i, k;
+  double sum;
+
+  if (n > 0) {
+    i = 0;
+    sum = 0.0;
+    if (rowPtr[i + 1] > rowPtr[i]) {
+      k = rowPtr[i];
+      sum += val[k] * x[col[k]];
+    }
+    y[i] = sum;
+  }
+}
+
 }
 
 
