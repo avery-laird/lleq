@@ -1154,7 +1154,8 @@ struct Constraint {
     IS_INT = 0,
     IS_ARRAY = 1,
     INDEXED_BY = 2,
-    AS_ADDRESS = 3
+    AS_ADDRESS = 3,
+    IS_READONLY = 4
   };
   const CType Kind;
   std::vector<Element*> Operands;
@@ -1171,6 +1172,8 @@ struct Constraint {
       return "INDEXED_BY";
     case AS_ADDRESS:
       return "AS_ADDRESS";
+    case IS_READONLY:
+      return "IS_READONLY";
     }
   }
 };
@@ -1293,6 +1296,7 @@ public:
     case Constraint::IS_INT:
     case Constraint::IS_ARRAY:
     case Constraint::AS_ADDRESS:
+    case Constraint::IS_READONLY:
       return 1;
     case Constraint::INDEXED_BY:
       return 2;
@@ -1322,6 +1326,10 @@ public:
       break;
     case Constraint::AS_ADDRESS:
       if (Predicates.asAddress(E->Val))
+        Concrete.push_back({C, {E}});
+      break;
+    case Constraint::IS_READONLY:
+      if (Predicates.isReadOnly(E->Val))
         Concrete.push_back({C, {E}});
       break;
     case Constraint::INDEXED_BY:
@@ -1357,10 +1365,10 @@ public:
   void makeBlock(const z3::model &M, const expr &EQUAL, expr_vector &Block) {
     for (auto &D : Domain) {
       int64_t Image = M.eval(EQUAL[Ctx.int_val(D->ID)]).as_int64();
-      if (Range.front().ID <= Image && Image <= Range.back().ID) {
+//      if (Range.front().ID <= Image && Image <= Range.back().ID) {
         Block.push_back(EQUAL[Ctx.int_val(D->ID)] !=
                         M.eval(EQUAL[Ctx.int_val(D->ID)]));
-      }
+//      }
     }
   }
 
@@ -1532,11 +1540,12 @@ public:
 //                          Model.eval(EQUAL[Ctx.int_val(i)]));
 //      }
       CC.makeBlock(Model, EQUAL, Block);
-      Slv.add(mk_and(Block));
+      Slv.add(mk_or(Block));
       auto Unique = Slv.check();
       if (Unique != z3::unsat) {
         auto M = Slv.get_model();
-        printMapping(M, LB, UB);
+        CC.printMapping(M, EQUAL);
+//        printMapping(M, LB, UB);
         LLVM_DEBUG({
           std::stringstream S;
           S << Res;
@@ -1694,12 +1703,19 @@ public:
   void setKernel(Kernel *K) { Kern = K; }
 
   void initEqualityChecking() {
-    for (unsigned i = 0; i < Scope.size(); ++i) {
-      int Src = Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64();
-      if (Src >= CARE)
-        continue;
-      NameMap[AllNames[Src]] = Scope[i];
+    for (auto &D : Domain) {
+      int64_t Image = Model.eval(EQUAL[Ctx.int_val(D->ID)]).as_int64() - Domain.size();
+      if (0 <= Image && Image < Scope.size()) {
+        NameMap[Domain[Image]->Name] = Scope[Image];
+        D->Val = Scope[Image];
+      }
     }
+//    for (unsigned i = 0; i < Scope.size(); ++i) {
+//      int Src = Model.eval(EQUAL[Ctx.int_val(i + Vars.size())]).as_int64();
+//      if (Src >= CARE)
+//        continue;
+//      NameMap[AllNames[Src]] = Scope[i];
+//    }
     // everything below here uses NameMap
     nnz = makeNumberNonZero();
     n = makeNumberRows();
@@ -1834,8 +1850,7 @@ public:
         BaseCase = false;
         LLVM_DEBUG({
           Format *A = (*MatchingFormats)[0];
-          Format *XFormat = (*MatchingFormats)[1];
-          expr x = Converter.FromVal(XFormat->NameMap["x"]);
+          expr x = Converter.FromVal(A->NameMap["x"]);
           Value *Y = LiveOut;
           func_decl Matrix = A->getMatrix();
           expr n = A->makeNumberRows();
@@ -1979,12 +1994,12 @@ public:
 
 class GEMV : public SPMVBase {
 public:
-  GEMV(MakeZ3 &Conv) : SPMVBase(Conv, "GEMV", "SPMV", {{CType::SPARSE, 2}, {CType::DENSE, 1}}) {}
+  GEMV(MakeZ3 &Conv) : SPMVBase(Conv, "GEMV", "SPMV", {{CType::SPARSE, 2}}) {}
 
   func_decl makeKernel(context &Ctx) override {
     expr y = Converter.FromVal(LiveOut);
     // x is constructed from dense format
-    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["x"]);
+    expr x = Converter.FromVal((*MatchingFormats)[0]->NameMap["x"]);
     // matrix is constructed from sparse format
     func_decl Matrix = (*MatchingFormats)[0]->getMatrix();
     expr n = Ctx.int_const("n");
@@ -2023,7 +2038,7 @@ public:
   func_decl makeKernelNoLoop(context &Ctx) override {
     expr y = Converter.FromVal(LiveOut);
     // x is constructed from dense format
-    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["x"]);
+    expr x = Converter.FromVal((*MatchingFormats)[0]->NameMap["x"]);
     // matrix is constructed from sparse format
     func_decl Matrix = (*MatchingFormats)[0]->getMatrix();
     expr n = Ctx.int_const("n");
@@ -2051,12 +2066,12 @@ public:
 
 class GEMV_reset : public SPMVBase {
 public:
-  GEMV_reset(MakeZ3 &Conv) : SPMVBase(Conv, "GEMV_reset", "SPMV_reset", {{CType::SPARSE, 2}, {CType::DENSE, 1}}) {}
+  GEMV_reset(MakeZ3 &Conv) : SPMVBase(Conv, "GEMV_reset", "SPMV_reset", {{CType::SPARSE, 2}}) {}
 
   func_decl makeKernel(context &Ctx) override {
     expr y = Converter.FromVal(LiveOut);
     // x is constructed from dense format
-    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["x"]);
+    expr x = Converter.FromVal((*MatchingFormats)[0]->NameMap["x"]);
     // matrix is constructed from sparse format
     func_decl Matrix = (*MatchingFormats)[0]->getMatrix();
     expr n = Ctx.int_const("n");
@@ -2092,7 +2107,7 @@ public:
 
   func_decl makeKernelNoLoop(context &Ctx) override {
     expr y = Converter.FromVal(LiveOut);
-    expr x = Converter.FromVal((*MatchingFormats)[1]->NameMap["x"]);
+    expr x = Converter.FromVal((*MatchingFormats)[0]->NameMap["x"]);
     // matrix is constructed from sparse format
     func_decl Matrix = (*MatchingFormats)[0]->getMatrix();
     expr n = Ctx.int_const("n");
@@ -2215,36 +2230,42 @@ public:
   }
 };
 
-class DenseVecFormat : public Format {
+class CSRDenseVecFormat : public Format {
 public:
-  DenseVecFormat(Predicate &P, Properties &Props, z3::context &Ctx,
+  Element _x;
+
+  CSRDenseVecFormat(Predicate &P, Properties &Props, z3::context &Ctx,
                  const std::vector<Value *> &Scope, z3::solver &Slv,
                  MakeZ3 &Converter, func_decl InputKernel)
-      : Format(P, Props, Ctx, Scope, Slv, Converter, InputKernel) {
+      : Format(P, Props, Ctx, Scope, Slv, Converter, InputKernel), _x("x") {
     FormatName = "DenseVec";
-    CARE = 1;
-    Names.push_back("x");
+//    CARE = 1;
+//    Names.push_back("x");
 
-    for (unsigned i = 0; i < CARE; ++i) {
-      Vars.push_back(i);
-      Map[Names[i].c_str()] = Vars[i];
-    }
-    AllNames.resize(CARE);
-    for (unsigned i = 0; i < CARE; ++i)
-      AllNames[i] = Names[i];
+    Domain = {&_x};
+    Constraints.push_back({Constraint::IS_ARRAY, {&_x}});
+    Constraints.push_back({Constraint::IS_READONLY, {&_x}});
 
-    Sets.resize(Props.Props.size());
-    for (unsigned i = 0; i < Props.Props.size(); ++i) {
-      auto &P = Props.Props[i];
-      if (P.Name == "readonly") {
-        Sets[i].insert(Map["x"]);
-      } else if (P.Name == "int") {
-      } else if (P.Name == "array") {
-        Sets[i].insert(Map["x"]);
-      } else if (P.Name == "as_address") {
-      } else if (P.Name == "direct_access") {
-      } else if (P.Name == "loop_bounds") {}
-    }
+//    for (unsigned i = 0; i < CARE; ++i) {
+//      Vars.push_back(i);
+//      Map[Names[i].c_str()] = Vars[i];
+//    }
+//    AllNames.resize(CARE);
+//    for (unsigned i = 0; i < CARE; ++i)
+//      AllNames[i] = Names[i];
+//
+//    Sets.resize(Props.Props.size());
+//    for (unsigned i = 0; i < Props.Props.size(); ++i) {
+//      auto &P = Props.Props[i];
+//      if (P.Name == "readonly") {
+//        Sets[i].insert(Map["x"]);
+//      } else if (P.Name == "int") {
+//      } else if (P.Name == "array") {
+//        Sets[i].insert(Map["x"]);
+//      } else if (P.Name == "as_address") {
+//      } else if (P.Name == "direct_access") {
+//      } else if (P.Name == "loop_bounds") {}
+//    }
   }
 
   func_decl makeMatrix() override {
@@ -2277,63 +2298,67 @@ public:
   Element _rowPtr;
   Element _col;
   Element _val;
+  Element _x;
 
   CSRFormat(Predicate &P, Properties &Props, z3::context &Ctx,
             const std::vector<Value *> &Scope, z3::solver &Slv,
             MakeZ3 &Converter, func_decl InputKernel)
       : Format(P, Props, Ctx, Scope, Slv, Converter, InputKernel), _n("n"),
-        _rowPtr("rowPtr"), _col("col"), _val("val") {
+        _rowPtr("rowPtr"), _col("col"), _val("val"), _x("x") {
     FormatName = "CSR";
-    CARE = 4;
-    Names.push_back("n");
-    Names.push_back("rowPtr");
-    Names.push_back("col");
-    Names.push_back("val");
+//    CARE = 4;
+//    Names.push_back("n");
+//    Names.push_back("rowPtr");
+//    Names.push_back("col");
+//    Names.push_back("val");
 
 
-    Domain = {&_n, &_rowPtr, &_col, &_val};
+    Domain = {&_n, &_rowPtr, &_col, &_val, &_x};
     Constraints.push_back({Constraint::IS_INT, {&_n}});
     Constraints.push_back({Constraint::IS_ARRAY, {&_rowPtr}});
     Constraints.push_back({Constraint::IS_ARRAY, {&_val}});
     Constraints.push_back({Constraint::IS_ARRAY, {&_col}});
+    Constraints.push_back({Constraint::IS_ARRAY, {&_x}});
     Constraints.push_back({Constraint::INDEXED_BY, {&_val, &_rowPtr}});
     Constraints.push_back({Constraint::INDEXED_BY, {&_col, &_rowPtr}});
+    Constraints.push_back({Constraint::INDEXED_BY, {&_x, &_col}});
+    Constraints.push_back({Constraint::INDEXED_BY, {&_x, &_rowPtr}});
     Constraints.push_back({Constraint::AS_ADDRESS, {&_col}});
     Constraints.push_back({Constraint::AS_ADDRESS, {&_rowPtr}});
 
 
-    for (unsigned i = 0; i < CARE; ++i) {
-      Vars.push_back(i);
-      Map[Names[i].c_str()] = Vars[i];
-    }
-    AllNames.resize(Vars.size());
-    for (unsigned i = 0; i < CARE; ++i)
-      AllNames[i] = Names[i];
-
-    Sets.resize(Props.Props.size());
-    for (unsigned i = 0; i < Props.Props.size(); ++i) {
-      auto &P = Props.Props[i];
-      if (P.Name == "readonly") {
-        Sets[i].insert(Map["rowPtr"]);
-        Sets[i].insert(Map["col"]);
-        Sets[i].insert(Map["val"]);
-      } else if (P.Name == "int") {
-        Sets[i].insert(Map["n"]);
-      } else if (P.Name == "array") {
-        Sets[i].insert(Map["rowPtr"]);
-        Sets[i].insert(Map["col"]);
-        Sets[i].insert(Map["val"]);
-      } else if (P.Name == "as_address") {
-        Sets[i].insert(Map["rowPtr"]);
-        Sets[i].insert(Map["col"]);
-      } else if (P.Name == "direct_access") {
-        Sets[i].insert(Map["rowPtr"]);
-        Sets[i].insert(Map["col"]);
-        Sets[i].insert(Map["val"]);
-      } else if (P.Name == "loop_bounds") {
-        Sets[i].insert(Map["rowPtr"]);
-      }
-    }
+//    for (unsigned i = 0; i < CARE; ++i) {
+//      Vars.push_back(i);
+//      Map[Names[i].c_str()] = Vars[i];
+//    }
+//    AllNames.resize(Vars.size());
+//    for (unsigned i = 0; i < CARE; ++i)
+//      AllNames[i] = Names[i];
+//
+//    Sets.resize(Props.Props.size());
+//    for (unsigned i = 0; i < Props.Props.size(); ++i) {
+//      auto &P = Props.Props[i];
+//      if (P.Name == "readonly") {
+//        Sets[i].insert(Map["rowPtr"]);
+//        Sets[i].insert(Map["col"]);
+//        Sets[i].insert(Map["val"]);
+//      } else if (P.Name == "int") {
+//        Sets[i].insert(Map["n"]);
+//      } else if (P.Name == "array") {
+//        Sets[i].insert(Map["rowPtr"]);
+//        Sets[i].insert(Map["col"]);
+//        Sets[i].insert(Map["val"]);
+//      } else if (P.Name == "as_address") {
+//        Sets[i].insert(Map["rowPtr"]);
+//        Sets[i].insert(Map["col"]);
+//      } else if (P.Name == "direct_access") {
+//        Sets[i].insert(Map["rowPtr"]);
+//        Sets[i].insert(Map["col"]);
+//        Sets[i].insert(Map["val"]);
+//      } else if (P.Name == "loop_bounds") {
+//        Sets[i].insert(Map["rowPtr"]);
+//      }
+//    }
   }
 
   func_decl makeMatrix() override {
@@ -2766,15 +2791,15 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   func_decl InputKernel = Translate[&F.getEntryBlock()];
 
   CSRFormat CSRF(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
-  COOFormat COOF(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
-  DenseMatFormat DenseMat(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
-  DenseVecFormat DenseVec(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
+//  COOFormat COOF(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
+//  DenseMatFormat DenseMat(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
+//  CSRDenseVecFormat CSRDenseVec(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
 
   FormatManager FM;
   FM.registerFormat(&CSRF, FormatManager::SPARSE, 2);
-  FM.registerFormat(&COOF, FormatManager::SPARSE, 2);
-  FM.registerFormat(&DenseMat, FormatManager::DENSE, 2);
-  FM.registerFormat(&DenseVec, FormatManager::DENSE, 1);
+//  FM.registerFormat(&COOF, FormatManager::SPARSE, 2);
+//  FM.registerFormat(&DenseMat, FormatManager::DENSE, 2);
+//  FM.registerFormat(&CSRDenseVec, FormatManager::DENSE, 1);
 
   GEMV MV(Converter);
   GEMV_reset MVReset(Converter);
