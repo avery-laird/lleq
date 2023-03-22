@@ -1706,7 +1706,7 @@ public:
     for (auto &D : Domain) {
       int64_t Image = Model.eval(EQUAL[Ctx.int_val(D->ID)]).as_int64() - Domain.size();
       if (0 <= Image && Image < Scope.size()) {
-        NameMap[Domain[Image]->Name] = Scope[Image];
+        NameMap[D->Name] = Scope[Image];
         D->Val = Scope[Image];
       }
     }
@@ -2139,23 +2139,23 @@ public:
 class SPMM : public Kernel {
 public:
   SPMM(MakeZ3 &Conv, LLVMContext &C, ScalarEvolution &SE, z3::context &Ctx, std::string Name, std::string SparseName)
-      : Kernel(Conv, Name, SparseName, {{CType::SPARSE, 2}, {CType::DENSE, 2}}), GEMM(ParseInputFile("gemm_opt.ll", "gemm", C, SE, Ctx, Conv, Mod)) {
+      : Kernel(Conv, Name, SparseName, {{CType::SPARSE, 2}}), GEMM(ParseInputFile("gemm_opt.ll", "gemm", C, SE, Ctx, Conv, Mod)) {
     // C(i, j) = C(i, j) + A(i, k) * B(k, j)
     Function *F = Mod->getFunction("gemm");
     func_decl G = GEMM[&F->getEntryBlock()];
 
   }
 
+  // TODO adapt for spmm
   void makeKernelParams(expr_vector &Params) override {
     Format *A = (*MatchingFormats)[0];
-    Format *B = (*MatchingFormats)[1];
     expr C = Converter.FromVal(LiveOut);
     z3::context &Ctx = Params.ctx();
     Params.push_back(A->n); // rows of C
-    Params.push_back(B->m); // cols of C
-    Params.push_back(Converter.FromVal(A->NameMap["B"])); // Dense A
+    Params.push_back(Converter.FromVal(A->NameMap["m"])); // cols of C
+//    Params.push_back(A->getMatrix()); // mapped matrix
     Params.push_back(A->m); // cols of A
-    Params.push_back(Converter.FromVal(B->NameMap["B"])); // Dense B
+    Params.push_back(Converter.FromVal(A->NameMap["x"])); // Dense matrix
     Params.push_back(C); // Dense C
   }
   func_decl makeKernel(context &Ctx) override {}
@@ -2451,6 +2451,22 @@ public:
       Assertions.push_back(val[m] != 0);
       return;
     }
+  }
+};
+
+class CSRSpMM : public CSRFormat {
+public:
+  Element _m;
+
+  CSRSpMM(Predicate &P, Properties &Props, z3::context &Ctx,
+            const std::vector<Value *> &Scope, z3::solver &Slv,
+            MakeZ3 &Converter, func_decl InputKernel)
+      : CSRFormat(P, Props, Ctx, Scope, Slv, Converter, InputKernel), _m("m") {
+    FormatName = "CSRSpMM";
+
+    Domain.push_back(&_m);
+    Constraints.push_back({Constraint::INDEXED_BY, {&_x, &_m}});
+    Constraints.push_back({Constraint::IS_INT, {&_m}});
   }
 };
 
@@ -2791,12 +2807,15 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   func_decl InputKernel = Translate[&F.getEntryBlock()];
 
   CSRFormat CSRF(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
+  CSRSpMM CSRSpMMF(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
 //  COOFormat COOF(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
 //  DenseMatFormat DenseMat(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
 //  CSRDenseVecFormat CSRDenseVec(Predicates, Props, Ctx, Scope, Slv, Converter, InputKernel);
 
   FormatManager FM;
   FM.registerFormat(&CSRF, FormatManager::SPARSE, 2);
+  FM.registerFormat(&CSRSpMMF, FormatManager::SPARSE, 2);
+  // TODO still index formats by domain elements, eg spmm should be sparse 2d dense 2d
 //  FM.registerFormat(&COOF, FormatManager::SPARSE, 2);
 //  FM.registerFormat(&DenseMat, FormatManager::DENSE, 2);
 //  FM.registerFormat(&CSRDenseVec, FormatManager::DENSE, 1);
