@@ -2143,7 +2143,6 @@ public:
     // C(i, j) = C(i, j) + A(i, k) * B(k, j)
     Function *F = Mod->getFunction("gemm");
     func_decl G = GEMM[&F->getEntryBlock()];
-
   }
 
   // TODO adapt for spmm
@@ -2158,7 +2157,19 @@ public:
     Params.push_back(Converter.FromVal(A->NameMap["x"])); // Dense matrix
     Params.push_back(C); // Dense C
   }
-  func_decl makeKernel(context &Ctx) override {}
+
+  func_decl makeKernel(context &Ctx) override {
+    Format *Spmm = (*MatchingFormats)[0];
+    expr y = Converter.FromVal(LiveOut);
+    // dense matrix B
+    expr B = Converter.FromVal(Spmm->NameMap["x"]);
+    func_decl A = Spmm->getMatrix();
+    expr n = Ctx.int_const("n");
+    expr m = Ctx.int_const("m");
+    expr colsA = Ctx.int_const("colsA");
+    expr_vector ArgsI(Ctx), ArgsJ(Ctx), ArgsK(Ctx);
+
+  }
   func_decl makeKernelNoLoop(context &Ctx) override {}
   bool checkInductiveImpl(func_decl &, z3::context &, expr_vector &, z3::solver &) override {}
 

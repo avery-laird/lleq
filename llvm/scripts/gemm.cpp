@@ -4,8 +4,7 @@
 
 extern "C" {
 
-void gemm(int n, int m, double *a, int colsA, double *b,
-          double *c) {
+void gemm(int n, int m, double *a, int colsA, double *b, double *c) {
   int i, j, k;
 
   for (i = 0; i < n; ++i) {   /* Loop over the rows of C */
