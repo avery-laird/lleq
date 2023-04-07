@@ -2769,6 +2769,25 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   GetLiveOuts(OuterLoop, LiveOuts);
   assert(LiveOuts.size() == 1 && "only 1 output tensor supported for now");
   auto *LiveOut = (*LiveOuts.begin());
+//  LLVM_DEBUG(dbgs() << "REV: LiveOut = " << *LiveOut << "\n");
+//  // get the thing we're storing, assume only one store for now
+//  auto *StoreVal = cast<StoreInst>(LiveOut)->getValueOperand();
+//  if (auto *StorePhi = dyn_cast<PHINode>(StoreVal)) {
+//    RecurrenceDescriptor RedDes;
+//    if (RecurrenceDescriptor::isReductionPHI(StorePhi, LN.getInnermostLoop(), RedDes, &DB, &AC, &DT, &SE)) {
+//        LLVM_DEBUG(dbgs() << "REV: reddes = " << *RedDes.getLoopExitInstr() << "\n");
+//    }
+//  }
+//  if (SE.isSCEVable(StoreVal->getType())) {
+//    auto *SC = SE.getSCEV(StoreVal);
+//    LLVM_DEBUG(dbgs() << "REV: scev = " << *SC << "\n");
+//    if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(SC)) {
+//        LLVM_DEBUG(dbgs() << "REV: addrec = " << *AddRec << "\n");
+//    }
+////    if (SE.hasComputableLoopEvolution(SC, OuterLoop)) {
+////
+////    }
+//  }
 
   SSA2Func Translate(Ctx, &DT, &Converter, LiveOut);
   Translate.fromFunction(&F);
@@ -2834,7 +2853,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   GEMV MV(Converter);
   GEMV_reset MVReset(Converter);
   SPMM GEMM(Converter, C, SE, Ctx, "GEMM", "SPMM");
-  std::vector<Kernel *> Kernels = {&MV, &MVReset, &GEMM};
+  std::vector<Kernel *> Kernels = {&MV,
+                                   &MVReset,
+//                                   &GEMM
+  };
 
   std::vector<std::pair<Kernel *, std::vector<Format *>>> PossibleKernels;
   std::vector<Format *> Formats;

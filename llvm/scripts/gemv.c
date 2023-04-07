@@ -8,11 +8,9 @@ void gemv(int n,
   double sum;
 
   for (i=0; i<n; i++) {
-    sum = 0.0;
     for(k=0; k<m; k++){
-      sum += A[i*m + k]*x[k];
+      y[i] += A[i*m + k]*x[k];
     }
-    y[i] = sum;
   }
 }
 
