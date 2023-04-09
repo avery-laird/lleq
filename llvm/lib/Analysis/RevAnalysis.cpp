@@ -25,6 +25,7 @@
 #include <chrono>
 #include <fstream>
 #include <sstream>
+#include "llvm/Support/Timer.h"
 
 #define DEBUG_TYPE "rev-analysis"
 
@@ -1444,7 +1445,7 @@ public:
 
     std::vector<Element> Range;
     for (auto *V : Scope)
-      Range.push_back(Element(V->getNameOrAsOperand(), V));
+      Range.push_back(Element(V->getName().data(), V));
     ConstraintCompiler CC(Constraints, Domain, Range, Ctx, Predicates);
     expr_vector Output(Ctx);
     CC.compileConstraints(EQUAL, Output);
@@ -2860,6 +2861,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   std::vector<std::pair<Kernel *, std::vector<Format *>>> PossibleKernels;
   std::vector<Format *> Formats;
+  Timer DomainInference("domainInference", "total domain inference time");
+  Timer EqualityCheck("equalityCheck", "total equality checking time");
+  Timer Translation("translation", "total translation time");
+  DomainInference.startTimer();
   for (auto *K : Kernels) {
     Formats.clear();
     for (auto &E : K->Formats) {
@@ -2881,12 +2886,14 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
       PossibleKernels.push_back({K, Formats});
     }
   }
+  DomainInference.stopTimer();
 
   if (PossibleKernels.empty()) {
     LLVM_DEBUG(dbgs() << "[REV] No viable format mappings found\n");
     return PreservedAnalyses::all();
   }
 
+  EqualityCheck.startTimer();
   // Now test every possible kernel
   std::vector<std::pair<Kernel *, std::vector<Format *>>> PossibleResult;
   for (auto &E : PossibleKernels) {
@@ -2897,12 +2904,14 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     if (K->checkEquality(LiveOut, F, DT, Ctx, Slv, Scope, InputKernel))
       PossibleResult.push_back(E);
   }
+  EqualityCheck.stopTimer();
 
   if (PossibleResult.size() != 1) {
     LLVM_DEBUG(dbgs() << "[REV] Kernel is not GEMV.\n");
     return PreservedAnalyses::all();
   }
 
+  Translation.startTimer();
   Kernel *InputProgram = PossibleResult[0].first;
   std::vector<Format *> &FormatList = PossibleResult[0].second;
   LLVM_DEBUG({
@@ -2947,6 +2956,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
   Builder.CreateCondBr(CmpResult, NewExit, OldEntry);
 
   LLVM_DEBUG(dbgs() << *F.getParent());
+  Translation.stopTimer();
+  outs() << "Domain Inference: " << DomainInference.getTotalTime().getWallTime() << "\n";
+  outs() << "Equality Check: " << EqualityCheck.getTotalTime().getWallTime() << "\n";
+  outs() << "Translation: " << Translation.getTotalTime().getWallTime() << "\n";
   // TODO only abandon the analyses we changed
   return PreservedAnalyses::none();
 }

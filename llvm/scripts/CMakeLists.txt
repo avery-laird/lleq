@@ -2,7 +2,7 @@ set(LD_LIBRARY_PATH "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/usr/local/lib")
 
 set(OPT "${PROJECT_BINARY_DIR}/bin/opt")
 set(EXTRACT "${PROJECT_BINARY_DIR}/bin/llvm-extract")
-set(LLFLAGS -S -emit-llvm -O0 -Xclang -disable-O0-optnone)
+set(LLFLAGS -S -emit-llvm -O0 -Xclang -disable-O0-optnone -fno-discard-value-names)
 set(OPTFLAGS -S -mem2reg -loop-rotate -instcombine -simplifycfg -loop-simplify -lcssa -dot-cfg -dot-dom)
 
 function(add_function_target filename funcname COMPILER)
