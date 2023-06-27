@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Object/RelocationResolver.h"
-#include "llvm/ADT/Triple.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/BinaryFormat/COFF.h"
 #include "llvm/BinaryFormat/ELF.h"
@@ -24,6 +23,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/TargetParser/Triple.h"
 #include <cassert>
 #include <vector>
 
@@ -252,6 +252,19 @@ static uint64_t resolveSparc64(uint64_t Type, uint64_t Offset, uint64_t S,
   }
 }
 
+/// Returns true if \c Obj is an AMDGPU code object based solely on the value
+/// of e_machine.
+///
+/// AMDGPU code objects with an e_machine of EF_AMDGPU_MACH_NONE do not
+/// identify their arch as either r600 or amdgcn, but we can still handle
+/// their relocations. When we identify an ELF object with an UnknownArch,
+/// we use isAMDGPU to check for this case.
+static bool isAMDGPU(const ObjectFile &Obj) {
+  if (const auto *ELFObj = dyn_cast<ELFObjectFileBase>(&Obj))
+    return ELFObj->getEMachine() == ELF::EM_AMDGPU;
+  return false;
+}
+
 static bool supportsAmdgpu(uint64_t Type) {
   switch (Type) {
   case ELF::R_AMDGPU_ABS32:
@@ -433,11 +446,14 @@ static bool supportsRISCV(uint64_t Type) {
   case ELF::R_RISCV_32_PCREL:
   case ELF::R_RISCV_64:
   case ELF::R_RISCV_SET6:
+  case ELF::R_RISCV_SET8:
   case ELF::R_RISCV_SUB6:
   case ELF::R_RISCV_ADD8:
   case ELF::R_RISCV_SUB8:
+  case ELF::R_RISCV_SET16:
   case ELF::R_RISCV_ADD16:
   case ELF::R_RISCV_SUB16:
+  case ELF::R_RISCV_SET32:
   case ELF::R_RISCV_ADD32:
   case ELF::R_RISCV_SUB32:
   case ELF::R_RISCV_ADD64:
@@ -465,14 +481,20 @@ static uint64_t resolveRISCV(uint64_t Type, uint64_t Offset, uint64_t S,
     return (A & 0xC0) | ((S + RA) & 0x3F);
   case ELF::R_RISCV_SUB6:
     return (A & 0xC0) | (((A & 0x3F) - (S + RA)) & 0x3F);
+  case ELF::R_RISCV_SET8:
+    return (S + RA) & 0xFF;
   case ELF::R_RISCV_ADD8:
     return (A + (S + RA)) & 0xFF;
   case ELF::R_RISCV_SUB8:
     return (A - (S + RA)) & 0xFF;
+  case ELF::R_RISCV_SET16:
+    return (S + RA) & 0xFFFF;
   case ELF::R_RISCV_ADD16:
     return (A + (S + RA)) & 0xFFFF;
   case ELF::R_RISCV_SUB16:
     return (A - (S + RA)) & 0xFFFF;
+  case ELF::R_RISCV_SET32:
+    return (S + RA) & 0xFFFFFFFF;
   case ELF::R_RISCV_ADD32:
     return (A + (S + RA)) & 0xFFFFFFFF;
   case ELF::R_RISCV_SUB32:
@@ -780,6 +802,8 @@ getRelocationResolver(const ObjectFile &Obj) {
       case Triple::riscv64:
         return {supportsRISCV, resolveRISCV};
       default:
+        if (isAMDGPU(Obj))
+          return {supportsAmdgpu, resolveAmdgpu};
         return {nullptr, nullptr};
       }
     }
@@ -812,11 +836,15 @@ getRelocationResolver(const ObjectFile &Obj) {
       return {supportsSparc32, resolveSparc32};
     case Triple::hexagon:
       return {supportsHexagon, resolveHexagon};
+    case Triple::r600:
+      return {supportsAmdgpu, resolveAmdgpu};
     case Triple::riscv32:
       return {supportsRISCV, resolveRISCV};
     case Triple::csky:
       return {supportsCSKY, resolveCSKY};
     default:
+      if (isAMDGPU(Obj))
+        return {supportsAmdgpu, resolveAmdgpu};
       return {nullptr, nullptr};
     }
   } else if (Obj.isMachO()) {

@@ -15,7 +15,6 @@
 
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/BinaryFormat/COFF.h"
-#include "llvm/MC/SubtargetFeature.h"
 #include "llvm/Object/Binary.h"
 #include "llvm/Object/CVDebugRecord.h"
 #include "llvm/Object/Error.h"
@@ -24,6 +23,7 @@
 #include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/TargetParser/SubtargetFeature.h"
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -379,8 +379,8 @@ public:
   }
 
   bool isCommon() const {
-    return isExternal() && getSectionNumber() == COFF::IMAGE_SYM_UNDEFINED &&
-           getValue() != 0;
+    return (isExternal() || isSection()) &&
+           getSectionNumber() == COFF::IMAGE_SYM_UNDEFINED && getValue() != 0;
   }
 
   bool isUndefined() const {
@@ -914,6 +914,10 @@ public:
 
   uint32_t getStringTableSize() const { return StringTableSize; }
 
+  const export_directory_table_entry *getExportTable() const {
+    return ExportDirectory;
+  }
+
   const coff_load_configuration32 *getLoadConfig32() const {
     assert(!is64());
     return reinterpret_cast<const coff_load_configuration32 *>(LoadConfig);
@@ -965,6 +969,8 @@ public:
   section_iterator section_begin() const override;
   section_iterator section_end() const override;
 
+  bool is64Bit() const override { return false; }
+
   const coff_section *getCOFFSection(const SectionRef &Section) const;
   COFFSymbolRef getCOFFSymbol(const DataRefImpl &Ref) const;
   COFFSymbolRef getCOFFSymbol(const SymbolRef &Symbol) const;
@@ -976,7 +982,9 @@ public:
   StringRef getFileFormatName() const override;
   Triple::ArchType getArch() const override;
   Expected<uint64_t> getStartAddress() const override;
-  SubtargetFeatures getFeatures() const override { return SubtargetFeatures(); }
+  Expected<SubtargetFeatures> getFeatures() const override {
+    return SubtargetFeatures();
+  }
 
   import_directory_iterator import_directory_begin() const;
   import_directory_iterator import_directory_end() const;
@@ -1251,7 +1259,7 @@ private:
   BinaryByteStream BBS;
 
   SectionRef Section;
-  const COFFObjectFile *Obj;
+  const COFFObjectFile *Obj = nullptr;
 
   std::vector<const coff_relocation *> Relocs;
 

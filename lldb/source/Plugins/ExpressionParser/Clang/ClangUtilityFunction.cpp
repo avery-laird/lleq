@@ -99,6 +99,12 @@ bool ClangUtilityFunction::Install(DiagnosticManager &diagnostic_manager,
     return false;
   }
 
+  // Since we might need to call allocate memory and maybe call code to make
+  // the caller, we need to be stopped.
+  if (process->GetState() != lldb::eStateStopped) {
+    diagnostic_manager.PutString(eDiagnosticSeverityError, "process running");
+    return false;
+  }
   //////////////////////////
   // Parse the expression
   //
@@ -169,6 +175,8 @@ bool ClangUtilityFunction::Install(DiagnosticManager &diagnostic_manager,
     return false;
   }
 }
+
+char ClangUtilityFunction::ClangUtilityFunctionHelper::ID;
 
 void ClangUtilityFunction::ClangUtilityFunctionHelper::ResetDeclMap(
     ExecutionContext &exe_ctx, bool keep_result_in_memory) {

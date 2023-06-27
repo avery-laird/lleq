@@ -38,13 +38,13 @@ class LLVM_LIBRARY_VISIBILITY NVPTXDAGToDAGISel : public SelectionDAGISel {
   bool useShortPointers() const;
 
 public:
+  static char ID;
+
+  NVPTXDAGToDAGISel() = delete;
+
   explicit NVPTXDAGToDAGISel(NVPTXTargetMachine &tm,
                              CodeGenOpt::Level   OptLevel);
 
-  // Pass Name
-  StringRef getPassName() const override {
-    return "NVPTX DAG->DAG Pattern Instruction Selection";
-  }
   bool runOnMachineFunction(MachineFunction &MF) override;
   const NVPTXSubtarget *Subtarget = nullptr;
 
@@ -97,7 +97,7 @@ private:
 
   bool ChkMemSDNodeAddressSpace(SDNode *N, unsigned int spN) const;
 
-  static unsigned GetConvertOpcode(MVT DestTy, MVT SrcTy, bool IsSigned);
+  static unsigned GetConvertOpcode(MVT DestTy, MVT SrcTy, LoadSDNode *N);
 };
 } // end namespace llvm
 

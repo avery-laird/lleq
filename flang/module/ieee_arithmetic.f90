@@ -15,6 +15,7 @@ module ieee_arithmetic
   use __Fortran_ieee_exceptions
 
   use __Fortran_builtins, only: &
+    ieee_fma => __builtin_fma, &
     ieee_is_nan => __builtin_ieee_is_nan, &
     ieee_is_negative => __builtin_ieee_is_negative, &
     ieee_is_normal => __builtin_ieee_is_normal, &
@@ -99,14 +100,20 @@ module ieee_arithmetic
   G(1) G(2) G(4) G(8) G(16)
 #define SPECIFICS_L(G) \
   G(1) G(2) G(4) G(8)
+#if __x86_64__
 #define SPECIFICS_R(G) \
   G(2) G(3) G(4) G(8) G(10) G(16)
+#else
+#define SPECIFICS_R(G) \
+  G(2) G(3) G(4) G(8) G(16)
+#endif
 #define SPECIFICS_II(G) \
   G(1,1) G(1,2) G(1,4) G(1,8) G(1,16) \
   G(2,1) G(2,2) G(2,4) G(2,8) G(2,16) \
   G(4,1) G(4,2) G(4,4) G(4,8) G(4,16) \
   G(8,1) G(8,2) G(8,4) G(8,8) G(8,16) \
   G(16,1) G(16,2) G(16,4) G(16,8) G(16,16)
+#if __x86_64__
 #define SPECIFICS_RI(G) \
   G(2,1) G(2,2) G(2,4) G(2,8) G(2,16) \
   G(3,1) G(3,2) G(3,4) G(3,8) G(3,16) \
@@ -114,6 +121,16 @@ module ieee_arithmetic
   G(8,1) G(8,2) G(8,4) G(8,8) G(8,16) \
   G(10,1) G(10,2) G(10,4) G(10,8) G(10,16) \
   G(16,1) G(16,2) G(16,4) G(16,8) G(16,16)
+#else
+#define SPECIFICS_RI(G) \
+  G(2,1) G(2,2) G(2,4) G(2,8) G(2,16) \
+  G(3,1) G(3,2) G(3,4) G(3,8) G(3,16) \
+  G(4,1) G(4,2) G(4,4) G(4,8) G(4,16) \
+  G(8,1) G(8,2) G(8,4) G(8,8) G(8,16) \
+  G(16,1) G(16,2) G(16,4) G(16,8) G(16,16)
+#endif
+
+#if __x86_64__
 #define SPECIFICS_RR(G) \
   G(2,2) G(2,3) G(2,4) G(2,8) G(2,10) G(2,16) \
   G(3,2) G(3,3) G(3,4) G(3,8) G(3,10) G(3,16) \
@@ -121,6 +138,14 @@ module ieee_arithmetic
   G(8,2) G(8,3) G(8,4) G(8,8) G(8,10) G(8,16) \
   G(10,2) G(10,3) G(10,4) G(10,8) G(10,10) G(10,16) \
   G(16,2) G(16,3) G(16,4) G(16,8) G(16,10) G(16,16)
+#else
+#define SPECIFICS_RR(G) \
+  G(2,2) G(2,3) G(2,4) G(2,8) G(2,16) \
+  G(3,2) G(3,3) G(3,4) G(3,8) G(3,16) \
+  G(4,2) G(4,3) G(4,4) G(4,8) G(4,16) \
+  G(8,2) G(8,3) G(8,4) G(8,8) G(8,16) \
+  G(16,2) G(16,3) G(16,4) G(16,8) G(16,16)
+#endif
 
 ! Set PRIVATE accessibility for specifics with 1 or 2 INTEGER, LOGICAL, or REAL
 ! arguments for generic G.
@@ -128,14 +153,20 @@ module ieee_arithmetic
   G##_i1, G##_i2, G##_i4, G##_i8, G##_i16
 #define PRIVATE_L(G) private :: \
   G##_l1, G##_l2, G##_l4, G##_l8
+#if __x86_64__
 #define PRIVATE_R(G) private :: \
   G##_a2, G##_a3, G##_a4, G##_a8, G##_a10, G##_a16
+#else
+#define PRIVATE_R(G) private :: \
+  G##_a2, G##_a3, G##_a4, G##_a8, G##_a16
+#endif
 #define PRIVATE_II(G) private :: \
   G##_i1_i1, G##_i1_i2, G##_i1_i4, G##_i1_i8, G##_i1_i16, \
   G##_i2_i1, G##_i2_i2, G##_i2_i4, G##_i2_i8, G##_i2_i16, \
   G##_i4_i1, G##_i4_i2, G##_i4_i4, G##_i4_i8, G##_i4_i16, \
   G##_i8_i1, G##_i8_i2, G##_i8_i4, G##_i8_i8, G##_i8_i16, \
   G##_i16_i1, G##_i16_i2, G##_i16_i4, G##_i16_i8, G##_i16_i16
+#if __x86_64__
 #define PRIVATE_RI(G) private :: \
   G##_a2_i1, G##_a2_i2, G##_a2_i4, G##_a2_i8, G##_a2_i16, \
   G##_a3_i1, G##_a3_i2, G##_a3_i4, G##_a3_i8, G##_a3_i16, \
@@ -143,6 +174,15 @@ module ieee_arithmetic
   G##_a8_i1, G##_a8_i2, G##_a8_i4, G##_a8_i8, G##_a8_i16, \
   G##_a10_i1, G##_a10_i2, G##_a10_i4, G##_a10_i8, G##_a10_i16, \
   G##_a16_i1, G##_a16_i2, G##_a16_i4, G##_a16_i8, G##_a16_i16
+#else
+#define PRIVATE_RI(G) private :: \
+  G##_a2_i1, G##_a2_i2, G##_a2_i4, G##_a2_i8, G##_a2_i16, \
+  G##_a3_i1, G##_a3_i2, G##_a3_i4, G##_a3_i8, G##_a3_i16, \
+  G##_a4_i1, G##_a4_i2, G##_a4_i4, G##_a4_i8, G##_a4_i16, \
+  G##_a8_i1, G##_a8_i2, G##_a8_i4, G##_a8_i8, G##_a8_i16, \
+  G##_a16_i1, G##_a16_i2, G##_a16_i4, G##_a16_i8, G##_a16_i16
+#endif
+#if __x86_64__
 #define PRIVATE_RR(G) private :: \
   G##_a2_a2, G##_a2_a3, G##_a2_a4, G##_a2_a8, G##_a2_a10, G##_a2_a16, \
   G##_a3_a2, G##_a3_a3, G##_a3_a4, G##_a3_a8, G##_a3_a10, G##_a3_a16, \
@@ -150,6 +190,14 @@ module ieee_arithmetic
   G##_a8_a2, G##_a8_a3, G##_a8_a4, G##_a8_a8, G##_a8_a10, G##_a8_a16, \
   G##_a10_a2, G##_a10_a3, G##_a10_a4, G##_a10_a8, G##_a10_a10, G##_a10_a16, \
   G##_a16_a2, G##_a16_a3, G##_a16_a4, G##_a16_a8, G##_a16_a10, G##_a16_a16
+#else
+#define PRIVATE_RR(G) private :: \
+  G##_a2_a2, G##_a2_a3, G##_a2_a4, G##_a2_a8, G##_a2_a16, \
+  G##_a3_a2, G##_a3_a3, G##_a3_a4, G##_a3_a8, G##_a3_a16, \
+  G##_a4_a2, G##_a4_a3, G##_a4_a4, G##_a4_a8, G##_a4_a16, \
+  G##_a8_a2, G##_a8_a3, G##_a8_a4, G##_a8_a8, G##_a8_a16, \
+  G##_a16_a2, G##_a16_a3, G##_a16_a4, G##_a16_a8, G##_a16_a16
+#endif
 
 #define IEEE_CLASS_R(XKIND) \
   elemental type(ieee_class_type) function ieee_class_a##XKIND(x); \
@@ -172,16 +220,6 @@ module ieee_arithmetic
   end interface ieee_copy_sign
   PRIVATE_RR(IEEE_COPY_SIGN)
 #undef IEEE_COPY_SIGN_RR
-
-#define IEEE_FMA_R(AKIND) \
-  elemental real(AKIND) function ieee_fma_a##AKIND(a, b, c); \
-    real(AKIND), intent(in) :: a, b, c; \
-  end function ieee_fma_a##AKIND;
-  interface ieee_fma
-    SPECIFICS_R(IEEE_FMA_R)
-  end interface ieee_fma
-  PRIVATE_R(IEEE_FMA)
-#undef IEEE_FMA_R
 
 #define IEEE_GET_ROUNDING_MODE_I(RKIND) \
   subroutine ieee_get_rounding_mode_i##RKIND(round_value, radix); \

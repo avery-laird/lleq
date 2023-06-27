@@ -35,7 +35,6 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/SymbolManager.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/FoldingSet.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
@@ -51,6 +50,7 @@
 #include <cstdint>
 #include <functional>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -73,8 +73,7 @@ RegionTy* MemRegionManager::getSubRegion(const Arg1Ty arg1,
   auto *R = cast_or_null<RegionTy>(Regions.FindNodeOrInsertPos(ID, InsertPos));
 
   if (!R) {
-    R = A.Allocate<RegionTy>();
-    new (R) RegionTy(arg1, superRegion);
+    R = new (A) RegionTy(arg1, superRegion);
     Regions.InsertNode(R, InsertPos);
   }
 
@@ -90,8 +89,7 @@ RegionTy* MemRegionManager::getSubRegion(const Arg1Ty arg1, const Arg2Ty arg2,
   auto *R = cast_or_null<RegionTy>(Regions.FindNodeOrInsertPos(ID, InsertPos));
 
   if (!R) {
-    R = A.Allocate<RegionTy>();
-    new (R) RegionTy(arg1, arg2, superRegion);
+    R = new (A) RegionTy(arg1, arg2, superRegion);
     Regions.InsertNode(R, InsertPos);
   }
 
@@ -109,8 +107,7 @@ RegionTy* MemRegionManager::getSubRegion(const Arg1Ty arg1, const Arg2Ty arg2,
   auto *R = cast_or_null<RegionTy>(Regions.FindNodeOrInsertPos(ID, InsertPos));
 
   if (!R) {
-    R = A.Allocate<RegionTy>();
-    new (R) RegionTy(arg1, arg2, arg3, superRegion);
+    R = new (A) RegionTy(arg1, arg2, arg3, superRegion);
     Regions.InsertNode(R, InsertPos);
   }
 
@@ -712,21 +709,17 @@ std::string MemRegion::getDescriptiveName(bool UseQuotes) const {
 }
 
 SourceRange MemRegion::sourceRange() const {
-  const auto *const VR = dyn_cast<VarRegion>(this->getBaseRegion());
-  const auto *const FR = dyn_cast<FieldRegion>(this);
-
   // Check for more specific regions first.
-  // FieldRegion
-  if (FR) {
+  if (auto *FR = dyn_cast<FieldRegion>(this)) {
     return FR->getDecl()->getSourceRange();
   }
-  // VarRegion
-  else if (VR) {
+
+  if (auto *VR = dyn_cast<VarRegion>(this->getBaseRegion())) {
     return VR->getDecl()->getSourceRange();
   }
+
   // Return invalid source range (can be checked by client).
-  else
-    return {};
+  return {};
 }
 
 //===----------------------------------------------------------------------===//
@@ -790,18 +783,30 @@ DefinedOrUnknownSVal MemRegionManager::getStaticSize(const MemRegion *MR,
         return true;
 
       if (const auto *CAT = dyn_cast<ConstantArrayType>(AT)) {
-        const llvm::APInt &Size = CAT->getSize();
-        if (Size.isZero())
-          return true;
-
-        if (getContext().getLangOpts().StrictFlexArrays >= 2)
-          return false;
-
+        using FAMKind = LangOptions::StrictFlexArraysLevelKind;
+        const FAMKind StrictFlexArraysLevel =
+          Ctx.getLangOpts().getStrictFlexArraysLevel();
         const AnalyzerOptions &Opts = SVB.getAnalyzerOptions();
-        // FIXME: this option is probably redundant with -fstrict-flex-arrays=1.
-        if (Opts.ShouldConsiderSingleElementArraysAsFlexibleArrayMembers &&
-            Size.isOne())
+        const llvm::APInt &Size = CAT->getSize();
+
+        if (StrictFlexArraysLevel <= FAMKind::ZeroOrIncomplete && Size.isZero())
           return true;
+
+        // The "-fstrict-flex-arrays" should have precedence over
+        // consider-single-element-arrays-as-flexible-array-members
+        // analyzer-config when checking single element arrays.
+        if (StrictFlexArraysLevel == FAMKind::Default) {
+          // FIXME: After clang-17 released, we should remove this branch.
+          if (Opts.ShouldConsiderSingleElementArraysAsFlexibleArrayMembers &&
+              Size.isOne())
+            return true;
+        } else {
+          // -fstrict-flex-arrays was specified, since it's not the default, so
+          // ignore analyzer-config.
+          if (StrictFlexArraysLevel <= FAMKind::OneZeroOrIncomplete &&
+              Size.isOne())
+            return true;
+        }
       }
       return false;
     };
@@ -826,8 +831,7 @@ DefinedOrUnknownSVal MemRegionManager::getStaticSize(const MemRegion *MR,
 template <typename REG>
 const REG *MemRegionManager::LazyAllocate(REG*& region) {
   if (!region) {
-    region = A.Allocate<REG>();
-    new (region) REG(*this);
+    region = new (A) REG(*this);
   }
 
   return region;
@@ -836,8 +840,7 @@ const REG *MemRegionManager::LazyAllocate(REG*& region) {
 template <typename REG, typename ARG>
 const REG *MemRegionManager::LazyAllocate(REG*& region, ARG a) {
   if (!region) {
-    region = A.Allocate<REG>();
-    new (region) REG(this, a);
+    region = new (A) REG(this, a);
   }
 
   return region;
@@ -851,8 +854,7 @@ MemRegionManager::getStackLocalsRegion(const StackFrameContext *STC) {
   if (R)
     return R;
 
-  R = A.Allocate<StackLocalsSpaceRegion>();
-  new (R) StackLocalsSpaceRegion(*this, STC);
+  R = new (A) StackLocalsSpaceRegion(*this, STC);
   return R;
 }
 
@@ -864,8 +866,7 @@ MemRegionManager::getStackArgumentsRegion(const StackFrameContext *STC) {
   if (R)
     return R;
 
-  R = A.Allocate<StackArgumentsSpaceRegion>();
-  new (R) StackArgumentsSpaceRegion(*this, STC);
+  R = new (A) StackArgumentsSpaceRegion(*this, STC);
   return R;
 }
 
@@ -886,8 +887,7 @@ const GlobalsSpaceRegion
   if (R)
     return R;
 
-  R = A.Allocate<StaticGlobalSpaceRegion>();
-  new (R) StaticGlobalSpaceRegion(*this, CR);
+  R = new (A) StaticGlobalSpaceRegion(*this, CR);
   return R;
 }
 
@@ -1029,7 +1029,7 @@ const VarRegion *MemRegionManager::getVarRegion(const VarDecl *D,
             T = getContext().VoidTy;
           if (!T->getAs<FunctionType>()) {
             FunctionProtoType::ExtProtoInfo Ext;
-            T = getContext().getFunctionType(T, None, Ext);
+            T = getContext().getFunctionType(T, std::nullopt, Ext);
           }
           T = getContext().getBlockPointerType(T);
 
@@ -1133,8 +1133,7 @@ MemRegionManager::getElementRegion(QualType elementType, NonLoc Idx,
   auto *R = cast_or_null<ElementRegion>(data);
 
   if (!R) {
-    R = A.Allocate<ElementRegion>();
-    new (R) ElementRegion(T, Idx, superRegion);
+    R = new (A) ElementRegion(T, Idx, superRegion);
     Regions.InsertNode(R, InsertPos);
   }
 
@@ -1271,7 +1270,7 @@ const MemSpaceRegion *MemRegion::getMemorySpace() const {
     SR = dyn_cast<SubRegion>(R);
   }
 
-  return dyn_cast<MemSpaceRegion>(R);
+  return cast<MemSpaceRegion>(R);
 }
 
 bool MemRegion::hasStackStorage() const {
@@ -1284,10 +1283,6 @@ bool MemRegion::hasStackNonParametersStorage() const {
 
 bool MemRegion::hasStackParametersStorage() const {
   return isa<StackArgumentsSpaceRegion>(getMemorySpace());
-}
-
-bool MemRegion::hasGlobalsOrParametersStorage() const {
-  return isa<StackArgumentsSpaceRegion, GlobalsSpaceRegion>(getMemorySpace());
 }
 
 // Strips away all elements and fields.
@@ -1485,7 +1480,7 @@ static RegionOffset calculateOffset(const MemRegion *R) {
         // If our base region is symbolic, we don't know what type it really is.
         // Pretend the type of the symbol is the true dynamic type.
         // (This will at least be self-consistent for the life of the symbol.)
-        Ty = SR->getSymbol()->getType()->getPointeeType();
+        Ty = SR->getPointeeStaticType();
         RootIsSymbolic = true;
       }
 
@@ -1542,7 +1537,7 @@ static RegionOffset calculateOffset(const MemRegion *R) {
       }
 
       SVal Index = ER->getIndex();
-      if (Optional<nonloc::ConcreteInt> CI =
+      if (std::optional<nonloc::ConcreteInt> CI =
               Index.getAs<nonloc::ConcreteInt>()) {
         // Don't bother calculating precise offsets if we already have a
         // symbolic offset somewhere in the chain.
@@ -1652,10 +1647,8 @@ void BlockDataRegion::LazyInitializeReferencedVars() {
 
   using VarVec = BumpVector<const MemRegion *>;
 
-  auto *BV = A.Allocate<VarVec>();
-  new (BV) VarVec(BC, NumBlockVars);
-  auto *BVOriginal = A.Allocate<VarVec>();
-  new (BVOriginal) VarVec(BC, NumBlockVars);
+  auto *BV = new (A) VarVec(BC, NumBlockVars);
+  auto *BVOriginal = new (A) VarVec(BC, NumBlockVars);
 
   for (const auto *VD : ReferencedBlockVars) {
     const VarRegion *VR = nullptr;

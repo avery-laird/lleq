@@ -357,11 +357,11 @@ private:
     }
 
     ArrayRef<CXXBaseSpecifier> bases() const {
-      return llvm::makeArrayRef(getBases(), NumBases);
+      return llvm::ArrayRef(getBases(), NumBases);
     }
 
     ArrayRef<CXXBaseSpecifier> vbases() const {
-      return llvm::makeArrayRef(getVBases(), NumVBases);
+      return llvm::ArrayRef(getVBases(), NumVBases);
     }
 
   private:
@@ -395,7 +395,7 @@ private:
     unsigned NumCaptures : 15;
 
     /// The number of explicit captures in this lambda.
-    unsigned NumExplicitCaptures : 13;
+    unsigned NumExplicitCaptures : 12;
 
     /// Has known `internal` linkage.
     unsigned HasKnownInternalLinkage : 1;
@@ -404,15 +404,21 @@ private:
     /// mangling in the Itanium C++ ABI.
     unsigned ManglingNumber : 31;
 
+    /// The index of this lambda within its context declaration. This is not in
+    /// general the same as the mangling number.
+    unsigned IndexInContext;
+
     /// The declaration that provides context for this lambda, if the
     /// actual DeclContext does not suffice. This is used for lambdas that
     /// occur within default arguments of function parameters within the class
     /// or within a data member initializer.
     LazyDeclPtr ContextDecl;
 
-    /// The list of captures, both explicit and implicit, for this
-    /// lambda.
-    Capture *Captures = nullptr;
+    /// The lists of captures, both explicit and implicit, for this
+    /// lambda. One list is provided for each merged copy of the lambda.
+    /// The first list corresponds to the canonical definition.
+    /// The destructor is registered by AddCaptureList when necessary.
+    llvm::TinyPtrVector<Capture*> Captures;
 
     /// The type of the call method.
     TypeSourceInfo *MethodTyInfo;
@@ -422,7 +428,7 @@ private:
         : DefinitionData(D), DependencyKind(DK), IsGenericLambda(IsGeneric),
           CaptureDefault(CaptureDefault), NumCaptures(0),
           NumExplicitCaptures(0), HasKnownInternalLinkage(0), ManglingNumber(0),
-          MethodTyInfo(Info) {
+          IndexInContext(0), MethodTyInfo(Info) {
       IsLambda = true;
 
       // C++1z [expr.prim.lambda]p4:
@@ -430,6 +436,9 @@ private:
       Aggregate = false;
       PlainOldData = false;
     }
+
+    // Add a list of captures.
+    void AddCaptureList(ASTContext &Ctx, Capture *CaptureList);
   };
 
   struct DefinitionData *dataPtr() const {
@@ -1058,6 +1067,11 @@ public:
   ///
   /// \note No entries will be added for init-captures, as they do not capture
   /// variables.
+  ///
+  /// \note If multiple versions of the lambda are merged together, they may
+  /// have different variable declarations corresponding to the same capture.
+  /// In that case, all of those variable declarations will be added to the
+  /// Captures list, so it may have more than one variable listed per field.
   void
   getCaptureFields(llvm::DenseMap<const ValueDecl *, FieldDecl *> &Captures,
                    FieldDecl *&ThisCapture) const;
@@ -1070,7 +1084,9 @@ public:
   }
 
   capture_const_iterator captures_begin() const {
-    return isLambda() ? getLambdaData().Captures : nullptr;
+    if (!isLambda()) return nullptr;
+    LambdaDefinitionData &LambdaData = getLambdaData();
+    return LambdaData.Captures.empty() ? nullptr : LambdaData.Captures.front();
   }
 
   capture_const_iterator captures_end() const {
@@ -1079,6 +1095,11 @@ public:
   }
 
   unsigned capture_size() const { return getLambdaData().NumCaptures; }
+
+  const LambdaCapture *getCapture(unsigned I) const {
+    assert(isLambda() && I < capture_size() && "invalid index for capture");
+    return captures_begin() + I;
+  }
 
   using conversion_iterator = UnresolvedSetIterator;
 
@@ -1148,6 +1169,10 @@ public:
   ///
   /// \note This does NOT include a check for union-ness.
   bool isEmpty() const { return data().Empty; }
+  /// Marks this record as empty. This is used by DWARFASTParserClang
+  /// when parsing records with empty fields having [[no_unique_address]]
+  /// attribute
+  void markEmpty() { data().Empty = true; }
 
   void setInitMethod(bool Val) { data().HasInitMethod = Val; }
   bool hasInitMethod() const { return data().HasInitMethod; }
@@ -1172,7 +1197,7 @@ public:
 
   /// Determine whether this class has a pure virtual function.
   ///
-  /// The class is is abstract per (C++ [class.abstract]p2) if it declares
+  /// The class is abstract per (C++ [class.abstract]p2) if it declares
   /// a pure virtual function or inherits a pure virtual function that is
   /// not overridden.
   bool isAbstract() const { return data().Abstract; }
@@ -1425,7 +1450,7 @@ public:
   }
 
   /// Notify the class that this destructor is now selected.
-  /// 
+  ///
   /// Important properties of the class depend on destructor properties. Since
   /// C++20, it is possible to have multiple destructor declarations in a class
   /// out of which one will be selected at the end.
@@ -1751,18 +1776,31 @@ public:
   /// the declaration context suffices.
   Decl *getLambdaContextDecl() const;
 
-  /// Set the mangling number and context declaration for a lambda
-  /// class.
-  void setLambdaMangling(unsigned ManglingNumber, Decl *ContextDecl,
-                         bool HasKnownInternalLinkage = false) {
+  /// Retrieve the index of this lambda within the context declaration returned
+  /// by getLambdaContextDecl().
+  unsigned getLambdaIndexInContext() const {
     assert(isLambda() && "Not a lambda closure type!");
-    getLambdaData().ManglingNumber = ManglingNumber;
-    getLambdaData().ContextDecl = ContextDecl;
-    getLambdaData().HasKnownInternalLinkage = HasKnownInternalLinkage;
+    return getLambdaData().IndexInContext;
   }
 
-  /// Set the device side mangling number.
-  void setDeviceLambdaManglingNumber(unsigned Num) const;
+  /// Information about how a lambda is numbered within its context.
+  struct LambdaNumbering {
+    Decl *ContextDecl = nullptr;
+    unsigned IndexInContext = 0;
+    unsigned ManglingNumber = 0;
+    unsigned DeviceManglingNumber = 0;
+    bool HasKnownInternalLinkage = false;
+  };
+
+  /// Set the mangling numbers and context declaration for a lambda class.
+  void setLambdaNumbering(LambdaNumbering Numbering);
+
+  // Get the mangling numbers and context declaration for a lambda class.
+  LambdaNumbering getLambdaNumbering() const {
+    return {getLambdaContextDecl(), getLambdaIndexInContext(),
+            getLambdaManglingNumber(), getDeviceLambdaManglingNumber(),
+            hasKnownLambdaInternalLinkage()};
+  }
 
   /// Retrieve the device side mangling number.
   unsigned getDeviceLambdaManglingNumber() const;
@@ -1812,6 +1850,20 @@ public:
 
   TypeSourceInfo *getLambdaTypeInfo() const {
     return getLambdaData().MethodTyInfo;
+  }
+
+  void setLambdaTypeInfo(TypeSourceInfo *TS) {
+    assert(DefinitionData && DefinitionData->IsLambda &&
+           "setting lambda property of non-lambda class");
+    auto &DL = static_cast<LambdaDefinitionData &>(*DefinitionData);
+    DL.MethodTyInfo = TS;
+  }
+
+  void setLambdaIsGeneric(bool IsGeneric) {
+    assert(DefinitionData && DefinitionData->IsLambda &&
+           "setting lambda property of non-lambda class");
+    auto &DL = static_cast<LambdaDefinitionData &>(*DefinitionData);
+    DL.IsGenericLambda = IsGeneric;
   }
 
   // Determine whether this type is an Interface Like type for
@@ -3614,17 +3666,15 @@ public:
 class UsingEnumDecl : public BaseUsingDecl, public Mergeable<UsingEnumDecl> {
   /// The source location of the 'using' keyword itself.
   SourceLocation UsingLocation;
-
-  /// Location of the 'enum' keyword.
+  /// The source location of the 'enum' keyword.
   SourceLocation EnumLocation;
-
-  /// The enum
-  EnumDecl *Enum;
+  /// 'qual::SomeEnum' as an EnumType, possibly with Elaborated/Typedef sugar.
+  TypeSourceInfo *EnumType;
 
   UsingEnumDecl(DeclContext *DC, DeclarationName DN, SourceLocation UL,
-                SourceLocation EL, SourceLocation NL, EnumDecl *ED)
-      : BaseUsingDecl(UsingEnum, DC, NL, DN), UsingLocation(UL),
-        EnumLocation(EL), Enum(ED) {}
+                SourceLocation EL, SourceLocation NL, TypeSourceInfo *EnumType)
+      : BaseUsingDecl(UsingEnum, DC, NL, DN), UsingLocation(UL), EnumLocation(EL),
+        EnumType(EnumType){}
 
   void anchor() override;
 
@@ -3639,13 +3689,29 @@ public:
   /// The source location of the 'enum' keyword.
   SourceLocation getEnumLoc() const { return EnumLocation; }
   void setEnumLoc(SourceLocation L) { EnumLocation = L; }
+  NestedNameSpecifier *getQualifier() const {
+    return getQualifierLoc().getNestedNameSpecifier();
+  }
+  NestedNameSpecifierLoc getQualifierLoc() const {
+    if (auto ETL = EnumType->getTypeLoc().getAs<ElaboratedTypeLoc>())
+      return ETL.getQualifierLoc();
+    return NestedNameSpecifierLoc();
+  }
+  // Returns the "qualifier::Name" part as a TypeLoc.
+  TypeLoc getEnumTypeLoc() const {
+    return EnumType->getTypeLoc();
+  }
+  TypeSourceInfo *getEnumType() const {
+    return EnumType;
+  }
+  void setEnumType(TypeSourceInfo *TSI) { EnumType = TSI; }
 
 public:
-  EnumDecl *getEnumDecl() const { return Enum; }
+  EnumDecl *getEnumDecl() const { return cast<EnumDecl>(EnumType->getType()->getAsTagDecl()); }
 
   static UsingEnumDecl *Create(ASTContext &C, DeclContext *DC,
                                SourceLocation UsingL, SourceLocation EnumL,
-                               SourceLocation NameL, EnumDecl *ED);
+                               SourceLocation NameL, TypeSourceInfo *EnumType);
 
   static UsingEnumDecl *CreateDeserialized(ASTContext &C, unsigned ID);
 
@@ -3713,7 +3779,7 @@ public:
   /// Get the set of using declarations that this pack expanded into. Note that
   /// some of these may still be unresolved.
   ArrayRef<NamedDecl *> expansions() const {
-    return llvm::makeArrayRef(getTrailingObjects<NamedDecl *>(), NumExpansions);
+    return llvm::ArrayRef(getTrailingObjects<NamedDecl *>(), NumExpansions);
   }
 
   static UsingPackDecl *Create(ASTContext &C, DeclContext *DC,
@@ -4083,10 +4149,10 @@ public:
                                                unsigned NumBindings);
 
   ArrayRef<BindingDecl *> bindings() const {
-    return llvm::makeArrayRef(getTrailingObjects<BindingDecl *>(), NumBindings);
+    return llvm::ArrayRef(getTrailingObjects<BindingDecl *>(), NumBindings);
   }
 
-  void printName(raw_ostream &os) const override;
+  void printName(raw_ostream &OS, const PrintingPolicy &Policy) const override;
 
   static bool classof(const Decl *D) { return classofKind(D->getKind()); }
   static bool classofKind(Kind K) { return K == Decomposition; }
@@ -4199,7 +4265,8 @@ private:
 
 public:
   /// Print this UUID in a human-readable format.
-  void printName(llvm::raw_ostream &OS) const override;
+  void printName(llvm::raw_ostream &OS,
+                 const PrintingPolicy &Policy) const override;
 
   /// Get the decomposed parts of this declaration.
   Parts getParts() const { return PartVal; }
@@ -4252,7 +4319,8 @@ class UnnamedGlobalConstantDecl : public ValueDecl,
 
 public:
   /// Print this in a human-readable format.
-  void printName(llvm::raw_ostream &OS) const override;
+  void printName(llvm::raw_ostream &OS,
+                 const PrintingPolicy &Policy) const override;
 
   const APValue &getValue() const { return Value; }
 

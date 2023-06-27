@@ -15,9 +15,13 @@
 #define LLVM_CLANG_ANALYSIS_FLOWSENSITIVE_SOLVER_H
 
 #include "clang/Analysis/FlowSensitive/Value.h"
+#include "clang/Basic/LLVM.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/Optional.h"
+#include "llvm/Support/Compiler.h"
+#include <optional>
+#include <vector>
 
 namespace clang {
 namespace dataflow {
@@ -64,7 +68,7 @@ public:
 
     /// Returns a truth assignment to boolean values that satisfies the queried
     /// boolean formula if available. Otherwise, an empty optional is returned.
-    llvm::Optional<llvm::DenseMap<AtomicBoolValue *, Assignment>>
+    std::optional<llvm::DenseMap<AtomicBoolValue *, Assignment>>
     getSolution() const {
       return Solution;
     }
@@ -72,11 +76,11 @@ public:
   private:
     Result(
         enum Status SATCheckStatus,
-        llvm::Optional<llvm::DenseMap<AtomicBoolValue *, Assignment>> Solution)
+        std::optional<llvm::DenseMap<AtomicBoolValue *, Assignment>> Solution)
         : SATCheckStatus(SATCheckStatus), Solution(std::move(Solution)) {}
 
     Status SATCheckStatus;
-    llvm::Optional<llvm::DenseMap<AtomicBoolValue *, Assignment>> Solution;
+    std::optional<llvm::DenseMap<AtomicBoolValue *, Assignment>> Solution;
   };
 
   virtual ~Solver() = default;
@@ -87,7 +91,12 @@ public:
   /// Requirements:
   ///
   ///  All elements in `Vals` must not be null.
-  virtual Result solve(llvm::DenseSet<BoolValue *> Vals) = 0;
+  virtual Result solve(llvm::ArrayRef<BoolValue *> Vals) = 0;
+
+  LLVM_DEPRECATED("Pass ArrayRef for determinism", "")
+  virtual Result solve(llvm::DenseSet<BoolValue *> Vals) {
+    return solve(ArrayRef(std::vector<BoolValue *>(Vals.begin(), Vals.end())));
+  }
 };
 
 } // namespace dataflow

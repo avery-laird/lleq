@@ -23,7 +23,7 @@ public:
     MoveOnly(const MoveOnly&) = delete;
     MoveOnly& operator=(const MoveOnly&) = delete;
 
-    TEST_CONSTEXPR_CXX14 MoveOnly(MoveOnly&& x)
+    TEST_CONSTEXPR_CXX14 MoveOnly(MoveOnly&& x) TEST_NOEXCEPT
         : data_(x.data_) {x.data_ = 0;}
     TEST_CONSTEXPR_CXX14 MoveOnly& operator=(MoveOnly&& x)
         {data_ = x.data_; x.data_ = 0; return *this;}
@@ -61,8 +61,8 @@ template <>
 struct std::hash<MoveOnly>
 {
     typedef MoveOnly argument_type;
-    typedef size_t result_type;
-    TEST_CONSTEXPR size_t operator()(const MoveOnly& x) const {return static_cast<size_t>(x.get());}
+    typedef std::size_t result_type;
+    TEST_CONSTEXPR std::size_t operator()(const MoveOnly& x) const {return static_cast<size_t>(x.get());}
 };
 
 #endif // MOVEONLY_H

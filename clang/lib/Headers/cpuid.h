@@ -200,9 +200,18 @@
 #define bit_AMXINT8       0x02000000
 
 /* Features in %eax for leaf 7 sub-leaf 1 */
+#define bit_RAOINT        0x00000008
 #define bit_AVXVNNI       0x00000010
 #define bit_AVX512BF16    0x00000020
+#define bit_CMPCCXADD     0x00000080
+#define bit_AMXFP16       0x00200000
 #define bit_HRESET        0x00400000
+#define bit_AVXIFMA       0x00800000
+
+/* Features in %edx for leaf 7 sub-leaf 1 */
+#define bit_AVXVNNIINT8   0x00000010
+#define bit_AVXNECONVERT  0x00000020
+#define bit_PREFETCHI     0x00004000
 
 /* Features in %eax for leaf 13 sub-leaf 1 */
 #define bit_XSAVEOPT    0x00000001
@@ -261,7 +270,8 @@
         : "0"(__leaf), "2"(__count))
 #endif
 
-static __inline int __get_cpuid_max (unsigned int __leaf, unsigned int *__sig)
+static __inline unsigned int __get_cpuid_max (unsigned int __leaf,
+                                              unsigned int *__sig)
 {
     unsigned int __eax, __ebx, __ecx, __edx;
 #if __i386__
@@ -317,5 +327,15 @@ static __inline int __get_cpuid_count (unsigned int __leaf,
     __cpuid_count(__leaf, __subleaf, *__eax, *__ebx, *__ecx, *__edx);
     return 1;
 }
+
+// If MS extensions are enabled, __cpuidex is defined as a builtin which will
+// conflict with the __cpuidex definition below.
+#ifndef _MSC_EXTENSIONS
+static __inline void __cpuidex (int __cpu_info[4], int __leaf, int __subleaf)
+{
+  __cpuid_count(__leaf, __subleaf, __cpu_info[0], __cpu_info[1], __cpu_info[2],
+                __cpu_info[3]);
+}
+#endif
 
 #endif /* __CPUID_H */

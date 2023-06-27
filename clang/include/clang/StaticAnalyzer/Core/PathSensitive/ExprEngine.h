@@ -36,6 +36,7 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/WorkList.h"
 #include "llvm/ADT/ArrayRef.h"
 #include <cassert>
+#include <optional>
 #include <utility>
 
 namespace clang {
@@ -233,10 +234,10 @@ public:
     return (*G.roots_begin())->getLocation().getLocationContext();
   }
 
-  void GenerateAutoTransition(ExplodedNode *N);
-  void enqueueEndOfPath(ExplodedNodeSet &S);
-  void GenerateCallExitNode(ExplodedNode *N);
-
+  CFGBlock::ConstCFGElementRef getCFGElementRef() const {
+    const CFGBlock *blockPtr = currBldrCtx ? currBldrCtx->getBlock() : nullptr;
+    return {blockPtr, currStmtIdx};
+  }
 
   /// Dump graph to the specified filename.
   /// If filename is empty, generate a temporary one.
@@ -360,13 +361,13 @@ public:
   void processSwitch(SwitchNodeBuilder& builder);
 
   /// Called by CoreEngine.  Used to notify checkers that processing a
-  /// function has begun. Called for both inlined and and top-level functions.
+  /// function has begun. Called for both inlined and top-level functions.
   void processBeginOfFunction(NodeBuilderContext &BC,
                               ExplodedNode *Pred, ExplodedNodeSet &Dst,
                               const BlockEdge &L);
 
   /// Called by CoreEngine.  Used to notify checkers that processing a
-  /// function has ended. Called for both inlined and and top-level functions.
+  /// function has ended. Called for both inlined and top-level functions.
   void processEndOfFunction(NodeBuilderContext& BC,
                             ExplodedNode *Pred,
                             const ReturnStmt *RS = nullptr);
@@ -601,12 +602,6 @@ public:
                                       StmtNodeBuilder &Bldr,
                                       ExplodedNode *Pred);
 
-  ProgramStateRef handleLVectorSplat(ProgramStateRef state,
-                                     const LocationContext *LCtx,
-                                     const CastExpr *CastE,
-                                     StmtNodeBuilder &Bldr,
-                                     ExplodedNode *Pred);
-
   void handleUOExtension(ExplodedNodeSet::iterator I,
                          const UnaryOperator* U,
                          StmtNodeBuilder &Bldr);
@@ -618,24 +613,24 @@ public:
   }
 
   /// Retreives which element is being constructed in a non-POD type array.
-  static Optional<unsigned>
+  static std::optional<unsigned>
   getIndexOfElementToConstruct(ProgramStateRef State, const CXXConstructExpr *E,
                                const LocationContext *LCtx);
 
   /// Retreives which element is being destructed in a non-POD type array.
-  static Optional<unsigned>
+  static std::optional<unsigned>
   getPendingArrayDestruction(ProgramStateRef State,
                              const LocationContext *LCtx);
 
   /// Retreives the size of the array in the pending ArrayInitLoopExpr.
-  static Optional<unsigned> getPendingInitLoop(ProgramStateRef State,
-                                               const CXXConstructExpr *E,
-                                               const LocationContext *LCtx);
+  static std::optional<unsigned>
+  getPendingInitLoop(ProgramStateRef State, const CXXConstructExpr *E,
+                     const LocationContext *LCtx);
 
   /// By looking at a certain item that may be potentially part of an object's
   /// ConstructionContext, retrieve such object's location. A particular
   /// statement can be transparently passed as \p Item in most cases.
-  static Optional<SVal>
+  static std::optional<SVal>
   getObjectUnderConstruction(ProgramStateRef State,
                              const ConstructionContextItem &Item,
                              const LocationContext *LC);
@@ -732,6 +727,7 @@ public:
   /// A multi-dimensional array is also a continuous memory location in a
   /// row major order, so for arr[0][0] Idx is 0 and for arr[2][2] Idx is 8.
   SVal computeObjectUnderConstruction(const Expr *E, ProgramStateRef State,
+                                      const NodeBuilderContext *BldrCtx,
                                       const LocationContext *LCtx,
                                       const ConstructionContext *CC,
                                       EvalCallOptions &CallOpts,
@@ -748,13 +744,13 @@ public:
 
   /// A convenient wrapper around computeObjectUnderConstruction
   /// and updateObjectsUnderConstruction.
-  std::pair<ProgramStateRef, SVal>
-  handleConstructionContext(const Expr *E, ProgramStateRef State,
-                            const LocationContext *LCtx,
-                            const ConstructionContext *CC,
-                            EvalCallOptions &CallOpts, unsigned Idx = 0) {
+  std::pair<ProgramStateRef, SVal> handleConstructionContext(
+      const Expr *E, ProgramStateRef State, const NodeBuilderContext *BldrCtx,
+      const LocationContext *LCtx, const ConstructionContext *CC,
+      EvalCallOptions &CallOpts, unsigned Idx = 0) {
 
-    SVal V = computeObjectUnderConstruction(E, State, LCtx, CC, CallOpts, Idx);
+    SVal V = computeObjectUnderConstruction(E, State, BldrCtx, LCtx, CC,
+                                            CallOpts, Idx);
     State = updateObjectsUnderConstruction(V, E, State, LCtx, CC, CallOpts);
 
     return std::make_pair(State, V);
@@ -765,15 +761,6 @@ private:
                                              const CallEvent &Call);
   void finishArgumentConstruction(ExplodedNodeSet &Dst, ExplodedNode *Pred,
                                   const CallEvent &Call);
-
-  void evalLoadCommon(ExplodedNodeSet &Dst,
-                      const Expr *NodeEx,  /* Eventually will be a CFGStmt */
-                      const Expr *BoundEx,
-                      ExplodedNode *Pred,
-                      ProgramStateRef St,
-                      SVal location,
-                      const ProgramPointTag *tag,
-                      QualType LoadTy);
 
   void evalLocation(ExplodedNodeSet &Dst,
                     const Stmt *NodeEx, /* This will eventually be a CFGStmt */
@@ -909,13 +896,6 @@ private:
   static SVal makeElementRegion(ProgramStateRef State, SVal LValue,
                                 QualType &Ty, bool &IsArray, unsigned Idx = 0);
 
-  /// For a DeclStmt or CXXInitCtorInitializer, walk backward in the current CFG
-  /// block to find the constructor expression that directly constructed into
-  /// the storage for this statement. Returns null if the constructor for this
-  /// statement created a temporary object region rather than directly
-  /// constructing into an existing region.
-  const CXXConstructExpr *findDirectConstructorForCurrentCFGElement();
-
   /// Common code that handles either a CXXConstructExpr or a
   /// CXXInheritedCtorInitExpr.
   void handleConstructor(const Expr *E, ExplodedNode *Pred,
@@ -969,6 +949,11 @@ private:
   static ProgramStateRef removePendingInitLoop(ProgramStateRef State,
                                                const CXXConstructExpr *E,
                                                const LocationContext *LCtx);
+
+  static ProgramStateRef
+  removeStateTraitsUsedForArrayEvaluation(ProgramStateRef State,
+                                          const CXXConstructExpr *E,
+                                          const LocationContext *LCtx);
 
   /// Store the location of a C++ object corresponding to a statement
   /// until the statement is actually encountered. For example, if a DeclStmt

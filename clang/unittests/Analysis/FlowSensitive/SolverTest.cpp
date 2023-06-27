@@ -10,7 +10,6 @@
 
 #include "TestingSupport.h"
 #include "clang/Analysis/FlowSensitive/Solver.h"
-#include "TestingSupport.h"
 #include "clang/Analysis/FlowSensitive/Value.h"
 #include "clang/Analysis/FlowSensitive/WatchedLiteralsSolver.h"
 #include "gmock/gmock.h"
@@ -24,14 +23,15 @@ using namespace dataflow;
 using test::ConstraintContext;
 using testing::_;
 using testing::AnyOf;
+using testing::IsEmpty;
 using testing::Optional;
 using testing::Pair;
 using testing::UnorderedElementsAre;
 
 // Checks if the conjunction of `Vals` is satisfiable and returns the
 // corresponding result.
-Solver::Result solve(llvm::DenseSet<BoolValue *> Vals) {
-  return WatchedLiteralsSolver().solve(std::move(Vals));
+Solver::Result solve(llvm::ArrayRef<BoolValue *> Vals) {
+  return WatchedLiteralsSolver().solve(Vals);
 }
 
 void expectUnsatisfiable(Solver::Result Result) {
@@ -86,6 +86,32 @@ TEST(SolverTest, DistinctVars) {
       solve({X, NotY}),
       UnorderedElementsAre(Pair(X, Solver::Result::Assignment::AssignedTrue),
                            Pair(Y, Solver::Result::Assignment::AssignedFalse)));
+}
+
+TEST(SolverTest, Top) {
+  ConstraintContext Ctx;
+  auto X = Ctx.top();
+
+  // X. Since Top is anonymous, we do not get any results in the solution.
+  expectSatisfiable(solve({X}), IsEmpty());
+}
+
+TEST(SolverTest, NegatedTop) {
+  ConstraintContext Ctx;
+  auto X = Ctx.top();
+
+  // !X
+  expectSatisfiable(solve({Ctx.neg(X)}), IsEmpty());
+}
+
+TEST(SolverTest, DistinctTops) {
+  ConstraintContext Ctx;
+  auto X = Ctx.top();
+  auto Y = Ctx.top();
+  auto NotY = Ctx.neg(Y);
+
+  // X ^ !Y
+  expectSatisfiable(solve({X, NotY}), IsEmpty());
 }
 
 TEST(SolverTest, DoubleNegation) {
@@ -332,6 +358,24 @@ TEST(SolverTest, ImplicationConflict) {
 
   // X => Y ^ X ^ !Y
   expectUnsatisfiable(solve({XImplY, XAndNotY}));
+}
+
+TEST(SolverTest, LowTimeoutResultsInTimedOut) {
+  WatchedLiteralsSolver solver(10);
+  ConstraintContext Ctx;
+  auto X = Ctx.atom();
+  auto Y = Ctx.atom();
+  auto Z = Ctx.atom();
+  auto W = Ctx.atom();
+
+  // !(X v Y) <=> !X ^ !Y
+  auto A = Ctx.iff(Ctx.neg(Ctx.disj(X, Y)), Ctx.conj(Ctx.neg(X), Ctx.neg(Y)));
+
+  // !(Z ^ W) <=> !Z v !W
+  auto B = Ctx.iff(Ctx.neg(Ctx.conj(Z, W)), Ctx.disj(Ctx.neg(Z), Ctx.neg(W)));
+
+  // A ^ B
+  EXPECT_EQ(solver.solve({A, B}).getStatus(), Solver::Result::Status::TimedOut);
 }
 
 } // namespace

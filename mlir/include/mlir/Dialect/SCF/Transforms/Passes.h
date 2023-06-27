@@ -17,16 +17,7 @@
 
 namespace mlir {
 
-#define GEN_PASS_DECL_SCFBUFFERIZE
-#define GEN_PASS_DECL_SCFFORLOOPCANONICALIZATION
-#define GEN_PASS_DECL_SCFFORLOOPPEELING
-#define GEN_PASS_DECL_SCFFORLOOPSPECIALIZATION
-#define GEN_PASS_DECL_SCFPARALLELLOOPFUSION
-#define GEN_PASS_DECL_SCFPARALLELLOOPCOLLAPSING
-#define GEN_PASS_DECL_SCFPARALLELLOOPSPECIALIZATION
-#define GEN_PASS_DECL_SCFPARALLELLOOPTILING
-#define GEN_PASS_DECL_SCFFORLOOPRANGEFOLDING
-#define GEN_PASS_DECL_SCFFORTOWHILELOOP
+#define GEN_PASS_DECL
 #include "mlir/Dialect/SCF/Transforms/Passes.h.inc"
 
 /// Creates a pass that bufferizes the SCF dialect.
@@ -46,7 +37,7 @@ std::unique_ptr<Pass> createSCFForLoopCanonicalizationPass();
 
 /// Creates a pass that transforms a single ParallelLoop over N induction
 /// variables into another ParallelLoop over less than N induction variables.
-std::unique_ptr<Pass> createParallelLoopCollapsingPass();
+std::unique_ptr<Pass> createTestSCFParallelLoopCollapsingPass();
 
 /// Creates a loop fusion pass which fuses parallel loops.
 std::unique_ptr<Pass> createParallelLoopFusionPass();

@@ -68,6 +68,7 @@ public:
   bool IsNextLinePreprocessorDirective() const;
   TokenSequence TokenizePreprocessorDirective();
   Provenance GetCurrentProvenance() const { return GetProvenance(at_); }
+  const char *IsCompilerDirectiveSentinel(const char *, std::size_t) const;
 
   template <typename... A> Message &Say(A &&...a) {
     return messages_.Say(std::forward<A>(a)...);
@@ -109,6 +110,7 @@ private:
     slashInCurrentStatement_ = false;
     preventHollerith_ = false;
     delimiterNesting_ = 0;
+    continuationLines_ = 0;
   }
 
   Provenance GetProvenance(const char *sourceChar) const {
@@ -181,7 +183,6 @@ private:
       const char *) const;
   std::optional<LineClassification> IsFreeFormCompilerDirectiveLine(
       const char *) const;
-  const char *IsCompilerDirectiveSentinel(const char *) const;
   LineClassification ClassifyLine(const char *) const;
   void SourceFormChange(std::string &&);
 
@@ -195,6 +196,7 @@ private:
   Encoding encoding_{Encoding::UTF_8};
   int delimiterNesting_{0};
   int prescannerNesting_{0};
+  int continuationLines_{0};
 
   Provenance startProvenance_;
   const char *start_{nullptr}; // beginning of current source file content

@@ -18,6 +18,7 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/DialectInterface.h"
+#include "mlir/IR/OpImplementation.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/Twine.h"
 
@@ -73,6 +74,10 @@ public:
 
   /// Read a reference to the given attribute.
   virtual LogicalResult readAttribute(Attribute &result) = 0;
+  /// Read an optional reference to the given attribute. Returns success even if
+  /// the Attribute isn't present.
+  virtual LogicalResult readOptionalAttribute(Attribute &attr) = 0;
+
   template <typename T>
   LogicalResult readAttributes(SmallVectorImpl<T> &attrs) {
     return readList(attrs, [this](T &attr) { return readAttribute(attr); });
@@ -82,7 +87,19 @@ public:
     Attribute baseResult;
     if (failed(readAttribute(baseResult)))
       return failure();
-    if ((result = baseResult.dyn_cast<T>()))
+    if ((result = dyn_cast<T>(baseResult)))
+      return success();
+    return emitError() << "expected " << llvm::getTypeName<T>()
+                       << ", but got: " << baseResult;
+  }
+  template <typename T>
+  LogicalResult readOptionalAttribute(T &result) {
+    Attribute baseResult;
+    if (failed(readOptionalAttribute(baseResult)))
+      return failure();
+    if (!baseResult)
+      return success();
+    if ((result = dyn_cast<T>(baseResult)))
       return success();
     return emitError() << "expected " << llvm::getTypeName<T>()
                        << ", but got: " << baseResult;
@@ -99,10 +116,22 @@ public:
     Type baseResult;
     if (failed(readType(baseResult)))
       return failure();
-    if ((result = baseResult.dyn_cast<T>()))
+    if ((result = dyn_cast<T>(baseResult)))
       return success();
     return emitError() << "expected " << llvm::getTypeName<T>()
                        << ", but got: " << baseResult;
+  }
+
+  /// Read a handle to a dialect resource.
+  template <typename ResourceT>
+  FailureOr<ResourceT> readResourceHandle() {
+    FailureOr<AsmDialectResourceHandle> handle = readResourceHandle();
+    if (failed(handle))
+      return failure();
+    if (auto *result = dyn_cast<ResourceT>(&*handle))
+      return std::move(*result);
+    return emitError() << "provided resource handle differs from the "
+                          "expected resource type";
   }
 
   //===--------------------------------------------------------------------===//
@@ -129,6 +158,16 @@ public:
 
   /// Read a string from the bytecode.
   virtual LogicalResult readString(StringRef &result) = 0;
+
+  /// Read a blob from the bytecode.
+  virtual LogicalResult readBlob(ArrayRef<char> &result) = 0;
+
+  /// Read a bool from the bytecode.
+  virtual LogicalResult readBool(bool &result) = 0;
+
+private:
+  /// Read a handle to a dialect resource.
+  virtual FailureOr<AsmDialectResourceHandle> readResourceHandle() = 0;
 };
 
 //===----------------------------------------------------------------------===//
@@ -159,6 +198,7 @@ public:
 
   /// Write a reference to the given attribute.
   virtual void writeAttribute(Attribute attr) = 0;
+  virtual void writeOptionalAttribute(Attribute attr) = 0;
   template <typename T>
   void writeAttributes(ArrayRef<T> attrs) {
     writeList(attrs, [this](T attr) { writeAttribute(attr); });
@@ -170,6 +210,10 @@ public:
   void writeTypes(ArrayRef<T> types) {
     writeList(types, [this](T type) { writeType(type); });
   }
+
+  /// Write the given handle to a dialect resource.
+  virtual void
+  writeResourceHandle(const AsmDialectResourceHandle &resource) = 0;
 
   //===--------------------------------------------------------------------===//
   // Primitives
@@ -204,6 +248,28 @@ public:
   /// only be called if such a guarantee can be made, such as when the string is
   /// owned by an attribute or type.
   virtual void writeOwnedString(StringRef str) = 0;
+
+  /// Write a blob to the bytecode, which is owned by the caller and is
+  /// guaranteed to not die before the end of the bytecode process. The blob is
+  /// written as-is, with no additional compression or compaction.
+  virtual void writeOwnedBlob(ArrayRef<char> blob) = 0;
+
+  /// Write a bool to the output stream.
+  virtual void writeOwnedBool(bool value) = 0;
+
+  /// Return the bytecode version being emitted for.
+  virtual int64_t getBytecodeVersion() const = 0;
+};
+
+//===--------------------------------------------------------------------===//
+// Dialect Version Interface.
+//===--------------------------------------------------------------------===//
+
+/// This class is used to represent the version of a dialect, for the purpose
+/// of polymorphic destruction.
+class DialectVersion {
+public:
+  virtual ~DialectVersion() = default;
 };
 
 //===----------------------------------------------------------------------===//
@@ -227,11 +293,37 @@ public:
     return Attribute();
   }
 
+  /// Read a versioned attribute encoding belonging to this dialect from the
+  /// given reader. This method should return null in the case of failure, and
+  /// falls back to the non-versioned reader in case the dialect implements
+  /// versioning but it does not support versioned custom encodings for the
+  /// attributes.
+  virtual Attribute readAttribute(DialectBytecodeReader &reader,
+                                  const DialectVersion &version) const {
+    reader.emitError()
+        << "dialect " << getDialect()->getNamespace()
+        << " does not support reading versioned attributes from bytecode";
+    return Attribute();
+  }
+
   /// Read a type belonging to this dialect from the given reader. This method
   /// should return null in the case of failure.
   virtual Type readType(DialectBytecodeReader &reader) const {
     reader.emitError() << "dialect " << getDialect()->getNamespace()
                        << " does not support reading types from bytecode";
+    return Type();
+  }
+
+  /// Read a versioned type encoding belonging to this dialect from the given
+  /// reader. This method should return null in the case of failure, and
+  /// falls back to the non-versioned reader in case the dialect implements
+  /// versioning but it does not support versioned custom encodings for the
+  /// types.
+  virtual Type readType(DialectBytecodeReader &reader,
+                        const DialectVersion &version) const {
+    reader.emitError()
+        << "dialect " << getDialect()->getNamespace()
+        << " does not support reading versioned types from bytecode";
     return Type();
   }
 
@@ -256,7 +348,59 @@ public:
                                   DialectBytecodeWriter &writer) const {
     return failure();
   }
+
+  /// Write the version of this dialect to the given writer.
+  virtual void writeVersion(DialectBytecodeWriter &writer) const {}
+
+  // Read the version of this dialect from the provided reader and return it as
+  // a `unique_ptr` to a dialect version object.
+  virtual std::unique_ptr<DialectVersion>
+  readVersion(DialectBytecodeReader &reader) const {
+    reader.emitError("Dialect does not support versioning");
+    return nullptr;
+  }
+
+  /// Hook invoked after parsing completed, if a version directive was present
+  /// and included an entry for the current dialect. This hook offers the
+  /// opportunity to the dialect to visit the IR and upgrades constructs emitted
+  /// by the version of the dialect corresponding to the provided version.
+  virtual LogicalResult
+  upgradeFromVersion(Operation *topLevelOp,
+                     const DialectVersion &version) const {
+    return success();
+  }
 };
+
+/// Helper for resource handle reading that returns LogicalResult.
+template <typename T, typename... Ts>
+static LogicalResult readResourceHandle(DialectBytecodeReader &reader,
+                                        FailureOr<T> &value, Ts &&...params) {
+  FailureOr<T> handle = reader.readResourceHandle<T>();
+  if (failed(handle))
+    return failure();
+  if (auto *result = dyn_cast<T>(&*handle)) {
+    value = std::move(*result);
+    return success();
+  }
+  return failure();
+}
+
+/// Helper method that injects context only if needed, this helps unify some of
+/// the attribute construction methods.
+template <typename T, typename... Ts>
+auto get(MLIRContext *context, Ts &&...params) {
+  // Prefer a direct `get` method if one exists.
+  if constexpr (llvm::is_detected<detail::has_get_method, T, Ts...>::value) {
+    (void)context;
+    return T::get(std::forward<Ts>(params)...);
+  } else if constexpr (llvm::is_detected<detail::has_get_method, T,
+                                         MLIRContext *, Ts...>::value) {
+    return T::get(context, std::forward<Ts>(params)...);
+  } else {
+    // Otherwise, pass to the base get.
+    return T::Base::get(context, std::forward<Ts>(params)...);
+  }
+}
 
 } // namespace mlir
 

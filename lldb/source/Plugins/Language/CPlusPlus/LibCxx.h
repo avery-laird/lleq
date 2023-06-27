@@ -18,6 +18,15 @@
 namespace lldb_private {
 namespace formatters {
 
+/// Find a child member of \c obj_sp, trying all alternative names in order.
+lldb::ValueObjectSP
+GetChildMemberWithName(ValueObject &obj,
+                       llvm::ArrayRef<ConstString> alternative_names);
+
+lldb::ValueObjectSP GetFirstValueOfLibCXXCompressedPair(ValueObject &pair);
+lldb::ValueObjectSP GetSecondValueOfLibCXXCompressedPair(ValueObject &pair);
+
+
 bool LibcxxStringSummaryProviderASCII(
     ValueObject &valobj, Stream &stream,
     const TypeSummaryOptions &summary_options); // libc++ std::string
@@ -195,6 +204,7 @@ public:
 
 private:
   lldb::ValueObjectSP m_value_ptr_sp;
+  lldb::ValueObjectSP m_deleter_sp;
 };
 
 SyntheticChildrenFrontEnd *
@@ -250,6 +260,10 @@ LibcxxVariantFrontEndCreator(CXXSyntheticChildren *,
 SyntheticChildrenFrontEnd *
 LibcxxStdSpanSyntheticFrontEndCreator(CXXSyntheticChildren *,
                                       lldb::ValueObjectSP);
+
+SyntheticChildrenFrontEnd *
+LibcxxStdRangesRefViewSyntheticFrontEndCreator(CXXSyntheticChildren *,
+                                               lldb::ValueObjectSP);
 
 } // namespace formatters
 } // namespace lldb_private

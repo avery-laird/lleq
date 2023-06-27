@@ -82,9 +82,9 @@ def CC_AArch64_AAPCS : CallingConv<[
             nxv2bf16, nxv4bf16, nxv8bf16, nxv2f32, nxv4f32, nxv2f64],
            CCPassIndirect<i64>>,
 
-  CCIfType<[nxv1i1, nxv2i1, nxv4i1, nxv8i1, nxv16i1],
+  CCIfType<[nxv1i1, nxv2i1, nxv4i1, nxv8i1, nxv16i1, aarch64svcount],
            CCAssignToReg<[P0, P1, P2, P3]>>,
-  CCIfType<[nxv1i1, nxv2i1, nxv4i1, nxv8i1, nxv16i1],
+  CCIfType<[nxv1i1, nxv2i1, nxv4i1, nxv8i1, nxv16i1, aarch64svcount],
            CCPassIndirect<i64>>,
 
   // Handle i1, i8, i16, i32, i64, f32, f64 and v2f64 by passing in registers,
@@ -149,7 +149,7 @@ def RetCC_AArch64_AAPCS : CallingConv<[
             nxv2bf16, nxv4bf16, nxv8bf16, nxv2f32, nxv4f32, nxv2f64],
            CCAssignToReg<[Z0, Z1, Z2, Z3, Z4, Z5, Z6, Z7]>>,
 
-  CCIfType<[nxv1i1, nxv2i1, nxv4i1, nxv8i1, nxv16i1],
+  CCIfType<[nxv1i1, nxv2i1, nxv4i1, nxv8i1, nxv16i1, aarch64svcount],
            CCAssignToReg<[P0, P1, P2, P3]>>
 ]>;
 
@@ -435,6 +435,26 @@ def CSR_AArch64_SVE_AAPCS : CalleeSavedRegs<(add (sequence "Z%u", 8, 23),
                                                  X19, X20, X21, X22, X23, X24,
                                                  X25, X26, X27, X28, LR, FP)>;
 
+// SME ABI support routines such as __arm_tpidr2_save/restore preserve most registers.
+def CSR_AArch64_SME_ABI_Support_Routines_PreserveMost_From_X0
+                          : CalleeSavedRegs<(add (sequence "Z%u", 0, 31),
+                                                 (sequence "P%u", 0, 15),
+                                                 (sequence "X%u", 0, 13),
+                                                 (sequence "X%u",19, 28),
+                                                 LR, FP)>;
+
+// SME ABI support routines __arm_sme_state preserves most registers.
+def CSR_AArch64_SME_ABI_Support_Routines_PreserveMost_From_X2
+                          : CalleeSavedRegs<(add (sequence "Z%u", 0, 31),
+                                                 (sequence "P%u", 0, 15),
+                                                 (sequence "X%u", 2, 15),
+                                                 (sequence "X%u",19, 28),
+                                                 LR, FP)>;
+
+// The SMSTART/SMSTOP instructions preserve only GPR registers.
+def CSR_AArch64_SMStartStop : CalleeSavedRegs<(add (sequence "X%u", 0, 28),
+                                                   LR, FP)>;
+
 def CSR_AArch64_AAPCS_SwiftTail
     : CalleeSavedRegs<(sub CSR_AArch64_AAPCS, X20, X22)>;
 
@@ -468,6 +488,9 @@ def CSR_AArch64_NoRegs : CalleeSavedRegs<(add)>;
 
 def CSR_AArch64_RT_MostRegs :  CalleeSavedRegs<(add CSR_AArch64_AAPCS,
                                                 (sequence "X%u", 9, 15))>;
+
+def CSR_AArch64_RT_AllRegs :  CalleeSavedRegs<(add CSR_AArch64_RT_MostRegs,
+                                                (sequence "Q%u", 8, 31))>;
 
 def CSR_AArch64_StackProbe_Windows
     : CalleeSavedRegs<(add (sequence "X%u", 0, 15),
@@ -531,6 +554,9 @@ def CSR_Darwin_AArch64_CXX_TLS_ViaCopy
 def CSR_Darwin_AArch64_RT_MostRegs
     : CalleeSavedRegs<(add CSR_Darwin_AArch64_AAPCS, (sequence "X%u", 9, 15))>;
 
+def CSR_Darwin_AArch64_RT_AllRegs
+    : CalleeSavedRegs<(add CSR_Darwin_AArch64_RT_MostRegs, (sequence "Q%u", 8, 31))>;
+
 // Variants of the standard calling conventions for shadow call stack.
 // These all preserve x18 in addition to any other registers.
 def CSR_AArch64_NoRegs_SCS
@@ -541,6 +567,8 @@ def CSR_AArch64_AAPCS_SwiftError_SCS
     : CalleeSavedRegs<(add CSR_AArch64_AAPCS_SwiftError, X18)>;
 def CSR_AArch64_RT_MostRegs_SCS
     : CalleeSavedRegs<(add CSR_AArch64_RT_MostRegs, X18)>;
+def CSR_AArch64_RT_AllRegs_SCS
+    : CalleeSavedRegs<(add CSR_AArch64_RT_AllRegs, X18)>;
 def CSR_AArch64_AAVPCS_SCS
     : CalleeSavedRegs<(add CSR_AArch64_AAVPCS, X18)>;
 def CSR_AArch64_SVE_AAPCS_SCS

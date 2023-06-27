@@ -17,6 +17,7 @@
 #include "mlir/Interfaces/InferIntRangeInterface.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "llvm/Support/Debug.h"
+#include <optional>
 
 #define DEBUG_TYPE "int-range-analysis"
 
@@ -25,11 +26,13 @@ using namespace mlir::dataflow;
 
 IntegerValueRange IntegerValueRange::getMaxRange(Value value) {
   unsigned width = ConstantIntRanges::getStorageBitwidth(value.getType());
+  if (width == 0)
+    return {};
   APInt umin = APInt::getMinValue(width);
   APInt umax = APInt::getMaxValue(width);
   APInt smin = width != 0 ? APInt::getSignedMinValue(width) : umin;
   APInt smax = width != 0 ? APInt::getSignedMaxValue(width) : umax;
-  return {{umin, umax, smin, smax}};
+  return IntegerValueRange{ConstantIntRanges{umin, umax, smin, smax}};
 }
 
 void IntegerValueRangeLattice::onUpdate(DataFlowSolver *solver) const {
@@ -37,7 +40,7 @@ void IntegerValueRangeLattice::onUpdate(DataFlowSolver *solver) const {
 
   // If the integer range can be narrowed to a constant, update the constant
   // value of the SSA value.
-  Optional<APInt> constant = getValue().getValue().getConstantValue();
+  std::optional<APInt> constant = getValue().getValue().getConstantValue();
   auto value = point.get<Value>();
   auto *cv = solver->getOrCreateState<Lattice<ConstantValue>>(value);
   if (!constant)
@@ -57,6 +60,13 @@ void IntegerValueRangeLattice::onUpdate(DataFlowSolver *solver) const {
 void IntegerRangeAnalysis::visitOperation(
     Operation *op, ArrayRef<const IntegerValueRangeLattice *> operands,
     ArrayRef<IntegerValueRangeLattice *> results) {
+  // If the lattice on any operand is unitialized, bail out.
+  if (llvm::any_of(operands, [](const IntegerValueRangeLattice *lattice) {
+        return lattice->getValue().isUninitialized();
+      })) {
+    return;
+  }
+
   // Ignore non-integer outputs - return early if the op has no scalar
   // integer results
   bool hasIntegerResult = false;
@@ -84,18 +94,16 @@ void IntegerRangeAnalysis::visitOperation(
       }));
 
   auto joinCallback = [&](Value v, const ConstantIntRanges &attrs) {
-    auto result = v.dyn_cast<OpResult>();
+    auto result = dyn_cast<OpResult>(v);
     if (!result)
       return;
     assert(llvm::is_contained(op->getResults(), result));
 
     LLVM_DEBUG(llvm::dbgs() << "Inferred range " << attrs << "\n");
     IntegerValueRangeLattice *lattice = results[result.getResultNumber()];
-    Optional<IntegerValueRange> oldRange;
-    if (!lattice->isUninitialized())
-      oldRange = lattice->getValue();
+    IntegerValueRange oldRange = lattice->getValue();
 
-    ChangeResult changed = lattice->join(attrs);
+    ChangeResult changed = lattice->join(IntegerValueRange{attrs});
 
     // Catch loop results with loop variant bounds and conservatively make
     // them [-inf, inf] so we don't circle around infinitely often (because
@@ -104,8 +112,8 @@ void IntegerRangeAnalysis::visitOperation(
     bool isYieldedResult = llvm::any_of(v.getUsers(), [](Operation *op) {
       return op->hasTrait<OpTrait::IsTerminator>();
     });
-    if (isYieldedResult && oldRange.has_value() &&
-        !(lattice->getValue() == *oldRange)) {
+    if (isYieldedResult && !oldRange.isUninitialized() &&
+        !(lattice->getValue() == oldRange)) {
       LLVM_DEBUG(llvm::dbgs() << "Loop variant loop result detected\n");
       changed |= lattice->join(IntegerValueRange::getMaxRange(v));
     }
@@ -120,13 +128,18 @@ void IntegerRangeAnalysis::visitNonControlFlowArguments(
     ArrayRef<IntegerValueRangeLattice *> argLattices, unsigned firstIndex) {
   if (auto inferrable = dyn_cast<InferIntRangeInterface>(op)) {
     LLVM_DEBUG(llvm::dbgs() << "Inferring ranges for " << *op << "\n");
+    // If the lattice on any operand is unitialized, bail out.
+    if (llvm::any_of(op->getOperands(), [&](Value value) {
+          return getLatticeElementFor(op, value)->getValue().isUninitialized();
+        }))
+      return;
     SmallVector<ConstantIntRanges> argRanges(
         llvm::map_range(op->getOperands(), [&](Value value) {
           return getLatticeElementFor(op, value)->getValue().getValue();
         }));
 
     auto joinCallback = [&](Value v, const ConstantIntRanges &attrs) {
-      auto arg = v.dyn_cast<BlockArgument>();
+      auto arg = dyn_cast<BlockArgument>(v);
       if (!arg)
         return;
       if (!llvm::is_contained(successor.getSuccessor()->getArguments(), arg))
@@ -134,11 +147,9 @@ void IntegerRangeAnalysis::visitNonControlFlowArguments(
 
       LLVM_DEBUG(llvm::dbgs() << "Inferred range " << attrs << "\n");
       IntegerValueRangeLattice *lattice = argLattices[arg.getArgNumber()];
-      Optional<IntegerValueRange> oldRange;
-      if (!lattice->isUninitialized())
-        oldRange = lattice->getValue();
+      IntegerValueRange oldRange = lattice->getValue();
 
-      ChangeResult changed = lattice->join(attrs);
+      ChangeResult changed = lattice->join(IntegerValueRange{attrs});
 
       // Catch loop results with loop variant bounds and conservatively make
       // them [-inf, inf] so we don't circle around infinitely often (because
@@ -147,7 +158,8 @@ void IntegerRangeAnalysis::visitNonControlFlowArguments(
       bool isYieldedValue = llvm::any_of(v.getUsers(), [](Operation *op) {
         return op->hasTrait<OpTrait::IsTerminator>();
       });
-      if (isYieldedValue && oldRange && !(lattice->getValue() == *oldRange)) {
+      if (isYieldedValue && !oldRange.isUninitialized() &&
+          !(lattice->getValue() == oldRange)) {
         LLVM_DEBUG(llvm::dbgs() << "Loop variant loop result detected\n");
         changed |= lattice->join(IntegerValueRange::getMaxRange(v));
       }
@@ -161,15 +173,15 @@ void IntegerRangeAnalysis::visitNonControlFlowArguments(
   /// Given the results of getConstant{Lower,Upper}Bound() or getConstantStep()
   /// on a LoopLikeInterface return the lower/upper bound for that result if
   /// possible.
-  auto getLoopBoundFromFold = [&](Optional<OpFoldResult> loopBound,
+  auto getLoopBoundFromFold = [&](std::optional<OpFoldResult> loopBound,
                                   Type boundType, bool getUpper) {
     unsigned int width = ConstantIntRanges::getStorageBitwidth(boundType);
     if (loopBound.has_value()) {
       if (loopBound->is<Attribute>()) {
         if (auto bound =
-                loopBound->get<Attribute>().dyn_cast_or_null<IntegerAttr>())
+                dyn_cast_or_null<IntegerAttr>(loopBound->get<Attribute>()))
           return bound.getValue();
-      } else if (auto value = loopBound->dyn_cast<Value>()) {
+      } else if (auto value = llvm::dyn_cast_if_present<Value>(*loopBound)) {
         const IntegerValueRangeLattice *lattice =
             getLatticeElementFor(op, value);
         if (lattice != nullptr)
@@ -186,14 +198,14 @@ void IntegerRangeAnalysis::visitNonControlFlowArguments(
 
   // Infer bounds for loop arguments that have static bounds
   if (auto loop = dyn_cast<LoopLikeOpInterface>(op)) {
-    Optional<Value> iv = loop.getSingleInductionVar();
+    std::optional<Value> iv = loop.getSingleInductionVar();
     if (!iv) {
       return SparseDataFlowAnalysis ::visitNonControlFlowArguments(
           op, successor, argLattices, firstIndex);
     }
-    Optional<OpFoldResult> lowerBound = loop.getSingleLowerBound();
-    Optional<OpFoldResult> upperBound = loop.getSingleUpperBound();
-    Optional<OpFoldResult> step = loop.getSingleStep();
+    std::optional<OpFoldResult> lowerBound = loop.getSingleLowerBound();
+    std::optional<OpFoldResult> upperBound = loop.getSingleUpperBound();
+    std::optional<OpFoldResult> step = loop.getSingleStep();
     APInt min = getLoopBoundFromFold(lowerBound, iv->getType(),
                                      /*getUpper=*/false);
     APInt max = getLoopBoundFromFold(upperBound, iv->getType(),
@@ -212,7 +224,7 @@ void IntegerRangeAnalysis::visitNonControlFlowArguments(
 
     IntegerValueRangeLattice *ivEntry = getLatticeElement(*iv);
     auto ivRange = ConstantIntRanges::fromSigned(min, max);
-    propagateIfChanged(ivEntry, ivEntry->join(ivRange));
+    propagateIfChanged(ivEntry, ivEntry->join(IntegerValueRange{ivRange}));
     return;
   }
 

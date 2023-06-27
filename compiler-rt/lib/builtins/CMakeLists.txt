@@ -3,7 +3,7 @@
 # architecture-specific code in various subdirectories.
 
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-  cmake_minimum_required(VERSION 3.13.4)
+  cmake_minimum_required(VERSION 3.20.0)
 
   set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
   project(CompilerRTBuiltins C ASM)
@@ -25,7 +25,9 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   include(base-config-ix)
   include(CompilerRTUtils)
 
-  load_llvm_config()
+  if (NOT LLVM_RUNTIMES_BUILD)
+    load_llvm_config()
+  endif()
   construct_compiler_rt_default_triple()
 
   include(SetPlatformToolchainTools)
@@ -49,6 +51,7 @@ if (COMPILER_RT_STANDALONE_BUILD)
 endif()
 
 include(builtin-config-ix)
+include(CMakePushCheckState)
 
 if(${CMAKE_SYSTEM_NAME} MATCHES "AIX")
   include(CompilerRTAIXUtils)
@@ -181,14 +184,11 @@ set(GENERIC_SOURCES
   umodti3.c
 )
 
-# Build BF16 files only when "__bf16" is available.
-if(COMPILER_RT_HAS_BFLOAT16 AND NOT APPLE)
-  set(GENERIC_SOURCES
-    ${GENERIC_SOURCES}
+# We only build BF16 files when "__bf16" is available.
+set(BF16_SOURCES
     truncdfbf2.c
     truncsfbf2.c
-  )
-endif()
+)
 
 # TODO: Several "tf" files (and divtc3.c, but not multc3.c) are in
 # GENERIC_SOURCES instead of here.
@@ -303,17 +303,27 @@ if (NOT MSVC)
     ${x86_ARCH_SOURCES}
     x86_64/floatdidf.c
     x86_64/floatdisf.c
-    x86_64/floatundidf.S
-    x86_64/floatundisf.S
   )
+  if (NOT WIN32)
+    set(x86_64_SOURCES
+      ${x86_64_SOURCES}
+      x86_64/floatundidf.S
+      x86_64/floatundisf.S
+    )
+  endif()
 
   if (NOT ANDROID)
     set(x86_64_SOURCES
       ${x86_64_SOURCES}
       ${x86_80_BIT_SOURCES}
       x86_64/floatdixf.c
-      x86_64/floatundixf.S
     )
+    if (NOT WIN32)
+      set(x86_64_SOURCES
+        ${x86_64_SOURCES}
+        x86_64/floatundixf.S
+      )
+    endif()
   endif()
 
   # Darwin x86_64 Haswell
@@ -373,7 +383,9 @@ else () # MSVC
   set(i386_SOURCES ${GENERIC_SOURCES} ${x86_ARCH_SOURCES})
 endif () # if (NOT MSVC)
 
-set(arm_SOURCES
+
+# builtin support for Targets that have Arm state or have Thumb2
+set(arm_or_thumb2_base_SOURCES
   arm/fp_mode.c
   arm/bswapdi2.S
   arm/bswapsi2.S
@@ -383,6 +395,13 @@ set(arm_SOURCES
   arm/divmodsi4.S
   arm/divsi3.S
   arm/modsi3.S
+  arm/udivmodsi4.S
+  arm/udivsi3.S
+  arm/umodsi3.S
+  ${GENERIC_SOURCES}
+)
+
+set(arm_sync_SOURCES
   arm/sync_fetch_and_add_4.S
   arm/sync_fetch_and_add_8.S
   arm/sync_fetch_and_and_4.S
@@ -403,13 +422,11 @@ set(arm_SOURCES
   arm/sync_fetch_and_umin_8.S
   arm/sync_fetch_and_xor_4.S
   arm/sync_fetch_and_xor_8.S
-  arm/udivmodsi4.S
-  arm/udivsi3.S
-  arm/umodsi3.S
-  ${GENERIC_SOURCES}
 )
 
-set(thumb1_SOURCES
+# builtin support for Thumb-only targets with very limited Thumb2 technology,
+# such as v6-m and v8-m.baseline
+set(thumb1_base_SOURCES
   arm/divsi3.S
   arm/udivsi3.S
   arm/comparesf2.S
@@ -488,12 +505,21 @@ set(arm_Thumb1_VFPv2_SP_SOURCES
 set(arm_Thumb1_icache_SOURCES
   arm/sync_synchronize.S
 )
+
+# thumb1 calling into Arm to cover support
 set(arm_Thumb1_SOURCES
   ${arm_Thumb1_JT_SOURCES}
   ${arm_Thumb1_SjLj_EH_SOURCES}
   ${arm_Thumb1_VFPv2_DP_SOURCES}
   ${arm_Thumb1_VFPv2_SP_SOURCES}
   ${arm_Thumb1_icache_SOURCES}
+)
+
+# base functionality for Arm Targets prior to Arm v7-a and Armv6-m such as v6,
+# v5t, v4t
+set(arm_min_SOURCES
+  ${arm_or_thumb2_base_SOURCES}
+  ${arm_EABI_SOURCES}
 )
 
 if(MINGW)
@@ -503,18 +529,24 @@ if(MINGW)
     arm/aeabi_uidivmod.S
     arm/aeabi_uldivmod.S
     arm/chkstk.S
-    ${arm_SOURCES}
+    ${arm_or_thumb2_base_SOURCES}
+    ${arm_sync_SOURCES}
+  )
+
+  set(thumb1_SOURCES
+    ${thumb1_base_SOURCES}
   )
 elseif(NOT WIN32)
   # TODO the EABI sources should only be added to EABI targets
   set(arm_SOURCES
-    ${arm_SOURCES}
+    ${arm_or_thumb2_base_SOURCES}
+    ${arm_sync_SOURCES}
     ${arm_EABI_SOURCES}
     ${arm_Thumb1_SOURCES}
   )
 
   set(thumb1_SOURCES
-    ${thumb1_SOURCES}
+    ${thumb1_base_SOURCES}
     ${arm_EABI_SOURCES}
   )
 endif()
@@ -561,6 +593,9 @@ if (MINGW)
   )
 endif()
 
+set(armv4t_SOURCES ${arm_min_SOURCES})
+set(armv5te_SOURCES ${arm_min_SOURCES})
+set(armv6_SOURCES ${arm_min_SOURCES})
 set(armhf_SOURCES ${arm_SOURCES})
 set(armv7_SOURCES ${arm_SOURCES})
 set(armv7s_SOURCES ${arm_SOURCES})
@@ -573,6 +608,7 @@ set(arm64_32_SOURCES ${aarch64_SOURCES})
 set(armv6m_SOURCES ${thumb1_SOURCES})
 set(armv7m_SOURCES ${arm_SOURCES})
 set(armv7em_SOURCES ${arm_SOURCES})
+set(armv8m.base_SOURCES ${thumb1_SOURCES})
 set(armv8m.main_SOURCES ${arm_SOURCES})
 set(armv8.1m.main_SOURCES ${arm_SOURCES})
 
@@ -620,6 +656,14 @@ set(hexagon_SOURCES
   ${GENERIC_TF_SOURCES}
 )
 
+set(loongarch_SOURCES
+  loongarch/fp_mode.c
+  ${GENERIC_SOURCES}
+  ${GENERIC_TF_SOURCES}
+)
+set(loongarch64_SOURCES
+  ${loongarch_SOURCES}
+)
 
 set(mips_SOURCES ${GENERIC_SOURCES})
 set(mipsel_SOURCES ${mips_SOURCES})
@@ -693,6 +737,10 @@ set(ve_SOURCES
 add_custom_target(builtins)
 set_target_properties(builtins PROPERTIES FOLDER "Compiler-RT Misc")
 
+option(COMPILER_RT_ENABLE_SOFTWARE_INT128
+  "Enable the int128 builtin routines for all targets."
+  OFF)
+
 if (APPLE)
   add_subdirectory(Darwin-excludes)
   add_subdirectory(macho_embedded)
@@ -704,8 +752,6 @@ else ()
   if (COMPILER_RT_HAS_FCF_PROTECTION_FLAG)
     append_list_if(COMPILER_RT_ENABLE_CET -fcf-protection=full BUILTIN_CFLAGS)
   endif()
-
-  append_list_if(COMPILER_RT_HAS_FLOAT16 -DCOMPILER_RT_HAS_FLOAT16 BUILTIN_CFLAGS)
 
   append_list_if(COMPILER_RT_HAS_STD_C11_FLAG -std=c11 BUILTIN_CFLAGS)
 
@@ -730,11 +776,19 @@ else ()
     append_list_if(COMPILER_RT_HAS_VISIBILITY_HIDDEN_FLAG VISIBILITY_HIDDEN BUILTIN_DEFS)
   endif()
 
+  if(COMPILER_RT_DISABLE_AARCH64_FMV)
+    list(APPEND BUILTIN_DEFS DISABLE_AARCH64_FMV)
+  endif()
+
   append_list_if(COMPILER_RT_HAS_ASM_LSE HAS_ASM_LSE BUILTIN_DEFS)
 
   foreach (arch ${BUILTIN_SUPPORTED_ARCH})
     if (CAN_TARGET_${arch})
+      cmake_push_check_state()
+      # TODO: we should probably make most of the checks in builtin-config depend on the target flags.
+      message(STATUS "Performing additional configure checks with target flags: ${TARGET_${arch}_CFLAGS}")
       set(BUILTIN_CFLAGS_${arch} ${BUILTIN_CFLAGS})
+      list(APPEND CMAKE_REQUIRED_FLAGS ${TARGET_${arch}_CFLAGS} ${BUILTIN_CFLAGS_${arch}})
       # For ARM archs, exclude any VFP builtins if VFP is not supported
       if (${arch} MATCHES "^(arm|armhf|armv7|armv7s|armv7k|armv7m|armv7em|armv8m.main|armv8.1m.main)$")
         string(REPLACE ";" " " _TARGET_${arch}_CFLAGS "${TARGET_${arch}_CFLAGS}")
@@ -747,11 +801,20 @@ else ()
                            SOURCE "#if !(__ARM_FP & 0x8)
                                    #error No double-precision support!
                                    #endif
-                                   int main() { return 0; }")
+                                   int main(void) { return 0; }")
           if(NOT COMPILER_RT_HAS_${arch}_VFP_DP)
             list(REMOVE_ITEM ${arch}_SOURCES ${arm_Thumb1_VFPv2_DP_SOURCES})
           endif()
         endif()
+      endif()
+      check_c_source_compiles("_Float16 foo(_Float16 x) { return x; }"
+                              COMPILER_RT_HAS_${arch}_FLOAT16)
+      append_list_if(COMPILER_RT_HAS_${arch}_FLOAT16 -DCOMPILER_RT_HAS_FLOAT16 BUILTIN_CFLAGS_${arch})
+      check_c_source_compiles("__bf16 foo(__bf16 x) { return x; }"
+                              COMPILER_RT_HAS_${arch}_BFLOAT16)
+      # Build BF16 files only when "__bf16" is available.
+      if(COMPILER_RT_HAS_${arch}_BFLOAT16)
+        list(APPEND ${arch}_SOURCES ${BF16_SOURCES})
       endif()
 
       # Remove a generic C builtin when an arch-specific builtin is specified.
@@ -765,7 +828,7 @@ else ()
 
       # For RISCV32, we must force enable int128 for compiling long
       # double routines.
-      if("${arch}" STREQUAL "riscv32")
+      if(COMPILER_RT_ENABLE_SOFTWARE_INT128 OR "${arch}" STREQUAL "riscv32")
         list(APPEND BUILTIN_CFLAGS_${arch} -fforce-enable-int128)
       endif()
 
@@ -787,6 +850,7 @@ else ()
                               DEFS ${BUILTIN_DEFS}
                               CFLAGS ${BUILTIN_CFLAGS_${arch}}
                               PARENT_TARGET builtins)
+      cmake_pop_check_state()
     endif ()
   endforeach ()
 endif ()
@@ -797,19 +861,17 @@ option(COMPILER_RT_BUILD_STANDALONE_LIBATOMIC
 
 if(COMPILER_RT_BUILD_STANDALONE_LIBATOMIC)
   add_custom_target(builtins-standalone-atomic)
-  set(BUILTIN_DEPS "")
   set(BUILTIN_TYPE SHARED)
   if(${CMAKE_SYSTEM_NAME} MATCHES "AIX")
     if(NOT COMPILER_RT_LIBATOMIC_LINK_FLAGS)
       get_aix_libatomic_default_link_flags(COMPILER_RT_LIBATOMIC_LINK_FLAGS
         "${CMAKE_CURRENT_SOURCE_DIR}/ppc/atomic.exp")
     endif()
-    # The compiler needs builtins to link any other binaries, so let
-    # clang_rt.atomic be built after builtins.
-    set(BUILTIN_DEPS builtins)
     # For different versions of cmake, SHARED behaves differently. For some
     # versions, we might need MODULE rather than SHARED.
     get_aix_libatomic_type(BUILTIN_TYPE)
+  else()
+    list(APPEND COMPILER_RT_LIBATOMIC_LINK_FLAGS -nodefaultlibs)
   endif()
   foreach (arch ${BUILTIN_SUPPORTED_ARCH})
     if(CAN_TARGET_${arch})
@@ -818,7 +880,7 @@ if(COMPILER_RT_BUILD_STANDALONE_LIBATOMIC)
                               ARCHS ${arch}
                               SOURCES atomic.c
                               LINK_FLAGS ${COMPILER_RT_LIBATOMIC_LINK_FLAGS}
-                              DEPS ${BUILTIN_DEPS}
+                              DEPS builtins
                               PARENT_TARGET builtins-standalone-atomic)
     endif()
   endforeach()

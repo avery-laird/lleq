@@ -31,7 +31,8 @@ struct X86_64 : TargetInfo {
   void relocateOne(uint8_t *loc, const Reloc &, uint64_t va,
                    uint64_t relocVA) const override;
 
-  void writeStub(uint8_t *buf, const Symbol &) const override;
+  void writeStub(uint8_t *buf, const Symbol &,
+                 uint64_t pointerVA) const override;
   void writeStubHelperHeader(uint8_t *buf) const override;
   void writeStubHelperEntry(uint8_t *buf, const Symbol &,
                             uint64_t entryAddr) const override;
@@ -138,11 +139,11 @@ static constexpr uint8_t stub[] = {
     0xff, 0x25, 0, 0, 0, 0, // jmpq *__la_symbol_ptr(%rip)
 };
 
-void X86_64::writeStub(uint8_t *buf, const Symbol &sym) const {
+void X86_64::writeStub(uint8_t *buf, const Symbol &sym,
+                       uint64_t pointerVA) const {
   memcpy(buf, stub, 2); // just copy the two nonzero bytes
   uint64_t stubAddr = in.stubs->addr + sym.stubsIndex * sizeof(stub);
-  writeRipRelative({&sym, "stub"}, buf, stubAddr, sizeof(stub),
-                   in.lazyPointers->addr + sym.stubsIndex * LP64::wordSize);
+  writeRipRelative({&sym, "stub"}, buf, stubAddr, sizeof(stub), pointerVA);
 }
 
 static constexpr uint8_t stubHelperHeader[] = {
@@ -230,11 +231,11 @@ void X86_64::handleDtraceReloc(const Symbol *sym, const Reloc &r,
   if (config->outputType == MH_OBJECT)
     return;
 
-  if (sym->getName().startswith("___dtrace_probe")) {
+  if (sym->getName().starts_with("___dtrace_probe")) {
     // change call site to a NOP
     loc[-1] = 0x90;
     write32le(loc, 0x00401F0F);
-  } else if (sym->getName().startswith("___dtrace_isenabled")) {
+  } else if (sym->getName().starts_with("___dtrace_isenabled")) {
     // change call site to a clear eax
     loc[-1] = 0x33;
     write32le(loc, 0x909090C0);

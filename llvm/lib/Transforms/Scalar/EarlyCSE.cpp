@@ -132,7 +132,15 @@ struct SimpleValue {
         }
         }
       }
-      return CI->doesNotAccessMemory() && !CI->getType()->isVoidTy();
+      return CI->doesNotAccessMemory() && !CI->getType()->isVoidTy() &&
+             // FIXME: Currently the calls which may access the thread id may
+             // be considered as not accessing the memory. But this is
+             // problematic for coroutines, since coroutines may resume in a
+             // different thread. So we disable the optimization here for the
+             // correctness. However, it may block many other correct
+             // optimizations. Revert this one when we detect the memory
+             // accessing kind more precisely.
+             !CI->getFunction()->isPresplitCoroutine();
     }
     return isa<CastInst>(Inst) || isa<UnaryOperator>(Inst) ||
            isa<BinaryOperator>(Inst) || isa<GetElementPtrInst>(Inst) ||
@@ -310,6 +318,14 @@ static unsigned getHashValueImpl(SimpleValue Val) {
     return hash_combine(GCR->getOpcode(), GCR->getOperand(0),
                         GCR->getBasePtr(), GCR->getDerivedPtr());
 
+  // Don't CSE convergent calls in different basic blocks, because they
+  // implicitly depend on the set of threads that is currently executing.
+  if (CallInst *CI = dyn_cast<CallInst>(Inst); CI && CI->isConvergent()) {
+    return hash_combine(
+        Inst->getOpcode(), Inst->getParent(),
+        hash_combine_range(Inst->value_op_begin(), Inst->value_op_end()));
+  }
+
   // Mix in the opcode.
   return hash_combine(
       Inst->getOpcode(),
@@ -336,8 +352,16 @@ static bool isEqualImpl(SimpleValue LHS, SimpleValue RHS) {
 
   if (LHSI->getOpcode() != RHSI->getOpcode())
     return false;
-  if (LHSI->isIdenticalToWhenDefined(RHSI))
+  if (LHSI->isIdenticalToWhenDefined(RHSI)) {
+    // Convergent calls implicitly depend on the set of threads that is
+    // currently executing, so conservatively return false if they are in
+    // different basic blocks.
+    if (CallInst *CI = dyn_cast<CallInst>(LHSI);
+        CI && CI->isConvergent() && LHSI->getParent() != RHSI->getParent())
+      return false;
+
     return true;
+  }
 
   // If we're not strictly identical, we still might be a commutable instruction
   if (BinaryOperator *LHSBinOp = dyn_cast<BinaryOperator>(LHSI)) {
@@ -463,7 +487,15 @@ struct CallValue {
       return false;
 
     CallInst *CI = dyn_cast<CallInst>(Inst);
-    if (!CI || !CI->onlyReadsMemory())
+    if (!CI || !CI->onlyReadsMemory() ||
+        // FIXME: Currently the calls which may access the thread id may
+        // be considered as not accessing the memory. But this is
+        // problematic for coroutines, since coroutines may resume in a
+        // different thread. So we disable the optimization here for the
+        // correctness. However, it may block many other correct
+        // optimizations. Revert this one when we detect the memory
+        // accessing kind more precisely.
+        CI->getFunction()->isPresplitCoroutine())
       return false;
     return true;
   }
@@ -562,12 +594,13 @@ public:
     unsigned Generation = 0;
     int MatchingId = -1;
     bool IsAtomic = false;
+    bool IsLoad = false;
 
     LoadValue() = default;
     LoadValue(Instruction *Inst, unsigned Generation, unsigned MatchingId,
-              bool IsAtomic)
+              bool IsAtomic, bool IsLoad)
         : DefInst(Inst), Generation(Generation), MatchingId(MatchingId),
-          IsAtomic(IsAtomic) {}
+          IsAtomic(IsAtomic), IsLoad(IsLoad) {}
   };
 
   using LoadMapAllocator =
@@ -786,17 +819,7 @@ private:
 
     Type *getValueType() const {
       // TODO: handle target-specific intrinsics.
-      if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(Inst)) {
-        switch (II->getIntrinsicID()) {
-        case Intrinsic::masked_load:
-          return II->getType();
-        case Intrinsic::masked_store:
-          return II->getArgOperand(0)->getType();
-        default:
-          return nullptr;
-        }
-      }
-      return getLoadStoreType(Inst);
+      return Inst->getAccessType();
     }
 
     bool mayReadFromMemory() const {
@@ -848,7 +871,7 @@ private:
     // TODO: We could insert relevant casts on type mismatch here.
     if (auto *LI = dyn_cast<LoadInst>(Inst))
       return LI->getType() == ExpectedType ? LI : nullptr;
-    else if (auto *SI = dyn_cast<StoreInst>(Inst)) {
+    if (auto *SI = dyn_cast<StoreInst>(Inst)) {
       Value *V = SI->getValueOperand();
       return V->getType() == ExpectedType ? V : nullptr;
     }
@@ -861,11 +884,14 @@ private:
 
   Value *getOrCreateResultNonTargetMemIntrinsic(IntrinsicInst *II,
                                                 Type *ExpectedType) const {
+    // TODO: We could insert relevant casts on type mismatch here.
     switch (II->getIntrinsicID()) {
     case Intrinsic::masked_load:
-      return II;
-    case Intrinsic::masked_store:
-      return II->getOperand(0);
+      return II->getType() == ExpectedType ? II : nullptr;
+    case Intrinsic::masked_store: {
+      Value *V = II->getOperand(0);
+      return V->getType() == ExpectedType ? V : nullptr;
+    }
     }
     return nullptr;
   }
@@ -1242,7 +1268,7 @@ bool EarlyCSE::processNode(DomTreeNode *Node) {
 
   // See if any instructions in the block can be eliminated.  If so, do it.  If
   // not, add them to AvailableValues.
-  for (Instruction &Inst : make_early_inc_range(BB->getInstList())) {
+  for (Instruction &Inst : make_early_inc_range(*BB)) {
     // Dead instructions should just be removed.
     if (isInstructionTriviallyDead(&Inst, &TLI)) {
       LLVM_DEBUG(dbgs() << "EarlyCSE DCE: " << Inst << '\n');
@@ -1457,6 +1483,9 @@ bool EarlyCSE::processNode(DomTreeNode *Node) {
           LLVM_DEBUG(dbgs() << "Skipping due to debug counter\n");
           continue;
         }
+        if (InVal.IsLoad)
+          if (auto *I = dyn_cast<Instruction>(Op))
+            combineMetadataForCSE(I, &Inst, false);
         if (!Inst.use_empty())
           Inst.replaceAllUsesWith(Op);
         salvageKnowledge(&Inst, &AC);
@@ -1471,7 +1500,8 @@ bool EarlyCSE::processNode(DomTreeNode *Node) {
       AvailableLoads.insert(MemInst.getPointerOperand(),
                             LoadValue(&Inst, CurrentGeneration,
                                       MemInst.getMatchingId(),
-                                      MemInst.isAtomic()));
+                                      MemInst.isAtomic(),
+                                      MemInst.isLoad()));
       LastStore = nullptr;
       continue;
     }
@@ -1595,7 +1625,8 @@ bool EarlyCSE::processNode(DomTreeNode *Node) {
         AvailableLoads.insert(MemInst.getPointerOperand(),
                               LoadValue(&Inst, CurrentGeneration,
                                         MemInst.getMatchingId(),
-                                        MemInst.isAtomic()));
+                                        MemInst.isAtomic(),
+                                        MemInst.isLoad()));
 
         // Remember that this was the last unordered store we saw for DSE. We
         // don't yet handle DSE on ordered or volatile stores since we don't
@@ -1691,10 +1722,10 @@ void EarlyCSEPass::printPipeline(
     raw_ostream &OS, function_ref<StringRef(StringRef)> MapClassName2PassName) {
   static_cast<PassInfoMixin<EarlyCSEPass> *>(this)->printPipeline(
       OS, MapClassName2PassName);
-  OS << "<";
+  OS << '<';
   if (UseMemorySSA)
     OS << "memssa";
-  OS << ">";
+  OS << '>';
 }
 
 namespace {

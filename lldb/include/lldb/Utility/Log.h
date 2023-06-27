@@ -166,7 +166,7 @@ public:
     // output will be discarded.
     Log *GetLog(MaskType mask) {
       Log *log = log_ptr.load(std::memory_order_relaxed);
-      if (log && log->GetMask().AnySet(mask))
+      if (log && ((log->GetMask() & mask) != 0))
         return log;
       return nullptr;
     }
@@ -232,6 +232,9 @@ public:
                          std::forward<Args>(args)...));
   }
 
+  void Formatf(llvm::StringRef file, llvm::StringRef function,
+               const char *format, ...) __attribute__((format(printf, 4, 5)));
+
   /// Prefer using LLDB_LOGF whenever possible.
   void Printf(const char *format, ...) __attribute__((format(printf, 2, 3)));
 
@@ -243,12 +246,14 @@ public:
 
   const Flags GetOptions() const;
 
-  const Flags GetMask() const;
+  MaskType GetMask() const;
 
   bool GetVerbose() const;
 
   void VAPrintf(const char *format, va_list args);
   void VAError(const char *format, va_list args);
+  void VAFormatf(llvm::StringRef file, llvm::StringRef function,
+                 const char *format, va_list args);
 
 private:
   Channel &m_channel;
@@ -265,7 +270,7 @@ private:
 
   void WriteHeader(llvm::raw_ostream &OS, llvm::StringRef file,
                    llvm::StringRef function);
-  void WriteMessage(const std::string &message);
+  void WriteMessage(llvm::StringRef message);
 
   void Format(llvm::StringRef file, llvm::StringRef function,
               const llvm::formatv_object_base &payload);
@@ -276,9 +281,9 @@ private:
   }
 
   void Enable(const std::shared_ptr<LogHandler> &handler_sp, uint32_t options,
-              uint32_t flags);
+              MaskType flags);
 
-  void Disable(uint32_t flags);
+  void Disable(MaskType flags);
 
   bool Dump(llvm::raw_ostream &stream);
 
@@ -291,8 +296,9 @@ private:
 
   static void ListCategories(llvm::raw_ostream &stream,
                              const ChannelMap::value_type &entry);
-  static uint32_t GetFlags(llvm::raw_ostream &stream, const ChannelMap::value_type &entry,
-                           llvm::ArrayRef<const char *> categories);
+  static Log::MaskType GetFlags(llvm::raw_ostream &stream,
+                                const ChannelMap::value_type &entry,
+                                llvm::ArrayRef<const char *> categories);
 
   Log(const Log &) = delete;
   void operator=(const Log &) = delete;
@@ -344,7 +350,7 @@ template <typename Cat> Log *GetLog(Cat mask) {
   do {                                                                         \
     ::lldb_private::Log *log_private = (log);                                  \
     if (log_private)                                                           \
-      log_private->Printf(__VA_ARGS__);                                        \
+      log_private->Formatf(__FILE__, __func__, __VA_ARGS__);                   \
   } while (0)
 
 #define LLDB_LOGV(log, ...)                                                    \
@@ -368,5 +374,3 @@ template <typename Cat> Log *GetLog(Cat mask) {
   } while (0)
 
 #endif // LLDB_UTILITY_LOG_H
-
-// TODO: Remove this and fix includes everywhere.

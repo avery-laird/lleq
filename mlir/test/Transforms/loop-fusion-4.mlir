@@ -1,5 +1,5 @@
-// RUN: mlir-opt -allow-unregistered-dialect %s -affine-loop-fusion="mode=producer" -split-input-file | FileCheck %s --check-prefix=PRODUCER-CONSUMER
-// RUN: mlir-opt -allow-unregistered-dialect %s -affine-loop-fusion="fusion-maximal mode=sibling" -split-input-file | FileCheck %s --check-prefix=SIBLING-MAXIMAL
+// RUN: mlir-opt -allow-unregistered-dialect %s -pass-pipeline='builtin.module(func.func(affine-loop-fusion{mode=producer}))' -split-input-file | FileCheck %s --check-prefix=PRODUCER-CONSUMER
+// RUN: mlir-opt -allow-unregistered-dialect %s -pass-pipeline='builtin.module(func.func(affine-loop-fusion{fusion-maximal mode=sibling}))' -split-input-file | FileCheck %s --check-prefix=SIBLING-MAXIMAL
 
 // Part I of fusion tests in  mlir/test/Transforms/loop-fusion.mlir.
 // Part II of fusion tests in mlir/test/Transforms/loop-fusion-2.mlir
@@ -141,3 +141,88 @@ func.func @reduce_add_non_maximal_f32_f32(%arg0: memref<64x64xf32, 1>, %arg1 : m
 // SIBLING-MAXIMAL-NEXT:             affine.for %[[idx_1:.*]] = 0 to 64 {
 // SIBLING-MAXIMAL-NEXT:               %[[result_1:.*]] = affine.for %[[idx_2:.*]] = 0 to 32 iter_args(%[[iter_0:.*]] = %[[cst_1]]) -> (f32) {
 // SIBLING-MAXIMAL-NEXT:                 %[[result_0:.*]] = affine.for %[[idx_3:.*]] = 0 to 64 iter_args(%[[iter_1:.*]] = %[[cst_0]]) -> (f32) {
+
+// -----
+
+// SIBLING-MAXIMAL-LABEL: func @sibling_load_only
+func.func @sibling_load_only(%arg0: memref<10xf32>) {
+  affine.for %arg1 = 0 to 10 {
+    %0 = affine.load %arg0[%arg1] : memref<10xf32>
+  }
+  affine.for %arg1 = 0 to 10 {
+    %0 = affine.load %arg0[%arg1] : memref<10xf32>
+  }
+  // SIBLING-MAXIMAL-NEXT: affine.for
+  // SIBLING-MAXIMAL-NEXT:   affine.load
+  // SIBLING-MAXIMAL-NEXT:   affine.load
+  return
+}
+
+// -----
+
+// PRODUCER-CONSUMER-LABEL: func @fusion_for_multiple_blocks() {
+func.func @fusion_for_multiple_blocks() {
+^bb0:
+  %m = memref.alloc() : memref<10xf32>
+  %cf7 = arith.constant 7.0 : f32
+
+  affine.for %i0 = 0 to 10 {
+    affine.store %cf7, %m[%i0] : memref<10xf32>
+  }
+  affine.for %i1 = 0 to 10 {
+    %v0 = affine.load %m[%i1] : memref<10xf32>
+  }
+  // PRODUCER-CONSUMER:      affine.for %{{.*}} = 0 to 10 {
+  // PRODUCER-CONSUMER-NEXT:   affine.store %{{.*}}, %{{.*}}[0] : memref<1xf32>
+  // PRODUCER-CONSUMER-NEXT:   affine.load %{{.*}}[0] : memref<1xf32>
+  // PRODUCER-CONSUMER-NEXT: }
+  cf.br ^bb1
+^bb1:
+  affine.for %i0 = 0 to 10 {
+    affine.store %cf7, %m[%i0] : memref<10xf32>
+  }
+  affine.for %i1 = 0 to 10 {
+    %v0 = affine.load %m[%i1] : memref<10xf32>
+  }
+  // PRODUCER-CONSUMER:      affine.for %{{.*}} = 0 to 10 {
+  // PRODUCER-CONSUMER-NEXT:   affine.store %{{.*}}, %{{.*}}[0] : memref<1xf32>
+  // PRODUCER-CONSUMER-NEXT:   affine.load %{{.*}}[0] : memref<1xf32>
+  // PRODUCER-CONSUMER-NEXT: }
+  return
+}
+
+// -----
+
+// PRODUCER-CONSUMER-LABEL: @fuse_higher_dim_nest_into_lower_dim_nest
+func.func @fuse_higher_dim_nest_into_lower_dim_nest() {
+  %A = memref.alloc() : memref<8x12x128x64xf32>
+  %B = memref.alloc() : memref<8x128x12x64xf32>
+  affine.for %arg205 = 0 to 8 {
+    affine.for %arg206 = 0 to 128 {
+      affine.for %arg207 = 0 to 12 {
+        affine.for %arg208 = 0 to 64 {
+          %a = affine.load %A[%arg205, %arg207, %arg206, %arg208] : memref<8x12x128x64xf32>
+          affine.store %a, %B[%arg205, %arg206, %arg207, %arg208] : memref<8x128x12x64xf32>
+        }
+      }
+    }
+  }
+  %C = memref.alloc() : memref<8x128x768xf16>
+  affine.for %arg205 = 0 to 8 {
+    affine.for %arg206 = 0 to 128 {
+      affine.for %arg207 = 0 to 768 {
+        %b = affine.load %B[%arg205, %arg206, %arg207 floordiv 64, %arg207 mod 64] : memref<8x128x12x64xf32>
+        %c = arith.truncf %b : f32 to f16
+        affine.store %c, %C[%arg205, %arg206, %arg207] : memref<8x128x768xf16>
+      }
+    }
+  }
+
+  // Check that fusion happens into the innermost loop of the consumer.
+  // PRODUCER-CONSUMER:      affine.for
+  // PRODUCER-CONSUMER-NEXT:   affine.for %{{.*}} = 0 to 128
+  // PRODUCER-CONSUMER-NEXT:     affine.for %{{.*}} = 0 to 768
+  // PRODUCER-CONSUMER-NOT:  affine.for
+  // PRODUCER-CONSUMER:      return
+  return
+}

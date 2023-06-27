@@ -197,7 +197,7 @@ bool isDwoSection(const MCSection &Sec) {
 }
 
 class WasmObjectWriter : public MCObjectWriter {
-  support::endian::Writer *W;
+  support::endian::Writer *W = nullptr;
 
   /// The target specific Wasm writer instance.
   std::unique_ptr<MCWasmObjectTargetWriter> TargetObjectWriter;
@@ -716,7 +716,7 @@ static void addData(SmallVectorImpl<char> &DataBytes,
                     MCSectionWasm &DataSection) {
   LLVM_DEBUG(errs() << "addData: " << DataSection.getName() << "\n");
 
-  DataBytes.resize(alignTo(DataBytes.size(), DataSection.getAlignment()));
+  DataBytes.resize(alignTo(DataBytes.size(), DataSection.getAlign()));
 
   for (const MCFragment &Frag : DataSection) {
     if (Frag.hasInstructions())
@@ -1498,7 +1498,7 @@ uint64_t WasmObjectWriter::writeOneObject(MCAssembler &Asm,
 
     if (Section.isWasmData()) {
       uint32_t SegmentIndex = DataSegments.size();
-      DataSize = alignTo(DataSize, Section.getAlignment());
+      DataSize = alignTo(DataSize, Section.getAlign());
       DataSegments.emplace_back();
       WasmDataSegment &Segment = DataSegments.back();
       Segment.Name = SectionName;
@@ -1508,7 +1508,7 @@ uint64_t WasmObjectWriter::writeOneObject(MCAssembler &Asm,
       Segment.Offset = DataSize;
       Segment.Section = &Section;
       addData(Segment.Data, Section);
-      Segment.Alignment = Log2_32(Section.getAlignment());
+      Segment.Alignment = Log2(Section.getAlign());
       Segment.LinkingFlags = Section.getSegmentFlags();
       DataSize += Segment.Data.size();
       Section.setSegmentIndex(SegmentIndex);

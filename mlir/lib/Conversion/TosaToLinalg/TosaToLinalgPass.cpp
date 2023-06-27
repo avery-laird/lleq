@@ -12,7 +12,7 @@
 
 #include "mlir/Conversion/TosaToLinalg/TosaToLinalg.h"
 
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -39,8 +39,8 @@ struct TosaToLinalg : public impl::TosaToLinalgBase<TosaToLinalg> {
 public:
   void getDependentDialects(DialectRegistry &registry) const override {
     registry
-        .insert<arith::ArithmeticDialect, linalg::LinalgDialect,
-                math::MathDialect, tensor::TensorDialect, scf::SCFDialect>();
+        .insert<arith::ArithDialect, linalg::LinalgDialect, math::MathDialect,
+                tensor::TensorDialect, scf::SCFDialect>();
   }
 
   void runOnOperation() override {
@@ -55,7 +55,10 @@ public:
     target.addLegalOp<tosa::IfOp>();
     target.addLegalOp<tosa::ConstOp>();
     target.addLegalOp<tosa::WhileOp>();
+    target.addLegalOp<tosa::ConcatOp>();
     target.addLegalOp<tosa::SliceOp>();
+    target.addLegalOp<tosa::ReshapeOp>();
+    target.addLegalOp<tosa::PadOp>();
 
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
 
@@ -78,11 +81,13 @@ void mlir::tosa::addTosaToLinalgPasses(OpPassManager &pm,
     pm.addNestedPass<func::FuncOp>(tosa::createTosaOptionalDecompositions());
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
 
+  pm.addNestedPass<func::FuncOp>(tosa::createTosaInferShapesPass());
   pm.addNestedPass<func::FuncOp>(tosa::createTosaMakeBroadcastablePass());
   pm.addNestedPass<func::FuncOp>(tosa::createTosaToLinalgNamed());
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
   // TODO: Remove pass that operates on const tensor and enable optionality
   pm.addNestedPass<func::FuncOp>(tosa::createTosaLayerwiseConstantFoldPass());
   pm.addNestedPass<func::FuncOp>(tosa::createTosaMakeBroadcastablePass());
+  pm.addNestedPass<func::FuncOp>(tosa::createTosaValidationPass());
   pm.addNestedPass<func::FuncOp>(tosa::createTosaToLinalg());
 }

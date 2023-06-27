@@ -87,10 +87,9 @@ Using Clang Tools
    ClangFormatStyleOptions
    ClangFormattedStatus
    ClangLinkerWrapper
-   ClangNvlinkWrapper
    ClangOffloadBundler
-   ClangOffloadWrapper
    ClangOffloadPackager
+   ClangRepl
 
 Design Documents
 ================
@@ -101,6 +100,7 @@ Design Documents
    CodeOwners
    InternalsManual
    DriverInternals
+   Multilib
    OffloadingDesign
    PCHInternals
    ItaniumMangleAbiTags
@@ -112,6 +112,5 @@ Indices and tables
 ==================
 
 * :ref:`genindex`
-* :ref:`modindex`
 * :ref:`search`
 

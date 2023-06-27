@@ -12,6 +12,7 @@
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include <optional>
 
 using namespace mlir;
 using namespace mlir::dataflow;
@@ -21,16 +22,29 @@ namespace {
 class UnderlyingValue {
 public:
   /// Create an underlying value state with a known underlying value.
-  UnderlyingValue(Value underlyingValue) : underlyingValue(underlyingValue) {}
+  explicit UnderlyingValue(std::optional<Value> underlyingValue = std::nullopt)
+      : underlyingValue(underlyingValue) {}
+
+  /// Whether the state is uninitialized.
+  bool isUninitialized() const { return !underlyingValue.has_value(); }
 
   /// Returns the underlying value.
-  Value getUnderlyingValue() const { return underlyingValue; }
+  Value getUnderlyingValue() const {
+    assert(!isUninitialized());
+    return *underlyingValue;
+  }
 
   /// Join two underlying values. If there are conflicting underlying values,
   /// go to the pessimistic value.
   static UnderlyingValue join(const UnderlyingValue &lhs,
                               const UnderlyingValue &rhs) {
-    return lhs.underlyingValue == rhs.underlyingValue ? lhs : Value();
+    if (lhs.isUninitialized())
+      return rhs;
+    if (rhs.isUninitialized())
+      return lhs;
+    return lhs.underlyingValue == rhs.underlyingValue
+               ? lhs
+               : UnderlyingValue(Value{});
   }
 
   /// Compare underlying values.
@@ -41,7 +55,7 @@ public:
   void print(raw_ostream &os) const { os << underlyingValue; }
 
 private:
-  Value underlyingValue;
+  std::optional<Value> underlyingValue;
 };
 
 /// This lattice represents, for a given memory resource, the potential last
@@ -51,9 +65,6 @@ public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LastModification)
 
   using AbstractDenseLattice::AbstractDenseLattice;
-
-  /// The lattice is always initialized.
-  bool isUninitialized() const override { return false; }
 
   /// Clear all modifications.
   ChangeResult reset() {
@@ -89,9 +100,9 @@ public:
     return result;
   }
 
-  /// Get the last modifications of a value. Returns none if the last
+  /// Get the last modifications of a value. Returns std::nullopt if the last
   /// modifications are not known.
-  Optional<ArrayRef<Operation *>> getLastModifiers(Value value) const {
+  std::optional<ArrayRef<Operation *>> getLastModifiers(Value value) const {
     auto it = lastMods.find(value);
     if (it == lastMods.end())
       return {};
@@ -169,7 +180,7 @@ static Value getMostUnderlyingValue(
   const UnderlyingValueLattice *underlying;
   do {
     underlying = getUnderlyingValueFn(value);
-    if (!underlying || underlying->isUninitialized())
+    if (!underlying || underlying->getValue().isUninitialized())
       return {};
     Value underlyingValue = underlying->getValue().getUnderlyingValue();
     if (underlyingValue == value)
@@ -243,13 +254,13 @@ struct TestLastModifiedPass
       const LastModification *lastMods =
           solver.lookupState<LastModification>(op);
       assert(lastMods && "expected a dense lattice");
-      for (auto &it : llvm::enumerate(op->getOperands())) {
-        os << " operand #" << it.index() << "\n";
-        Value value = getMostUnderlyingValue(it.value(), [&](Value value) {
+      for (auto [index, operand] : llvm::enumerate(op->getOperands())) {
+        os << " operand #" << index << "\n";
+        Value value = getMostUnderlyingValue(operand, [&](Value value) {
           return solver.lookupState<UnderlyingValueLattice>(value);
         });
         assert(value && "expected an underlying value");
-        if (Optional<ArrayRef<Operation *>> lastMod =
+        if (std::optional<ArrayRef<Operation *>> lastMod =
                 lastMods->getLastModifiers(value)) {
           for (Operation *lastModifier : *lastMod) {
             if (auto tagName =

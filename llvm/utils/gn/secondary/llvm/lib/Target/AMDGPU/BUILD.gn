@@ -58,7 +58,11 @@ tablegen("AMDGPUGenMCPseudoLowering") {
 }
 
 tablegen("AMDGPUGenRegisterBank") {
-  visibility = [ ":LLVMAMDGPUCodeGen" ]
+  visibility = [
+    ":LLVMAMDGPUCodeGen",
+    "Utils",
+    "//llvm/unittests/Target/AMDGPU:AMDGPUTests",
+  ]
   args = [ "-gen-register-bank" ]
   td_file = "AMDGPU.td"
 }
@@ -115,6 +119,7 @@ static_library("LLVMAMDGPUCodeGen") {
     "//llvm/lib/Passes",
     "//llvm/lib/Support",
     "//llvm/lib/Target",
+    "//llvm/lib/TargetParser",
     "//llvm/lib/Transforms/IPO",
     "//llvm/lib/Transforms/Scalar",
     "//llvm/lib/Transforms/Utils",
@@ -148,7 +153,6 @@ static_library("LLVMAMDGPUCodeGen") {
     "AMDGPULegalizerInfo.cpp",
     "AMDGPULibCalls.cpp",
     "AMDGPULibFunc.cpp",
-    "AMDGPULowerIntrinsics.cpp",
     "AMDGPULowerKernelArguments.cpp",
     "AMDGPULowerKernelAttributes.cpp",
     "AMDGPULowerModuleLDSPass.cpp",
@@ -165,13 +169,13 @@ static_library("LLVMAMDGPUCodeGen") {
     "AMDGPUPrintfRuntimeBinding.cpp",
     "AMDGPUPromoteAlloca.cpp",
     "AMDGPUPromoteKernelArguments.cpp",
-    "AMDGPUPropagateAttributes.cpp",
     "AMDGPURegBankCombiner.cpp",
+    "AMDGPURegBankSelect.cpp",
     "AMDGPURegisterBankInfo.cpp",
-    "AMDGPUReleaseVGPRs.cpp",
-    "AMDGPUReplaceLDSUseWithPointer.cpp",
+    "AMDGPURemoveIncompatibleFunctions.cpp",
     "AMDGPUResourceUsageAnalysis.cpp",
     "AMDGPURewriteOutArguments.cpp",
+    "AMDGPURewriteUndefForPHI.cpp",
     "AMDGPUSetWavePriority.cpp",
     "AMDGPUSubtarget.cpp",
     "AMDGPUTargetMachine.cpp",
@@ -188,6 +192,7 @@ static_library("LLVMAMDGPUCodeGen") {
     "GCNNSAReassign.cpp",
     "GCNPreRAOptimizations.cpp",
     "GCNRegPressure.cpp",
+    "GCNRewritePartialRegUses.cpp",
     "GCNSchedStrategy.cpp",
     "GCNVOPDUtils.cpp",
     "R600AsmPrinter.cpp",
@@ -229,6 +234,7 @@ static_library("LLVMAMDGPUCodeGen") {
     "SIMachineScheduler.cpp",
     "SIMemoryLegalizer.cpp",
     "SIModeRegister.cpp",
+    "SIModeRegisterDefaults.cpp",
     "SIOptimizeExecMasking.cpp",
     "SIOptimizeExecMaskingPreRA.cpp",
     "SIOptimizeVGPRLiveRange.cpp",

@@ -16,6 +16,7 @@
 #include "llvm/FileCheck/FileCheck.h"
 #include "FileCheckImpl.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/CheckedArithmetic.h"
@@ -146,13 +147,10 @@ ExpressionFormat::valueFromStringRepr(StringRef StrVal,
   bool Hex = Value == Kind::HexUpper || Value == Kind::HexLower;
   uint64_t UnsignedValue;
   bool MissingFormPrefix = AlternateForm && !StrVal.consume_front("0x");
+  (void)MissingFormPrefix;
+  assert(!MissingFormPrefix && "missing alternate form prefix");
   if (StrVal.getAsInteger(Hex ? 16 : 10, UnsignedValue))
     return ErrorDiagnostic::get(SM, StrVal, IntegerParseErrorStr);
-
-  // Error out for a missing prefix only now that we know we have an otherwise
-  // valid integer.  For example, "-0x18" is reported above instead.
-  if (MissingFormPrefix)
-    return ErrorDiagnostic::get(SM, StrVal, "missing alternate form prefix");
 
   return ExpressionValue(UnsignedValue);
 }
@@ -206,7 +204,7 @@ Expected<ExpressionValue> llvm::operator+(const ExpressionValue &LeftOperand,
   if (LeftOperand.isNegative() && RightOperand.isNegative()) {
     int64_t LeftValue = cantFail(LeftOperand.getSignedValue());
     int64_t RightValue = cantFail(RightOperand.getSignedValue());
-    Optional<int64_t> Result = checkedAdd<int64_t>(LeftValue, RightValue);
+    std::optional<int64_t> Result = checkedAdd<int64_t>(LeftValue, RightValue);
     if (!Result)
       return make_error<OverflowError>();
 
@@ -224,7 +222,7 @@ Expected<ExpressionValue> llvm::operator+(const ExpressionValue &LeftOperand,
   // Both values are positive at this point.
   uint64_t LeftValue = cantFail(LeftOperand.getUnsignedValue());
   uint64_t RightValue = cantFail(RightOperand.getUnsignedValue());
-  Optional<uint64_t> Result =
+  std::optional<uint64_t> Result =
       checkedAddUnsigned<uint64_t>(LeftValue, RightValue);
   if (!Result)
     return make_error<OverflowError>();
@@ -241,7 +239,7 @@ Expected<ExpressionValue> llvm::operator-(const ExpressionValue &LeftOperand,
     // Result <= -1 - (max int64_t) which overflows on 1- and 2-complement.
     if (RightValue > (uint64_t)std::numeric_limits<int64_t>::max())
       return make_error<OverflowError>();
-    Optional<int64_t> Result =
+    std::optional<int64_t> Result =
         checkedSub(LeftValue, static_cast<int64_t>(RightValue));
     if (!Result)
       return make_error<OverflowError>();
@@ -306,7 +304,7 @@ Expected<ExpressionValue> llvm::operator*(const ExpressionValue &LeftOperand,
   // Result will be positive and can overflow.
   uint64_t LeftValue = cantFail(LeftOperand.getUnsignedValue());
   uint64_t RightValue = cantFail(RightOperand.getUnsignedValue());
-  Optional<uint64_t> Result =
+  std::optional<uint64_t> Result =
       checkedMulUnsigned<uint64_t>(LeftValue, RightValue);
   if (!Result)
     return make_error<OverflowError>();
@@ -363,7 +361,7 @@ Expected<ExpressionValue> llvm::min(const ExpressionValue &LeftOperand,
 }
 
 Expected<ExpressionValue> NumericVariableUse::eval() const {
-  Optional<ExpressionValue> Value = Variable->getValue();
+  std::optional<ExpressionValue> Value = Variable->getValue();
   if (Value)
     return *Value;
 
@@ -480,7 +478,7 @@ char ErrorReported::ID = 0;
 
 Expected<NumericVariable *> Pattern::parseNumericVariableDefinition(
     StringRef &Expr, FileCheckPatternContext *Context,
-    Optional<size_t> LineNumber, ExpressionFormat ImplicitFormat,
+    std::optional<size_t> LineNumber, ExpressionFormat ImplicitFormat,
     const SourceMgr &SM) {
   Expected<VariableProperties> ParseVarResult = parseVariable(Expr, SM);
   if (!ParseVarResult)
@@ -493,8 +491,7 @@ Expected<NumericVariable *> Pattern::parseNumericVariableDefinition(
 
   // Detect collisions between string and numeric variables when the latter
   // is created later than the former.
-  if (Context->DefinedVariableTable.find(Name) !=
-      Context->DefinedVariableTable.end())
+  if (Context->DefinedVariableTable.contains(Name))
     return ErrorDiagnostic::get(
         SM, Name, "string variable with name '" + Name + "' already exists");
 
@@ -518,7 +515,7 @@ Expected<NumericVariable *> Pattern::parseNumericVariableDefinition(
 }
 
 Expected<std::unique_ptr<NumericVariableUse>> Pattern::parseNumericVariableUse(
-    StringRef Name, bool IsPseudo, Optional<size_t> LineNumber,
+    StringRef Name, bool IsPseudo, std::optional<size_t> LineNumber,
     FileCheckPatternContext *Context, const SourceMgr &SM) {
   if (IsPseudo && !Name.equals("@LINE"))
     return ErrorDiagnostic::get(
@@ -542,7 +539,7 @@ Expected<std::unique_ptr<NumericVariableUse>> Pattern::parseNumericVariableUse(
     Context->GlobalNumericVariableTable[Name] = NumericVariable;
   }
 
-  Optional<size_t> DefLineNumber = NumericVariable->getDefLineNumber();
+  std::optional<size_t> DefLineNumber = NumericVariable->getDefLineNumber();
   if (DefLineNumber && LineNumber && *DefLineNumber == *LineNumber)
     return ErrorDiagnostic::get(
         SM, Name,
@@ -554,7 +551,7 @@ Expected<std::unique_ptr<NumericVariableUse>> Pattern::parseNumericVariableUse(
 
 Expected<std::unique_ptr<ExpressionAST>> Pattern::parseNumericOperand(
     StringRef &Expr, AllowedOperand AO, bool MaybeInvalidConstraint,
-    Optional<size_t> LineNumber, FileCheckPatternContext *Context,
+    std::optional<size_t> LineNumber, FileCheckPatternContext *Context,
     const SourceMgr &SM) {
   if (Expr.startswith("(")) {
     if (AO != AllowedOperand::Any)
@@ -611,7 +608,7 @@ Expected<std::unique_ptr<ExpressionAST>> Pattern::parseNumericOperand(
 }
 
 Expected<std::unique_ptr<ExpressionAST>>
-Pattern::parseParenExpr(StringRef &Expr, Optional<size_t> LineNumber,
+Pattern::parseParenExpr(StringRef &Expr, std::optional<size_t> LineNumber,
                         FileCheckPatternContext *Context, const SourceMgr &SM) {
   Expr = Expr.ltrim(SpaceChars);
   assert(Expr.startswith("("));
@@ -646,7 +643,7 @@ Pattern::parseParenExpr(StringRef &Expr, Optional<size_t> LineNumber,
 Expected<std::unique_ptr<ExpressionAST>>
 Pattern::parseBinop(StringRef Expr, StringRef &RemainingExpr,
                     std::unique_ptr<ExpressionAST> LeftOp,
-                    bool IsLegacyLineExpr, Optional<size_t> LineNumber,
+                    bool IsLegacyLineExpr, std::optional<size_t> LineNumber,
                     FileCheckPatternContext *Context, const SourceMgr &SM) {
   RemainingExpr = RemainingExpr.ltrim(SpaceChars);
   if (RemainingExpr.empty())
@@ -690,19 +687,19 @@ Pattern::parseBinop(StringRef Expr, StringRef &RemainingExpr,
 
 Expected<std::unique_ptr<ExpressionAST>>
 Pattern::parseCallExpr(StringRef &Expr, StringRef FuncName,
-                       Optional<size_t> LineNumber,
+                       std::optional<size_t> LineNumber,
                        FileCheckPatternContext *Context, const SourceMgr &SM) {
   Expr = Expr.ltrim(SpaceChars);
   assert(Expr.startswith("("));
 
-  auto OptFunc = StringSwitch<Optional<binop_eval_t>>(FuncName)
+  auto OptFunc = StringSwitch<binop_eval_t>(FuncName)
                      .Case("add", operator+)
                      .Case("div", operator/)
                      .Case("max", max)
                      .Case("min", min)
                      .Case("mul", operator*)
                      .Case("sub", operator-)
-                     .Default(None);
+                     .Default(nullptr);
 
   if (!OptFunc)
     return ErrorDiagnostic::get(
@@ -765,12 +762,12 @@ Pattern::parseCallExpr(StringRef &Expr, StringRef FuncName,
 }
 
 Expected<std::unique_ptr<Expression>> Pattern::parseNumericSubstitutionBlock(
-    StringRef Expr, Optional<NumericVariable *> &DefinedNumericVariable,
-    bool IsLegacyLineExpr, Optional<size_t> LineNumber,
+    StringRef Expr, std::optional<NumericVariable *> &DefinedNumericVariable,
+    bool IsLegacyLineExpr, std::optional<size_t> LineNumber,
     FileCheckPatternContext *Context, const SourceMgr &SM) {
   std::unique_ptr<ExpressionAST> ExpressionASTPointer = nullptr;
   StringRef DefExpr = StringRef();
-  DefinedNumericVariable = None;
+  DefinedNumericVariable = std::nullopt;
   ExpressionFormat ExplicitFormat = ExpressionFormat();
   unsigned Precision = 0;
 
@@ -1072,8 +1069,7 @@ bool Pattern::parsePattern(StringRef PatternStr, StringRef Prefix,
 
           // Detect collisions between string and numeric variables when the
           // former is created later than the latter.
-          if (Context->GlobalNumericVariableTable.find(Name) !=
-              Context->GlobalNumericVariableTable.end()) {
+          if (Context->GlobalNumericVariableTable.contains(Name)) {
             SM.PrintMessage(
                 SMLoc::getFromPointer(Name.data()), SourceMgr::DK_Error,
                 "numeric variable with name '" + Name + "' already exists");
@@ -1099,7 +1095,7 @@ bool Pattern::parsePattern(StringRef PatternStr, StringRef Prefix,
 
       // Parse numeric substitution block.
       std::unique_ptr<Expression> ExpressionPointer;
-      Optional<NumericVariable *> DefinedNumericVariable;
+      std::optional<NumericVariable *> DefinedNumericVariable;
       if (IsNumBlock) {
         Expected<std::unique_ptr<Expression>> ParseResult =
             parseNumericSubstitutionBlock(MatchStr, DefinedNumericVariable,
@@ -1412,7 +1408,7 @@ void Pattern::printVariableDefs(const SourceMgr &SM,
   for (const auto &VariableDef : NumericVariableDefs) {
     VarCapture VC;
     VC.Name = VariableDef.getKey();
-    Optional<StringRef> StrValue =
+    std::optional<StringRef> StrValue =
         VariableDef.getValue().DefinedNumericVariable->getStringValue();
     if (!StrValue)
       continue;
@@ -2701,10 +2697,11 @@ Error FileCheckPatternContext::defineCmdlineVariables(
       // Now parse the definition both to check that the syntax is correct and
       // to create the necessary class instance.
       StringRef CmdlineDefExpr = CmdlineDef.substr(1);
-      Optional<NumericVariable *> DefinedNumericVariable;
+      std::optional<NumericVariable *> DefinedNumericVariable;
       Expected<std::unique_ptr<Expression>> ExpressionResult =
-          Pattern::parseNumericSubstitutionBlock(
-              CmdlineDefExpr, DefinedNumericVariable, false, None, this, SM);
+          Pattern::parseNumericSubstitutionBlock(CmdlineDefExpr,
+                                                 DefinedNumericVariable, false,
+                                                 std::nullopt, this, SM);
       if (!ExpressionResult) {
         Errs = joinErrors(std::move(Errs), ExpressionResult.takeError());
         continue;
@@ -2752,8 +2749,7 @@ Error FileCheckPatternContext::defineCmdlineVariables(
 
       // Detect collisions between string and numeric variables when the former
       // is created later than the latter.
-      if (GlobalNumericVariableTable.find(Name) !=
-          GlobalNumericVariableTable.end()) {
+      if (GlobalNumericVariableTable.contains(Name)) {
         Errs = joinErrors(std::move(Errs),
                           ErrorDiagnostic::get(SM, Name,
                                                "numeric variable with name '" +

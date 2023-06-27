@@ -103,6 +103,8 @@ void FormatTokenLexer::tryMergePreviousTokens() {
     return;
   if (tryMergeLessLess())
     return;
+  if (tryMergeGreaterGreater())
+    return;
   if (tryMergeForEach())
     return;
   if (Style.isCpp() && tryTransformTryUsageForC())
@@ -312,36 +314,32 @@ bool FormatTokenLexer::tryMergeCSharpStringLiteral() {
     return false;
 
   // Look for @"aaaaaa" or $"aaaaaa".
-  auto &String = *(Tokens.end() - 1);
-  if (!String->is(tok::string_literal))
+  const auto String = *(Tokens.end() - 1);
+  if (String->isNot(tok::string_literal))
     return false;
 
-  auto &At = *(Tokens.end() - 2);
-  if (!(At->is(tok::at) || At->TokenText == "$"))
+  auto Prefix = *(Tokens.end() - 2);
+  if (Prefix->isNot(tok::at) && Prefix->TokenText != "$")
     return false;
 
-  if (Tokens.size() > 2 && At->is(tok::at)) {
-    auto &Dollar = *(Tokens.end() - 3);
-    if (Dollar->TokenText == "$") {
-      // This looks like $@"aaaaa" so we need to combine all 3 tokens.
-      Dollar->Tok.setKind(tok::string_literal);
-      Dollar->TokenText =
-          StringRef(Dollar->TokenText.begin(),
-                    String->TokenText.end() - Dollar->TokenText.begin());
-      Dollar->ColumnWidth += (At->ColumnWidth + String->ColumnWidth);
-      Dollar->setType(TT_CSharpStringLiteral);
+  if (Tokens.size() > 2) {
+    const auto Tok = *(Tokens.end() - 3);
+    if ((Tok->TokenText == "$" && Prefix->is(tok::at)) ||
+        (Tok->is(tok::at) && Prefix->TokenText == "$")) {
+      // This looks like $@"aaa" or @$"aaa" so we need to combine all 3 tokens.
+      Tok->ColumnWidth += Prefix->ColumnWidth;
       Tokens.erase(Tokens.end() - 2);
-      Tokens.erase(Tokens.end() - 1);
-      return true;
+      Prefix = Tok;
     }
   }
 
   // Convert back into just a string_literal.
-  At->Tok.setKind(tok::string_literal);
-  At->TokenText = StringRef(At->TokenText.begin(),
-                            String->TokenText.end() - At->TokenText.begin());
-  At->ColumnWidth += String->ColumnWidth;
-  At->setType(TT_CSharpStringLiteral);
+  Prefix->Tok.setKind(tok::string_literal);
+  Prefix->TokenText =
+      StringRef(Prefix->TokenText.begin(),
+                String->TokenText.end() - Prefix->TokenText.begin());
+  Prefix->ColumnWidth += String->ColumnWidth;
+  Prefix->setType(TT_CSharpStringLiteral);
   Tokens.erase(Tokens.end() - 1);
   return true;
 }
@@ -375,9 +373,11 @@ bool FormatTokenLexer::tryMergeNullishCoalescingEqual() {
 bool FormatTokenLexer::tryMergeCSharpKeywordVariables() {
   if (Tokens.size() < 2)
     return false;
-  auto &At = *(Tokens.end() - 2);
-  auto &Keyword = *(Tokens.end() - 1);
-  if (!At->is(tok::at))
+  const auto At = *(Tokens.end() - 2);
+  if (At->isNot(tok::at))
+    return false;
+  const auto Keyword = *(Tokens.end() - 1);
+  if (Keyword->TokenText == "$")
     return false;
   if (!Keywords.isCSharpKeyword(*Keyword))
     return false;
@@ -462,18 +462,41 @@ bool FormatTokenLexer::tryMergeLessLess() {
     return false;
 
   auto X = Tokens.size() > 3 ? First[-1] : nullptr;
-  auto Y = First[2];
-  if ((X && X->is(tok::less)) || Y->is(tok::less))
+  if (X && X->is(tok::less))
     return false;
 
-  // Do not remove a whitespace between the two "<" e.g. "operator< <>".
-  if (X && X->is(tok::kw_operator) && Y->is(tok::greater))
+  auto Y = First[2];
+  if ((!X || X->isNot(tok::kw_operator)) && Y->is(tok::less))
     return false;
 
   First[0]->Tok.setKind(tok::lessless);
   First[0]->TokenText = "<<";
   First[0]->ColumnWidth += 1;
   Tokens.erase(Tokens.end() - 2);
+  return true;
+}
+
+bool FormatTokenLexer::tryMergeGreaterGreater() {
+  // Merge kw_operator,greater,greater into kw_operator,greatergreater.
+  if (Tokens.size() < 2)
+    return false;
+
+  auto First = Tokens.end() - 2;
+  if (First[0]->isNot(tok::greater) || First[1]->isNot(tok::greater))
+    return false;
+
+  // Only merge if there currently is no whitespace between the first two ">".
+  if (First[1]->hasWhitespaceBefore())
+    return false;
+
+  auto Tok = Tokens.size() > 2 ? First[-1] : nullptr;
+  if (Tok && Tok->isNot(tok::kw_operator))
+    return false;
+
+  First[0]->Tok.setKind(tok::greatergreater);
+  First[0]->TokenText = ">>";
+  First[0]->ColumnWidth += 1;
+  Tokens.erase(Tokens.end() - 1);
   return true;
 }
 
@@ -683,7 +706,7 @@ void FormatTokenLexer::handleCSharpVerbatimAndInterpolatedStrings() {
 
   bool Verbatim = false;
   bool Interpolated = false;
-  if (TokenText.startswith(R"($@")")) {
+  if (TokenText.startswith(R"($@")") || TokenText.startswith(R"(@$")")) {
     Verbatim = true;
     Interpolated = true;
   } else if (TokenText.startswith(R"(@")")) {
@@ -762,6 +785,7 @@ void FormatTokenLexer::handleTemplateStrings() {
   for (; Offset != Lex->getBuffer().end(); ++Offset) {
     if (Offset[0] == '`') {
       StateStack.pop();
+      ++Offset;
       break;
     }
     if (Offset[0] == '\\') {
@@ -770,12 +794,12 @@ void FormatTokenLexer::handleTemplateStrings() {
                Offset[1] == '{') {
       // '${' introduces an expression interpolation in the template string.
       StateStack.push(LexerState::NORMAL);
-      ++Offset;
+      Offset += 2;
       break;
     }
   }
 
-  StringRef LiteralText(TmplBegin, Offset - TmplBegin + 1);
+  StringRef LiteralText(TmplBegin, Offset - TmplBegin);
   BacktickToken->setType(TT_TemplateString);
   BacktickToken->Tok.setKind(tok::string_literal);
   BacktickToken->TokenText = LiteralText;
@@ -796,9 +820,7 @@ void FormatTokenLexer::handleTemplateStrings() {
                                       StartColumn, Style.TabWidth, Encoding);
   }
 
-  SourceLocation loc = Offset < Lex->getBuffer().end()
-                           ? Lex->getSourceLocation(Offset + 1)
-                           : SourceMgr.getLocForEndOfFile(ID);
+  SourceLocation loc = Lex->getSourceLocation(Offset);
   resetLexer(SourceMgr.getFileOffset(loc));
 }
 
@@ -1289,17 +1311,13 @@ void FormatTokenLexer::readRawToken(FormatToken &Tok) {
     Tok.Tok.setKind(tok::string_literal);
   }
 
-  if (Tok.is(tok::comment) && (Tok.TokenText == "// clang-format on" ||
-                               Tok.TokenText == "/* clang-format on */")) {
+  if (Tok.is(tok::comment) && isClangFormatOn(Tok.TokenText))
     FormattingDisabled = false;
-  }
 
   Tok.Finalized = FormattingDisabled;
 
-  if (Tok.is(tok::comment) && (Tok.TokenText == "// clang-format off" ||
-                               Tok.TokenText == "/* clang-format off */")) {
+  if (Tok.is(tok::comment) && isClangFormatOff(Tok.TokenText))
     FormattingDisabled = true;
-  }
 }
 
 void FormatTokenLexer::resetLexer(unsigned Offset) {

@@ -10,13 +10,17 @@
 #include "Config.h"
 #include "HeuristicResolver.h"
 #include "ParsedAST.h"
+#include "SourceCode.h"
+#include "clang/AST/ASTDiagnostic.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclarationName.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/Type.h"
 #include "clang/Basic/Builtins.h"
 #include "clang/Basic/SourceManager.h"
 #include "llvm/ADT/ScopeExit.h"
+#include <optional>
 
 namespace clang {
 namespace clangd {
@@ -188,16 +192,73 @@ getDesignators(const InitListExpr *Syn) {
   return Designators;
 }
 
+// Determines if any intermediate type in desugaring QualType QT is of
+// substituted template parameter type. Ignore pointer or reference wrappers.
+bool isSugaredTemplateParameter(QualType QT) {
+  static auto PeelWrappers = [](QualType QT) {
+    // Neither `PointerType` nor `ReferenceType` is considered as sugared
+    // type. Peel it.
+    QualType Next;
+    while (!(Next = QT->getPointeeType()).isNull())
+      QT = Next;
+    return QT;
+  };
+  while (true) {
+    QualType Desugared =
+        PeelWrappers(QT->getLocallyUnqualifiedSingleStepDesugaredType());
+    if (Desugared == QT)
+      break;
+    if (Desugared->getAs<SubstTemplateTypeParmType>())
+      return true;
+    QT = Desugared;
+  }
+  return false;
+}
+
+// A simple wrapper for `clang::desugarForDiagnostic` that provides optional
+// semantic.
+std::optional<QualType> desugar(ASTContext &AST, QualType QT) {
+  bool ShouldAKA = false;
+  auto Desugared = clang::desugarForDiagnostic(AST, QT, ShouldAKA);
+  if (!ShouldAKA)
+    return std::nullopt;
+  return Desugared;
+}
+
+// Apply a series of heuristic methods to determine whether or not a QualType QT
+// is suitable for desugaring (e.g. getting the real name behind the using-alias
+// name). If so, return the desugared type. Otherwise, return the unchanged
+// parameter QT.
+//
+// This could be refined further. See
+// https://github.com/clangd/clangd/issues/1298.
+QualType maybeDesugar(ASTContext &AST, QualType QT) {
+  // Prefer desugared type for name that aliases the template parameters.
+  // This can prevent things like printing opaque `: type` when accessing std
+  // containers.
+  if (isSugaredTemplateParameter(QT))
+    return desugar(AST, QT).value_or(QT);
+
+  // Prefer desugared type for `decltype(expr)` specifiers.
+  if (QT->isDecltypeType())
+    return QT.getCanonicalType();
+  if (const AutoType *AT = QT->getContainedAutoType())
+    if (!AT->getDeducedType().isNull() &&
+        AT->getDeducedType()->isDecltypeType())
+      return QT.getCanonicalType();
+
+  return QT;
+}
+
 class InlayHintVisitor : public RecursiveASTVisitor<InlayHintVisitor> {
 public:
   InlayHintVisitor(std::vector<InlayHint> &Results, ParsedAST &AST,
-                   const Config &Cfg, llvm::Optional<Range> RestrictRange)
-      : Results(Results), AST(AST.getASTContext()), Cfg(Cfg),
-        RestrictRange(std::move(RestrictRange)),
+                   const Config &Cfg, std::optional<Range> RestrictRange)
+      : Results(Results), AST(AST.getASTContext()), Tokens(AST.getTokens()),
+        Cfg(Cfg), RestrictRange(std::move(RestrictRange)),
         MainFileID(AST.getSourceManager().getMainFileID()),
         Resolver(AST.getHeuristicResolver()),
-        TypeHintPolicy(this->AST.getPrintingPolicy()),
-        StructuredBindingPolicy(this->AST.getPrintingPolicy()) {
+        TypeHintPolicy(this->AST.getPrintingPolicy()) {
     bool Invalid = false;
     llvm::StringRef Buf =
         AST.getSourceManager().getBufferData(MainFileID, &Invalid);
@@ -207,14 +268,15 @@ public:
     TypeHintPolicy.AnonymousTagLocations =
         false; // do not print lambda locations
 
-    // For structured bindings, print canonical types. This is important because
-    // for bindings that use the tuple_element protocol, the non-canonical types
-    // would be "tuple_element<I, A>::type".
-    // For "auto", we often prefer sugared types.
     // Not setting PrintCanonicalTypes for "auto" allows
     // SuppressDefaultTemplateArgs (set by default) to have an effect.
-    StructuredBindingPolicy = TypeHintPolicy;
-    StructuredBindingPolicy.PrintCanonicalTypes = true;
+  }
+
+  bool VisitTypeLoc(TypeLoc TL) {
+    if (const auto *DT = llvm::dyn_cast<DecltypeType>(TL.getType()))
+      if (QualType UT = DT->getUnderlyingType(); !UT->isDependentType())
+        addTypeHint(TL.getSourceRange(), UT, ": ");
+    return true;
   }
 
   bool VisitCXXConstructExpr(CXXConstructExpr *E) {
@@ -227,8 +289,7 @@ public:
       return true;
     }
 
-    processCall(E->getParenOrBraceRange().getBegin(), E->getConstructor(),
-                {E->getArgs(), E->getNumArgs()});
+    processCall(E->getConstructor(), {E->getArgs(), E->getNumArgs()});
     return true;
   }
 
@@ -254,7 +315,7 @@ public:
     if (!Callee)
       return true;
 
-    processCall(E->getRParenLoc(), Callee, {E->getArgs(), E->getNumArgs()});
+    processCall(Callee, {E->getArgs(), E->getNumArgs()});
     return true;
   }
 
@@ -278,11 +339,11 @@ public:
     return true;
   }
 
-  void addReturnTypeHint(FunctionDecl *D, SourceLocation Loc) {
+  void addReturnTypeHint(FunctionDecl *D, SourceRange Range) {
     auto *AT = D->getReturnType()->getContainedAutoType();
     if (!AT || AT->getDeducedType().isNull())
       return;
-    addTypeHint(Loc, D->getReturnType(), /*Prefix=*/"-> ");
+    addTypeHint(Range, D->getReturnType(), /*Prefix=*/"-> ");
   }
 
   bool VisitVarDecl(VarDecl *D) {
@@ -290,14 +351,18 @@ public:
     // but show hints for the individual bindings.
     if (auto *DD = dyn_cast<DecompositionDecl>(D)) {
       for (auto *Binding : DD->bindings()) {
-        addTypeHint(Binding->getLocation(), Binding->getType(), /*Prefix=*/": ",
-                    StructuredBindingPolicy);
+        // For structured bindings, print canonical types. This is important
+        // because for bindings that use the tuple_element protocol, the
+        // non-canonical types would be "tuple_element<I, A>::type".
+        if (auto Type = Binding->getType(); !Type.isNull())
+          addTypeHint(Binding->getLocation(), Type.getCanonicalType(),
+                      /*Prefix=*/": ");
       }
       return true;
     }
 
-    if (D->getType()->getContainedAutoType()) {
-      if (!D->getType()->isDependentType()) {
+    if (auto *AT = D->getType()->getContainedAutoType()) {
+      if (AT->isDeduced() && !D->getType()->isDependentType()) {
         // Our current approach is to place the hint on the variable
         // and accordingly print the full type
         // (e.g. for `const auto& x = 42`, print `const int&`).
@@ -375,19 +440,9 @@ public:
 private:
   using NameVec = SmallVector<StringRef, 8>;
 
-  // The purpose of Anchor is to deal with macros. It should be the call's
-  // opening or closing parenthesis or brace. (Always using the opening would
-  // make more sense but CallExpr only exposes the closing.) We heuristically
-  // assume that if this location does not come from a macro definition, then
-  // the entire argument list likely appears in the main file and can be hinted.
-  void processCall(SourceLocation Anchor, const FunctionDecl *Callee,
+  void processCall(const FunctionDecl *Callee,
                    llvm::ArrayRef<const Expr *> Args) {
     if (!Cfg.InlayHints.Parameters || Args.size() == 0 || !Callee)
-      return;
-
-    // If the anchor location comes from a macro definition, there's nowhere to
-    // put hints.
-    if (!AST.getSourceManager().getTopMacroCallerLoc(Anchor).isFileID())
       return;
 
     // The parameter name of a move or copy constructor is not very interesting.
@@ -432,7 +487,7 @@ private:
       return false;
 
     StringRef Name = getSimpleName(*Callee);
-    if (!Name.startswith_insensitive("set"))
+    if (!Name.starts_with_insensitive("set"))
       return false;
 
     // In addition to checking that the function has one parameter and its
@@ -518,8 +573,8 @@ private:
   // at the end.
   bool isPrecededByParamNameComment(const Expr *E, StringRef ParamName) {
     auto &SM = AST.getSourceManager();
-    auto ExprStartLoc = SM.getTopMacroCallerLoc(E->getBeginLoc());
-    auto Decomposed = SM.getDecomposedLoc(ExprStartLoc);
+    auto FileLoc = SM.getFileLoc(E->getBeginLoc());
+    auto Decomposed = SM.getDecomposedLoc(FileLoc);
     if (Decomposed.first != MainFileID)
       return false;
 
@@ -591,9 +646,8 @@ private:
   static const ParmVarDecl *getParamDefinition(const ParmVarDecl *P) {
     if (auto *Callee = dyn_cast<FunctionDecl>(P->getDeclContext())) {
       if (auto *Def = Callee->getDefinition()) {
-        auto I = std::distance(
-            Callee->param_begin(),
-            std::find(Callee->param_begin(), Callee->param_end(), P));
+        auto I = std::distance(Callee->param_begin(),
+                               llvm::find(Callee->parameters(), P));
         if (I < Callee->getNumParams()) {
           return Def->getParamDecl(I);
         }
@@ -637,38 +691,49 @@ private:
 #undef CHECK_KIND
     }
 
-    auto FileRange =
-        toHalfOpenFileRange(AST.getSourceManager(), AST.getLangOpts(), R);
-    if (!FileRange)
+    auto LSPRange = getHintRange(R);
+    if (!LSPRange)
       return;
-    Range LSPRange{
-        sourceLocToPosition(AST.getSourceManager(), FileRange->getBegin()),
-        sourceLocToPosition(AST.getSourceManager(), FileRange->getEnd())};
-    Position LSPPos = Side == HintSide::Left ? LSPRange.start : LSPRange.end;
+    Position LSPPos = Side == HintSide::Left ? LSPRange->start : LSPRange->end;
     if (RestrictRange &&
         (LSPPos < RestrictRange->start || !(LSPPos < RestrictRange->end)))
-      return;
-    // The hint may be in a file other than the main file (for example, a header
-    // file that was included after the preamble), do not show in that case.
-    if (!AST.getSourceManager().isWrittenInMainFile(FileRange->getBegin()))
       return;
     bool PadLeft = Prefix.consume_front(" ");
     bool PadRight = Suffix.consume_back(" ");
     Results.push_back(InlayHint{LSPPos, (Prefix + Label + Suffix).str(), Kind,
-                                PadLeft, PadRight, LSPRange});
+                                PadLeft, PadRight, *LSPRange});
+  }
+
+  // Get the range of the main file that *exactly* corresponds to R.
+  std::optional<Range> getHintRange(SourceRange R) {
+    const auto &SM = AST.getSourceManager();
+    auto Spelled = Tokens.spelledForExpanded(Tokens.expandedTokens(R));
+    // TokenBuffer will return null if e.g. R corresponds to only part of a
+    // macro expansion.
+    if (!Spelled || Spelled->empty())
+      return std::nullopt;
+    // Hint must be within the main file, not e.g. a non-preamble include.
+    if (SM.getFileID(Spelled->front().location()) != SM.getMainFileID() ||
+        SM.getFileID(Spelled->back().location()) != SM.getMainFileID())
+      return std::nullopt;
+    return Range{sourceLocToPosition(SM, Spelled->front().location()),
+                 sourceLocToPosition(SM, Spelled->back().endLocation())};
   }
 
   void addTypeHint(SourceRange R, QualType T, llvm::StringRef Prefix) {
-    addTypeHint(R, T, Prefix, TypeHintPolicy);
-  }
-
-  void addTypeHint(SourceRange R, QualType T, llvm::StringRef Prefix,
-                   const PrintingPolicy &Policy) {
     if (!Cfg.InlayHints.DeducedTypes || T.isNull())
       return;
 
-    std::string TypeName = T.getAsString(Policy);
-    if (TypeName.length() < TypeNameLimit)
+    // The sugared type is more useful in some cases, and the canonical
+    // type in other cases.
+    auto Desugared = maybeDesugar(AST, T);
+    std::string TypeName = Desugared.getAsString(TypeHintPolicy);
+    if (T != Desugared && !shouldPrintTypeHint(TypeName)) {
+      // If the desugared type is too long to display, fallback to the sugared
+      // type.
+      TypeName = T.getAsString(TypeHintPolicy);
+    }
+    if (shouldPrintTypeHint(TypeName))
       addInlayHint(R, HintSide::Right, InlayHintKind::Type, Prefix, TypeName,
                    /*Suffix=*/"");
   }
@@ -678,29 +743,26 @@ private:
                  /*Prefix=*/"", Text, /*Suffix=*/"=");
   }
 
+  bool shouldPrintTypeHint(llvm::StringRef TypeName) const noexcept {
+    return Cfg.InlayHints.TypeNameLimit == 0 ||
+           TypeName.size() < Cfg.InlayHints.TypeNameLimit;
+  }
+
   std::vector<InlayHint> &Results;
   ASTContext &AST;
+  const syntax::TokenBuffer &Tokens;
   const Config &Cfg;
-  llvm::Optional<Range> RestrictRange;
+  std::optional<Range> RestrictRange;
   FileID MainFileID;
   StringRef MainFileBuf;
   const HeuristicResolver *Resolver;
-  // We want to suppress default template arguments, but otherwise print
-  // canonical types. Unfortunately, they're conflicting policies so we can't
-  // have both. For regular types, suppressing template arguments is more
-  // important, whereas printing canonical types is crucial for structured
-  // bindings, so we use two separate policies. (See the constructor where
-  // the policies are initialized for more details.)
   PrintingPolicy TypeHintPolicy;
-  PrintingPolicy StructuredBindingPolicy;
-
-  static const size_t TypeNameLimit = 32;
 };
 
 } // namespace
 
 std::vector<InlayHint> inlayHints(ParsedAST &AST,
-                                  llvm::Optional<Range> RestrictRange) {
+                                  std::optional<Range> RestrictRange) {
   std::vector<InlayHint> Results;
   const auto &Cfg = Config::current();
   if (!Cfg.InlayHints.Enabled)

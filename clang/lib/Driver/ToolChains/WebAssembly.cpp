@@ -101,12 +101,15 @@ void wasm::Linker::ConstructJob(Compilation &C, const JobAction &JA,
           << CM << A->getOption().getName();
     }
   }
-  if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nostartfiles))
+  if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nostartfiles, options::OPT_shared))
     CmdArgs.push_back(Args.MakeArgString(ToolChain.GetFilePath(Crt1)));
   if (Entry) {
     CmdArgs.push_back(Args.MakeArgString("--entry"));
     CmdArgs.push_back(Args.MakeArgString(Entry));
   }
+
+  if (Args.hasArg(options::OPT_shared))
+    CmdArgs.push_back(Args.MakeArgString("-shared"));
 
   AddLinkerInputs(ToolChain, Inputs, Args, CmdArgs, JA);
 
@@ -424,8 +427,8 @@ void WebAssembly::AddClangSystemIncludeArgs(const ArgList &DriverArgs,
 void WebAssembly::AddClangCXXStdlibIncludeArgs(const ArgList &DriverArgs,
                                                ArgStringList &CC1Args) const {
 
-  if (DriverArgs.hasArg(options::OPT_nostdlibinc) ||
-      DriverArgs.hasArg(options::OPT_nostdincxx))
+  if (DriverArgs.hasArg(options::OPT_nostdlibinc, options::OPT_nostdinc,
+                        options::OPT_nostdincxx))
     return;
 
   switch (GetCXXStdlibType(DriverArgs)) {
@@ -459,6 +462,9 @@ SanitizerMask WebAssembly::getSupportedSanitizers() const {
   if (getTriple().isOSEmscripten()) {
     Res |= SanitizerKind::Vptr | SanitizerKind::Leak | SanitizerKind::Address;
   }
+  // -fsanitize=function places two words before the function label, which are
+  // -unsupported.
+  Res &= ~SanitizerKind::Function;
   return Res;
 }
 

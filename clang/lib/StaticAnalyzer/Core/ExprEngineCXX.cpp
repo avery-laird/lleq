@@ -10,15 +10,17 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "clang/StaticAnalyzer/Core/PathSensitive/ExprEngine.h"
-#include "clang/Analysis/ConstructionContext.h"
 #include "clang/AST/DeclCXX.h"
-#include "clang/AST/StmtCXX.h"
 #include "clang/AST/ParentMap.h"
+#include "clang/AST/StmtCXX.h"
+#include "clang/Analysis/ConstructionContext.h"
 #include "clang/Basic/PrettyStackTrace.h"
 #include "clang/StaticAnalyzer/Core/CheckerManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/AnalysisManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ExprEngine.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SVals.h"
+#include <optional>
 
 using namespace clang;
 using namespace ento;
@@ -74,7 +76,7 @@ void ExprEngine::performTrivialCopy(NodeBuilder &Bldr, ExplodedNode *Pred,
 
   // If the value being copied is not unknown, load from its location to get
   // an aggregate rvalue.
-  if (Optional<Loc> L = V.getAs<Loc>())
+  if (std::optional<Loc> L = V.getAs<Loc>())
     V = Pred->getState()->getSVal(*L);
   else
     assert(V.isUnknownOrUndef());
@@ -111,9 +113,15 @@ SVal ExprEngine::makeElementRegion(ProgramStateRef State, SVal LValue,
   return LValue;
 }
 
+// In case when the prvalue is returned from the function (kind is one of
+// SimpleReturnedValueKind, CXX17ElidedCopyReturnedValueKind), then
+// it's materialization happens in context of the caller.
+// We pass BldrCtx explicitly, as currBldrCtx always refers to callee's context.
 SVal ExprEngine::computeObjectUnderConstruction(
-    const Expr *E, ProgramStateRef State, const LocationContext *LCtx,
-    const ConstructionContext *CC, EvalCallOptions &CallOpts, unsigned Idx) {
+    const Expr *E, ProgramStateRef State, const NodeBuilderContext *BldrCtx,
+    const LocationContext *LCtx, const ConstructionContext *CC,
+    EvalCallOptions &CallOpts, unsigned Idx) {
+
   SValBuilder &SVB = getSValBuilder();
   MemRegionManager &MRMgr = SVB.getRegionManager();
   ASTContext &ACtx = SVB.getContext();
@@ -210,8 +218,11 @@ SVal ExprEngine::computeObjectUnderConstruction(
           CallerLCtx = CallerLCtx->getParent();
           assert(!isa<BlockInvocationContext>(CallerLCtx));
         }
+
+        NodeBuilderContext CallerBldrCtx(getCoreEngine(),
+                                         SFC->getCallSiteBlock(), CallerLCtx);
         return computeObjectUnderConstruction(
-            cast<Expr>(SFC->getCallSite()), State, CallerLCtx,
+            cast<Expr>(SFC->getCallSite()), State, &CallerBldrCtx, CallerLCtx,
             RTC->getConstructionContext(), CallOpts);
       } else {
         // We are on the top frame of the analysis. We do not know where is the
@@ -251,7 +262,7 @@ SVal ExprEngine::computeObjectUnderConstruction(
       EvalCallOptions PreElideCallOpts = CallOpts;
 
       SVal V = computeObjectUnderConstruction(
-          TCC->getConstructorAfterElision(), State, LCtx,
+          TCC->getConstructorAfterElision(), State, BldrCtx, LCtx,
           TCC->getConstructionContextAfterElision(), CallOpts);
 
       // FIXME: This definition of "copy elision has not failed" is unreliable.
@@ -317,13 +328,13 @@ SVal ExprEngine::computeObjectUnderConstruction(
       unsigned Idx = ACC->getIndex();
 
       CallEventManager &CEMgr = getStateManager().getCallEventManager();
-      auto getArgLoc = [&](CallEventRef<> Caller) -> Optional<SVal> {
+      auto getArgLoc = [&](CallEventRef<> Caller) -> std::optional<SVal> {
         const LocationContext *FutureSFC =
-            Caller->getCalleeStackFrame(currBldrCtx->blockCount());
+            Caller->getCalleeStackFrame(BldrCtx->blockCount());
         // Return early if we are unable to reliably foresee
         // the future stack frame.
         if (!FutureSFC)
-          return None;
+          return std::nullopt;
 
         // This should be equivalent to Caller->getDecl() for now, but
         // FutureSFC->getDecl() is likely to support better stuff (like
@@ -332,37 +343,39 @@ SVal ExprEngine::computeObjectUnderConstruction(
 
         // FIXME: Support for variadic arguments is not implemented here yet.
         if (CallEvent::isVariadic(CalleeD))
-          return None;
+          return std::nullopt;
 
         // Operator arguments do not correspond to operator parameters
         // because this-argument is implemented as a normal argument in
         // operator call expressions but not in operator declarations.
         const TypedValueRegion *TVR = Caller->getParameterLocation(
-            *Caller->getAdjustedParameterIndex(Idx), currBldrCtx->blockCount());
+            *Caller->getAdjustedParameterIndex(Idx), BldrCtx->blockCount());
         if (!TVR)
-          return None;
+          return std::nullopt;
 
         return loc::MemRegionVal(TVR);
       };
 
       if (const auto *CE = dyn_cast<CallExpr>(E)) {
-        CallEventRef<> Caller = CEMgr.getSimpleCall(CE, State, LCtx);
-        if (Optional<SVal> V = getArgLoc(Caller))
+        CallEventRef<> Caller =
+            CEMgr.getSimpleCall(CE, State, LCtx, getCFGElementRef());
+        if (std::optional<SVal> V = getArgLoc(Caller))
           return *V;
         else
           break;
       } else if (const auto *CCE = dyn_cast<CXXConstructExpr>(E)) {
         // Don't bother figuring out the target region for the future
         // constructor because we won't need it.
-        CallEventRef<> Caller =
-            CEMgr.getCXXConstructorCall(CCE, /*Target=*/nullptr, State, LCtx);
-        if (Optional<SVal> V = getArgLoc(Caller))
+        CallEventRef<> Caller = CEMgr.getCXXConstructorCall(
+            CCE, /*Target=*/nullptr, State, LCtx, getCFGElementRef());
+        if (std::optional<SVal> V = getArgLoc(Caller))
           return *V;
         else
           break;
       } else if (const auto *ME = dyn_cast<ObjCMessageExpr>(E)) {
-        CallEventRef<> Caller = CEMgr.getObjCMethodCall(ME, State, LCtx);
-        if (Optional<SVal> V = getArgLoc(Caller))
+        CallEventRef<> Caller =
+            CEMgr.getObjCMethodCall(ME, State, LCtx, getCFGElementRef());
+        if (std::optional<SVal> V = getArgLoc(Caller))
           return *V;
         else
           break;
@@ -573,18 +586,18 @@ void ExprEngine::handleConstructor(const Expr *E,
   SVal Target = UnknownVal();
 
   if (CE) {
-    if (Optional<SVal> ElidedTarget =
+    if (std::optional<SVal> ElidedTarget =
             getObjectUnderConstruction(State, CE, LCtx)) {
-      // We've previously modeled an elidable constructor by pretending that it
-      // in fact constructs into the correct target. This constructor can
-      // therefore be skipped.
-      Target = *ElidedTarget;
-      StmtNodeBuilder Bldr(Pred, destNodes, *currBldrCtx);
-      State = finishObjectConstruction(State, CE, LCtx);
-      if (auto L = Target.getAs<Loc>())
-        State = State->BindExpr(CE, LCtx, State->getSVal(*L, CE->getType()));
-      Bldr.generateNode(CE, Pred, State);
-      return;
+        // We've previously modeled an elidable constructor by pretending that
+        // it in fact constructs into the correct target. This constructor can
+        // therefore be skipped.
+        Target = *ElidedTarget;
+        StmtNodeBuilder Bldr(Pred, destNodes, *currBldrCtx);
+        State = finishObjectConstruction(State, CE, LCtx);
+        if (auto L = Target.getAs<Loc>())
+          State = State->BindExpr(CE, LCtx, State->getSVal(*L, CE->getType()));
+        Bldr.generateNode(CE, Pred, State);
+        return;
     }
   }
 
@@ -643,8 +656,8 @@ void ExprEngine::handleConstructor(const Expr *E,
     }
 
     // The target region is found from construction context.
-    std::tie(State, Target) =
-        handleConstructionContext(CE, State, LCtx, CC, CallOpts, Idx);
+    std::tie(State, Target) = handleConstructionContext(
+        CE, State, currBldrCtx, LCtx, CC, CallOpts, Idx);
     break;
   }
   case CXXConstructExpr::CK_VirtualBase: {
@@ -715,9 +728,9 @@ void ExprEngine::handleConstructor(const Expr *E,
   CallEventManager &CEMgr = getStateManager().getCallEventManager();
   CallEventRef<> Call =
       CIE ? (CallEventRef<>)CEMgr.getCXXInheritedConstructorCall(
-                CIE, TargetRegion, State, LCtx)
+                CIE, TargetRegion, State, LCtx, getCFGElementRef())
           : (CallEventRef<>)CEMgr.getCXXConstructorCall(
-                CE, TargetRegion, State, LCtx);
+                CE, TargetRegion, State, LCtx, getCFGElementRef());
 
   ExplodedNodeSet DstPreVisit;
   getCheckerManager().runCheckersForPreStmt(DstPreVisit, Pred, E, *this);
@@ -858,7 +871,8 @@ void ExprEngine::VisitCXXDestructor(QualType ObjectType,
     // it would interrupt the analysis instead.
     static SimpleProgramPointTag T("ExprEngine", "SkipInvalidDestructor");
     // FIXME: PostImplicitCall with a null decl may crash elsewhere anyway.
-    PostImplicitCall PP(/*Decl=*/nullptr, S->getEndLoc(), LCtx, &T);
+    PostImplicitCall PP(/*Decl=*/nullptr, S->getEndLoc(), LCtx,
+                        getCFGElementRef(), &T);
     NodeBuilder Bldr(Pred, Dst, *currBldrCtx);
     Bldr.generateNode(PP, Pred->getState(), Pred);
     return;
@@ -883,8 +897,8 @@ void ExprEngine::VisitCXXDestructor(QualType ObjectType,
   }
 
   CallEventManager &CEMgr = getStateManager().getCallEventManager();
-  CallEventRef<CXXDestructorCall> Call =
-      CEMgr.getCXXDestructorCall(DtorDecl, S, Dest, IsBaseDtor, State, LCtx);
+  CallEventRef<CXXDestructorCall> Call = CEMgr.getCXXDestructorCall(
+      DtorDecl, S, Dest, IsBaseDtor, State, LCtx, getCFGElementRef());
 
   PrettyStackTraceLoc CrashInfo(getContext().getSourceManager(),
                                 Call->getSourceRange().getBegin(),
@@ -914,7 +928,7 @@ void ExprEngine::VisitCXXNewAllocatorCall(const CXXNewExpr *CNE,
                                 "Error evaluating New Allocator Call");
   CallEventManager &CEMgr = getStateManager().getCallEventManager();
   CallEventRef<CXXAllocatorCall> Call =
-    CEMgr.getCXXAllocatorCall(CNE, State, LCtx);
+      CEMgr.getCXXAllocatorCall(CNE, State, LCtx, getCFGElementRef());
 
   ExplodedNodeSet DstPreCall;
   getCheckerManager().runCheckersForPreCall(DstPreCall, Pred,
@@ -944,6 +958,11 @@ void ExprEngine::VisitCXXNewAllocatorCall(const CXXNewExpr *CNE,
     // skip it for now.
     ProgramStateRef State = I->getState();
     SVal RetVal = State->getSVal(CNE, LCtx);
+    // [basic.stc.dynamic.allocation] (on the return value of an allocation
+    // function):
+    // "The order, contiguity, and initial value of storage allocated by
+    // successive calls to an allocation function are unspecified."
+    State = State->bindDefaultInitial(RetVal, UndefinedVal{}, LCtx);
 
     // If this allocation function is not declared as non-throwing, failures
     // /must/ be signalled by exceptions, and thus the return value will never
@@ -1007,7 +1026,7 @@ void ExprEngine::VisitCXXNewExpr(const CXXNewExpr *CNE, ExplodedNode *Pred,
 
   CallEventManager &CEMgr = getStateManager().getCallEventManager();
   CallEventRef<CXXAllocatorCall> Call =
-    CEMgr.getCXXAllocatorCall(CNE, State, LCtx);
+      CEMgr.getCXXAllocatorCall(CNE, State, LCtx, getCFGElementRef());
 
   if (!AMgr.getAnalyzerOptions().MayInlineCXXAllocator) {
     // Invalidate placement args.
@@ -1108,7 +1127,7 @@ void ExprEngine::VisitCXXDeleteExpr(const CXXDeleteExpr *CDE,
 
   CallEventManager &CEMgr = getStateManager().getCallEventManager();
   CallEventRef<CXXDeallocatorCall> Call = CEMgr.getCXXDeallocatorCall(
-      CDE, Pred->getState(), Pred->getLocationContext());
+      CDE, Pred->getState(), Pred->getLocationContext(), getCFGElementRef());
 
   ExplodedNodeSet DstPreCall;
   getCheckerManager().runCheckersForPreCall(DstPreCall, Pred, *Call, *this);

@@ -30,7 +30,7 @@ def fold_global_offset : GICombineRule<
   (defs root:$root, fold_global_offset_matchdata:$matchinfo),
   (match (wip_match_opcode G_GLOBAL_VALUE):$root,
           [{ return matchFoldGlobalOffset(*${root}, MRI, ${matchinfo}); }]),
-  (apply [{  return applyFoldGlobalOffset(*${root}, MRI, B, Observer, ${matchinfo});}])
+  (apply [{ applyFoldGlobalOffset(*${root}, MRI, B, Observer, ${matchinfo});}])
 >;
 
 def AArch64PreLegalizerCombinerHelper: GICombinerHelper<
@@ -101,7 +101,7 @@ def shuf_to_ins: GICombineRule <
   (defs root:$root, shuf_to_ins_matchdata:$matchinfo),
   (match (wip_match_opcode G_SHUFFLE_VECTOR):$root,
          [{ return matchINS(*${root}, MRI, ${matchinfo}); }]),
-  (apply [{ return applyINS(*${root}, MRI, B, ${matchinfo}); }])
+  (apply [{ applyINS(*${root}, MRI, B, ${matchinfo}); }])
 >;
 
 def vashr_vlshr_imm_matchdata : GIDefMatchData<"int64_t">;
@@ -163,7 +163,7 @@ def build_vector_to_dup : GICombineRule<
   (defs root:$root),
   (match (wip_match_opcode G_BUILD_VECTOR):$root,
           [{ return matchBuildVectorToDup(*${root}, MRI); }]),
-  (apply [{ return applyBuildVectorToDup(*${root}, MRI, B); }])
+  (apply [{ applyBuildVectorToDup(*${root}, MRI, B); }])
 >;
 
 def build_vector_lowering : GICombineGroup<[build_vector_to_dup]>;
@@ -203,6 +203,13 @@ def split_store_zero_128 : GICombineRule<
   (apply [{ applySplitStoreZero128(*${d}, MRI, B, Observer); }])
 >;
 
+def vector_sext_inreg_to_shift : GICombineRule<
+  (defs root:$d),
+  (match (wip_match_opcode G_SEXT_INREG):$d,
+          [{ return matchVectorSextInReg(*${d}, MRI); }]),
+  (apply [{ applyVectorSextInReg(*${d}, MRI, B, Observer); }])
+>;
+
 // Post-legalization combines which should happen at all optimization levels.
 // (E.g. ones that facilitate matching for the selector) For example, matching
 // pseudos.
@@ -210,7 +217,8 @@ def AArch64PostLegalizerLoweringHelper
     : GICombinerHelper<"AArch64GenPostLegalizerLoweringHelper",
                        [shuffle_vector_lowering, vashr_vlshr_imm,
                         icmp_lowering, build_vector_lowering,
-                        lower_vector_fcmp, form_truncstore]> {
+                        lower_vector_fcmp, form_truncstore,
+                        vector_sext_inreg_to_shift]> {
   let DisableRuleOption = "aarch64postlegalizerlowering-disable-rule";
 }
 
@@ -228,6 +236,7 @@ def AArch64PostLegalizerCombinerHelper
                         select_combines, fold_merge_to_zext,
                         constant_fold, identity_combines,
                         ptr_add_immed_chain, overlapping_and,
-                        split_store_zero_128, undef_combines]> {
+                        split_store_zero_128, undef_combines,
+                        select_to_minmax]> {
   let DisableRuleOption = "aarch64postlegalizercombiner-disable-rule";
 }

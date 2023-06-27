@@ -21,7 +21,7 @@
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/TargetParser.h"
+#include "llvm/TargetParser/TargetParser.h"
 
 using namespace clang::driver;
 using namespace clang::driver::toolchains;
@@ -108,7 +108,12 @@ void AMDGCN::Linker::constructLldCommand(Compilation &C, const JobAction &JA,
                                          const llvm::opt::ArgList &Args) const {
   // Construct lld command.
   // The output from ld.lld is an HSA code object file.
-  ArgStringList LldArgs{"-flavor", "gnu", "--no-undefined", "-shared",
+  ArgStringList LldArgs{"-flavor",
+                        "gnu",
+                        "-m",
+                        "elf64_amdgpu",
+                        "--no-undefined",
+                        "-shared",
                         "-plugin-opt=-amdgpu-internalize-symbols"};
 
   auto &TC = getToolChain();
@@ -147,8 +152,22 @@ void AMDGCN::Linker::constructLldCommand(Compilation &C, const JobAction &JA,
 
   addLinkerCompressDebugSectionsOption(TC, Args, LldArgs);
 
-  for (auto *Arg : Args.filtered(options::OPT_Xoffload_linker))
+  // Given that host and device linking happen in separate processes, the device
+  // linker doesn't always have the visibility as to which device symbols are
+  // needed by a program, especially for the device symbol dependencies that are
+  // introduced through the host symbol resolution.
+  // For example: host_A() (A.obj) --> host_B(B.obj) --> device_kernel_B()
+  // (B.obj) In this case, the device linker doesn't know that A.obj actually
+  // depends on the kernel functions in B.obj.  When linking to static device
+  // library, the device linker may drop some of the device global symbols if
+  // they aren't referenced.  As a workaround, we are adding to the
+  // --whole-archive flag such that all global symbols would be linked in.
+  LldArgs.push_back("--whole-archive");
+
+  for (auto *Arg : Args.filtered(options::OPT_Xoffload_linker)) {
     LldArgs.push_back(Arg->getValue(1));
+    Arg->claim();
+  }
 
   LldArgs.append({"-o", Output.getFilename()});
   for (auto Input : Inputs)
@@ -161,6 +180,8 @@ void AMDGCN::Linker::constructLldCommand(Compilation &C, const JobAction &JA,
                              TargetID,
                              /*IsBitCodeSDL=*/true,
                              /*PostClangLink=*/false);
+
+  LldArgs.push_back("--no-whole-archive");
 
   const char *Lld = Args.MakeArgString(getToolChain().GetProgramPath("lld"));
   C.addCommand(std::make_unique<Command>(JA, *this, ResponseFileSupport::None(),
@@ -232,7 +253,7 @@ void HIPAMDToolChain::addClangTargetOptions(
       DriverArgs.getLastArgValue(options::OPT_gpu_max_threads_per_block_EQ);
   if (!MaxThreadsPerBlock.empty()) {
     std::string ArgStr =
-        std::string("--gpu-max-threads-per-block=") + MaxThreadsPerBlock.str();
+        (Twine("--gpu-max-threads-per-block=") + MaxThreadsPerBlock).str();
     CC1Args.push_back(DriverArgs.MakeArgStringRef(ArgStr));
   }
 
@@ -246,7 +267,7 @@ void HIPAMDToolChain::addClangTargetOptions(
     CC1Args.push_back("-fapply-global-visibility-to-externs");
   }
 
-  for (auto BCFile : getHIPDeviceLibs(DriverArgs)) {
+  for (auto BCFile : getDeviceLibs(DriverArgs)) {
     CC1Args.push_back(BCFile.ShouldInternalize ? "-mlink-builtin-bitcode"
                                                : "-mlink-bitcode-file");
     CC1Args.push_back(DriverArgs.MakeArgString(BCFile.Path));
@@ -265,8 +286,7 @@ HIPAMDToolChain::TranslateArgs(const llvm::opt::DerivedArgList &Args,
   const OptTable &Opts = getDriver().getOpts();
 
   for (Arg *A : Args) {
-    if (!shouldSkipArgument(A) &&
-        !shouldSkipSanitizeOption(*this, Args, BoundArch, A))
+    if (!shouldSkipSanitizeOption(*this, Args, BoundArch, A))
       DAL->append(A);
   }
 
@@ -310,7 +330,7 @@ void HIPAMDToolChain::AddIAMCUIncludeArgs(const ArgList &Args,
 
 void HIPAMDToolChain::AddHIPIncludeArgs(const ArgList &DriverArgs,
                                         ArgStringList &CC1Args) const {
-  RocmInstallation.AddHIPIncludeArgs(DriverArgs, CC1Args);
+  RocmInstallation->AddHIPIncludeArgs(DriverArgs, CC1Args);
 }
 
 SanitizerMask HIPAMDToolChain::getSupportedSanitizers() const {
@@ -332,14 +352,14 @@ VersionTuple HIPAMDToolChain::computeMSVCVersion(const Driver *D,
 }
 
 llvm::SmallVector<ToolChain::BitCodeLibraryInfo, 12>
-HIPAMDToolChain::getHIPDeviceLibs(const llvm::opt::ArgList &DriverArgs) const {
+HIPAMDToolChain::getDeviceLibs(const llvm::opt::ArgList &DriverArgs) const {
   llvm::SmallVector<BitCodeLibraryInfo, 12> BCLibs;
   if (DriverArgs.hasArg(options::OPT_nogpulib))
     return {};
   ArgStringList LibraryPaths;
 
   // Find in --hip-device-lib-path and HIP_LIBRARY_PATH.
-  for (auto Path : RocmInstallation.getRocmDeviceLibPathArg())
+  for (StringRef Path : RocmInstallation->getRocmDeviceLibPathArg())
     LibraryPaths.push_back(DriverArgs.MakeArgString(Path));
 
   addDirectoryList(DriverArgs, LibraryPaths, "", "HIP_DEVICE_LIB_PATH");
@@ -349,7 +369,7 @@ HIPAMDToolChain::getHIPDeviceLibs(const llvm::opt::ArgList &DriverArgs) const {
   if (!BCLibArgs.empty()) {
     llvm::for_each(BCLibArgs, [&](StringRef BCName) {
       StringRef FullName;
-      for (std::string LibraryPath : LibraryPaths) {
+      for (StringRef LibraryPath : LibraryPaths) {
         SmallString<128> Path(LibraryPath);
         llvm::sys::path::append(Path, BCName);
         FullName = Path;
@@ -361,7 +381,7 @@ HIPAMDToolChain::getHIPDeviceLibs(const llvm::opt::ArgList &DriverArgs) const {
       getDriver().Diag(diag::err_drv_no_such_file) << BCName;
     });
   } else {
-    if (!RocmInstallation.hasDeviceLibrary()) {
+    if (!RocmInstallation->hasDeviceLibrary()) {
       getDriver().Diag(diag::err_drv_no_rocm_device_lib) << 0;
       return {};
     }
@@ -372,7 +392,7 @@ HIPAMDToolChain::getHIPDeviceLibs(const llvm::opt::ArgList &DriverArgs) const {
     if (DriverArgs.hasFlag(options::OPT_fgpu_sanitize,
                            options::OPT_fno_gpu_sanitize, true) &&
         getSanitizerArgs(DriverArgs).needsAsanRt()) {
-      auto AsanRTL = RocmInstallation.getAsanRTLPath();
+      auto AsanRTL = RocmInstallation->getAsanRTLPath();
       if (AsanRTL.empty()) {
         unsigned DiagID = getDriver().getDiags().getCustomDiagID(
             DiagnosticsEngine::Error,
@@ -382,15 +402,15 @@ HIPAMDToolChain::getHIPDeviceLibs(const llvm::opt::ArgList &DriverArgs) const {
         getDriver().Diag(DiagID);
         return {};
       } else
-        BCLibs.push_back({AsanRTL.str(), /*ShouldInternalize=*/false});
+        BCLibs.emplace_back(AsanRTL, /*ShouldInternalize=*/false);
     }
 
     // Add the HIP specific bitcode library.
-    BCLibs.push_back(RocmInstallation.getHIPPath());
+    BCLibs.push_back(RocmInstallation->getHIPPath());
 
     // Add common device libraries like ocml etc.
-    for (auto N : getCommonDeviceLibNames(DriverArgs, GpuArch.str()))
-      BCLibs.push_back(StringRef(N));
+    for (StringRef N : getCommonDeviceLibNames(DriverArgs, GpuArch.str()))
+      BCLibs.emplace_back(N);
 
     // Add instrument lib.
     auto InstLib =

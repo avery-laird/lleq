@@ -43,7 +43,7 @@ static LogicalResult replaceWithConstant(DataFlowSolver &solver,
                                          OpBuilder &builder,
                                          OperationFolder &folder, Value value) {
   auto *lattice = solver.lookupState<Lattice<ConstantValue>>(value);
-  if (!lattice || lattice->isUninitialized())
+  if (!lattice || lattice->getValue().isUninitialized())
     return failure();
   const ConstantValue &latticeValue = lattice->getValue();
   if (!latticeValue.getConstantValue())
@@ -51,9 +51,9 @@ static LogicalResult replaceWithConstant(DataFlowSolver &solver,
 
   // Attempt to materialize a constant for the given value.
   Dialect *dialect = latticeValue.getConstantDialect();
-  Value constant = folder.getOrCreateConstant(builder, dialect,
-                                              latticeValue.getConstantValue(),
-                                              value.getType(), value.getLoc());
+  Value constant = folder.getOrCreateConstant(
+      builder.getInsertionBlock(), dialect, latticeValue.getConstantValue(),
+      value.getType(), value.getLoc());
   if (!constant)
     return failure();
 

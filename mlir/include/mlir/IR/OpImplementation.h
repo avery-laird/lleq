@@ -18,6 +18,7 @@
 #include "mlir/IR/OpDefinition.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/SMLoc.h"
+#include <optional>
 
 namespace mlir {
 class AsmParsedResourceEntry;
@@ -140,7 +141,16 @@ public:
   void printStrippedAttrOrType(AttrOrType attrOrType) {
     if (succeeded(printAlias(attrOrType)))
       return;
+
+    raw_ostream &os = getStream();
+    uint64_t posPrior = os.tell();
     attrOrType.print(*this);
+    if (posPrior != os.tell())
+      return;
+
+    // Fallback to printing with prefix if the above failed to write anything
+    // to the output stream.
+    *this << attrOrType;
   }
 
   /// Print the provided array of attributes or types in the context of an
@@ -181,7 +191,7 @@ public:
   virtual void printSymbolName(StringRef symbolRef);
 
   /// Print a handle to the given dialect resource.
-  void printResourceHandle(const AsmDialectResourceHandle &resource);
+  virtual void printResourceHandle(const AsmDialectResourceHandle &resource);
 
   /// Print an optional arrow followed by a type list.
   template <typename TypeRange>
@@ -194,7 +204,7 @@ public:
     auto &os = getStream() << " -> ";
 
     bool wrapped = !llvm::hasSingleElement(types) ||
-                   (*types.begin()).template isa<FunctionType>();
+                   llvm::isa<FunctionType>((*types.begin()));
     if (wrapped)
       os << '(';
     llvm::interleaveComma(types, *this);
@@ -215,7 +225,7 @@ public:
 protected:
   /// Initialize the printer with no internal implementation. In this case, all
   /// virtual methods of this class must be overriden.
-  AsmPrinter() {}
+  AsmPrinter() = default;
 
 private:
   AsmPrinter(const AsmPrinter &) = delete;
@@ -301,6 +311,7 @@ operator<<(AsmPrinterT &p, const ValueTypeRange<ValueRangeT> &types) {
   llvm::interleaveComma(types, p);
   return p;
 }
+
 template <typename AsmPrinterT>
 inline std::enable_if_t<std::is_base_of<AsmPrinter, AsmPrinterT>::value,
                         AsmPrinterT &>
@@ -308,6 +319,18 @@ operator<<(AsmPrinterT &p, const TypeRange &types) {
   llvm::interleaveComma(types, p);
   return p;
 }
+
+// Prevent matching the TypeRange version above for ValueRange
+// printing through base AsmPrinter. This is needed so that the
+// ValueRange printing behaviour does not change from printing
+// the SSA values to printing the types for the operands when
+// using AsmPrinter instead of OpAsmPrinter.
+template <typename AsmPrinterT, typename T>
+inline std::enable_if_t<std::is_same<AsmPrinter, AsmPrinterT>::value &&
+                            std::is_convertible<T &, ValueRange>::value,
+                        AsmPrinterT &>
+operator<<(AsmPrinterT &p, const T &other) = delete;
+
 template <typename AsmPrinterT, typename ElementT>
 inline std::enable_if_t<std::is_base_of<AsmPrinter, AsmPrinterT>::value,
                         AsmPrinterT &>
@@ -327,9 +350,18 @@ public:
   using AsmPrinter::AsmPrinter;
   ~OpAsmPrinter() override;
 
+  /// Print a loc(...) specifier if printing debug info is enabled.
+  virtual void printOptionalLocationSpecifier(Location loc) = 0;
+
   /// Print a newline and indent the printer to the start of the current
   /// operation.
   virtual void printNewline() = 0;
+
+  /// Increase indentation.
+  virtual void increaseIndent() = 0;
+
+  /// Decrease indentation.
+  virtual void decreaseIndent() = 0;
 
   /// Print a block argument in the usual format of:
   ///   %ssaName : type {attr1=42} loc("here")
@@ -353,13 +385,8 @@ public:
   /// Print a comma separated list of operands.
   template <typename IteratorType>
   void printOperands(IteratorType it, IteratorType end) {
-    if (it == end)
-      return;
-    printOperand(*it);
-    for (++it; it != end; ++it) {
-      getStream() << ", ";
-      printOperand(*it);
-    }
+    llvm::interleaveComma(llvm::make_range(it, end), getStream(),
+                          [this](Value value) { printOperand(value); });
   }
 
   /// Print the given successor.
@@ -381,6 +408,10 @@ public:
   virtual void
   printOptionalAttrDictWithKeyword(ArrayRef<NamedAttribute> attrs,
                                    ArrayRef<StringRef> elidedAttrs = {}) = 0;
+
+  /// Prints the entire operation with the custom assembly form, if available,
+  /// or the generic assembly form, otherwise.
+  virtual void printCustomOrGenericOp(Operation *op) = 0;
 
   /// Print the entire operation with the default generic assembly form.
   /// If `printOpName` is true, then the operation name is printed (the default)
@@ -569,6 +600,9 @@ public:
   /// Parse a quoted string token if present.
   virtual ParseResult parseOptionalString(std::string *string) = 0;
 
+  /// Parses a Base64 encoded string of bytes.
+  virtual ParseResult parseBase64Bytes(std::vector<char> *bytes) = 0;
+
   /// Parse a `(` token.
   virtual ParseResult parseLParen() = 0;
 
@@ -592,6 +626,9 @@ public:
 
   /// Parse a `]` token if present.
   virtual ParseResult parseOptionalRSquare() = 0;
+
+  /// Parse a `...` token.
+  virtual ParseResult parseEllipsis() = 0;
 
   /// Parse a `...` token if present;
   virtual ParseResult parseOptionalEllipsis() = 0;
@@ -741,8 +778,8 @@ public:
     /// The parsed keyword itself.
     StringRef keyword;
 
-    /// The result of the switch statement or none if currently unknown.
-    Optional<ResultT> result;
+    /// The result of the switch statement or std::nullopt if currently unknown.
+    std::optional<ResultT> result;
   };
 
   /// Parse a given keyword.
@@ -828,7 +865,7 @@ public:
       return failure();
 
     // Check for the right kind of attribute.
-    if (!(result = attr.dyn_cast<AttrType>()))
+    if (!(result = llvm::dyn_cast<AttrType>(attr)))
       return emitError(loc, "invalid kind of attribute specified");
 
     return success();
@@ -862,7 +899,7 @@ public:
       return failure();
 
     // Check for the right kind of attribute.
-    result = attr.dyn_cast<AttrType>();
+    result = llvm::dyn_cast<AttrType>(attr);
     if (!result)
       return emitError(loc, "invalid kind of attribute specified");
 
@@ -899,7 +936,7 @@ public:
       return failure();
 
     // Check for the right kind of attribute.
-    result = attr.dyn_cast<AttrType>();
+    result = llvm::dyn_cast<AttrType>(attr);
     if (!result)
       return emitError(loc, "invalid kind of attribute specified");
 
@@ -920,20 +957,20 @@ public:
   /// populated in `result`.
   template <typename AttrType>
   std::enable_if_t<detect_has_parse_method<AttrType>::value, ParseResult>
-  parseCustomAttributeWithFallback(AttrType &result) {
+  parseCustomAttributeWithFallback(AttrType &result, Type type = {}) {
     SMLoc loc = getCurrentLocation();
 
     // Parse any kind of attribute.
     Attribute attr;
     if (parseCustomAttributeWithFallback(
-            attr, {}, [&](Attribute &result, Type type) -> ParseResult {
+            attr, type, [&](Attribute &result, Type type) -> ParseResult {
               result = AttrType::parse(*this, type);
               return success(!!result);
             }))
       return failure();
 
     // Check for the right kind of attribute.
-    result = attr.dyn_cast<AttrType>();
+    result = llvm::dyn_cast<AttrType>(attr);
     if (!result)
       return emitError(loc, "invalid kind of attribute specified");
     return success();
@@ -942,8 +979,8 @@ public:
   /// SFINAE parsing method for Attribute that don't implement a parse method.
   template <typename AttrType>
   std::enable_if_t<!detect_has_parse_method<AttrType>::value, ParseResult>
-  parseCustomAttributeWithFallback(AttrType &result) {
-    return parseAttribute(result);
+  parseCustomAttributeWithFallback(AttrType &result, Type type = {}) {
+    return parseAttribute(result, type);
   }
 
   /// Parse an arbitrary optional attribute of a given type and return it in
@@ -957,6 +994,10 @@ public:
 
   /// Parse an optional string attribute and return it in result.
   virtual OptionalParseResult parseOptionalAttribute(StringAttr &result,
+                                                     Type type = {}) = 0;
+
+  /// Parse an optional symbol ref attribute and return it in result.
+  virtual OptionalParseResult parseOptionalAttribute(SymbolRefAttr &result,
                                                      Type type = {}) = 0;
 
   /// Parse an optional attribute of a specific type and add it to the list with
@@ -999,20 +1040,38 @@ public:
   //===--------------------------------------------------------------------===//
 
   /// Parse an @-identifier and store it (without the '@' symbol) in a string
-  /// attribute named 'attrName'.
-  ParseResult parseSymbolName(StringAttr &result, StringRef attrName,
-                              NamedAttrList &attrs) {
-    if (failed(parseOptionalSymbolName(result, attrName, attrs)))
+  /// attribute.
+  ParseResult parseSymbolName(StringAttr &result) {
+    if (failed(parseOptionalSymbolName(result)))
       return emitError(getCurrentLocation())
              << "expected valid '@'-identifier for symbol name";
     return success();
   }
 
+  /// Parse an @-identifier and store it (without the '@' symbol) in a string
+  /// attribute named 'attrName'.
+  ParseResult parseSymbolName(StringAttr &result, StringRef attrName,
+                              NamedAttrList &attrs) {
+    if (parseSymbolName(result))
+      return failure();
+    attrs.append(attrName, result);
+    return success();
+  }
+
+  /// Parse an optional @-identifier and store it (without the '@' symbol) in a
+  /// string attribute.
+  virtual ParseResult parseOptionalSymbolName(StringAttr &result) = 0;
+
   /// Parse an optional @-identifier and store it (without the '@' symbol) in a
   /// string attribute named 'attrName'.
-  virtual ParseResult parseOptionalSymbolName(StringAttr &result,
-                                              StringRef attrName,
-                                              NamedAttrList &attrs) = 0;
+  ParseResult parseOptionalSymbolName(StringAttr &result, StringRef attrName,
+                                      NamedAttrList &attrs) {
+    if (succeeded(parseOptionalSymbolName(result))) {
+      attrs.append(attrName, result);
+      return success();
+    }
+    return failure();
+  }
 
   //===--------------------------------------------------------------------===//
   // Resource Parsing
@@ -1067,7 +1126,7 @@ public:
       return failure();
 
     // Check for the right kind of type.
-    result = type.dyn_cast<TypeT>();
+    result = llvm::dyn_cast<TypeT>(type);
     if (!result)
       return emitError(loc, "invalid kind of type specified");
 
@@ -1099,7 +1158,7 @@ public:
       return failure();
 
     // Check for the right kind of Type.
-    result = type.dyn_cast<TypeT>();
+    result = llvm::dyn_cast<TypeT>(type);
     if (!result)
       return emitError(loc, "invalid kind of Type specified");
     return success();
@@ -1139,7 +1198,7 @@ public:
       return failure();
 
     // Check for the right kind of type.
-    result = type.dyn_cast<TypeType>();
+    result = llvm::dyn_cast<TypeType>(type);
     if (!result)
       return emitError(loc, "invalid kind of type specified");
 
@@ -1177,8 +1236,9 @@ public:
   }
 
   /// Parse a dimension list of a tensor or memref type.  This populates the
-  /// dimension list, using -1 for the `?` dimensions if `allowDynamic` is set
-  /// and errors out on `?` otherwise. Parsing the trailing `x` is configurable.
+  /// dimension list, using ShapedType::kDynamic for the `?` dimensions if
+  /// `allowDynamic` is set and errors out on `?` otherwise. Parsing the
+  /// trailing `x` is configurable.
   ///
   ///   dimension-list ::= eps | dimension (`x` dimension)*
   ///   dimension-list-with-trailing-x ::= (dimension `x`)*
@@ -1248,7 +1308,7 @@ public:
   /// which case an OpaqueLoc is set and will be resolved when parsing
   /// completes.
   virtual ParseResult
-  parseOptionalLocationSpecifier(Optional<Location> &result) = 0;
+  parseOptionalLocationSpecifier(std::optional<Location> &result) = 0;
 
   /// Return the name of the specified result in the specified syntax, as well
   /// as the sub-element in the name.  It returns an empty string and ~0U for
@@ -1302,12 +1362,14 @@ public:
   /// skip parsing that component.
   virtual ParseResult parseGenericOperationAfterOpName(
       OperationState &result,
-      Optional<ArrayRef<UnresolvedOperand>> parsedOperandType = llvm::None,
-      Optional<ArrayRef<Block *>> parsedSuccessors = llvm::None,
-      Optional<MutableArrayRef<std::unique_ptr<Region>>> parsedRegions =
-          llvm::None,
-      Optional<ArrayRef<NamedAttribute>> parsedAttributes = llvm::None,
-      Optional<FunctionType> parsedFnType = llvm::None) = 0;
+      std::optional<ArrayRef<UnresolvedOperand>> parsedOperandType =
+          std::nullopt,
+      std::optional<ArrayRef<Block *>> parsedSuccessors = std::nullopt,
+      std::optional<MutableArrayRef<std::unique_ptr<Region>>> parsedRegions =
+          std::nullopt,
+      std::optional<ArrayRef<NamedAttribute>> parsedAttributes = std::nullopt,
+      std::optional<Attribute> parsedPropertiesAttribute = std::nullopt,
+      std::optional<FunctionType> parsedFnType = std::nullopt) = 0;
 
   /// Parse a single SSA value operand name along with a result number if
   /// `allowResultNumber` is true.
@@ -1414,7 +1476,7 @@ public:
     UnresolvedOperand ssaName;    // SourceLoc, SSA name, result #.
     Type type;                    // Type.
     DictionaryAttr attrs;         // Attributes if present.
-    Optional<Location> sourceLoc; // Source location specifier if present.
+    std::optional<Location> sourceLoc; // Source location specifier if present.
   };
 
   /// Parse a single argument with the following syntax:

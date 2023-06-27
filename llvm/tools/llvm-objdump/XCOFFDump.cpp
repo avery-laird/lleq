@@ -32,10 +32,8 @@ Error objdump::getXCOFFRelocationValueString(const XCOFFObjectFile &Obj,
   if (!SymNameOrErr)
     return SymNameOrErr.takeError();
 
-  std::string SymName = (*SymNameOrErr).str();
-  if (Demangle)
-    SymName = demangle(SymName);
-
+  std::string SymName =
+      Demangle ? demangle(*SymNameOrErr) : SymNameOrErr->str();
   if (SymbolDescription)
     SymName = getXCOFFSymbolDescription(createSymbolInfo(Obj, *SymI), SymName);
 
@@ -43,31 +41,31 @@ Error objdump::getXCOFFRelocationValueString(const XCOFFObjectFile &Obj,
   return Error::success();
 }
 
-Optional<XCOFF::StorageMappingClass>
+std::optional<XCOFF::StorageMappingClass>
 objdump::getXCOFFSymbolCsectSMC(const XCOFFObjectFile &Obj,
                                 const SymbolRef &Sym) {
   const XCOFFSymbolRef SymRef = Obj.toSymbolRef(Sym.getRawDataRefImpl());
 
   if (!SymRef.isCsectSymbol())
-    return None;
+    return std::nullopt;
 
   auto CsectAuxEntOrErr = SymRef.getXCOFFCsectAuxRef();
   if (!CsectAuxEntOrErr)
-    return None;
+    return std::nullopt;
 
   return CsectAuxEntOrErr.get().getStorageMappingClass();
 }
 
-Optional<object::SymbolRef>
+std::optional<object::SymbolRef>
 objdump::getXCOFFSymbolContainingSymbolRef(const XCOFFObjectFile &Obj,
                                            const SymbolRef &Sym) {
   const XCOFFSymbolRef SymRef = Obj.toSymbolRef(Sym.getRawDataRefImpl());
   if (!SymRef.isCsectSymbol())
-    return None;
+    return std::nullopt;
 
   Expected<XCOFFCsectAuxRef> CsectAuxEntOrErr = SymRef.getXCOFFCsectAuxRef();
   if (!CsectAuxEntOrErr || !CsectAuxEntOrErr.get().isLabel())
-    return None;
+    return std::nullopt;
   uint32_t Idx =
       static_cast<uint32_t>(CsectAuxEntOrErr.get().getSectionOrLength());
   DataRefImpl DRI;
@@ -94,9 +92,9 @@ std::string objdump::getXCOFFSymbolDescription(const SymbolInfoTy &SymbolInfo,
   std::string Result;
   // Dummy symbols have no symbol index.
   if (SymbolInfo.XCOFFSymInfo.Index)
-    Result = ("(idx: " + Twine(SymbolInfo.XCOFFSymInfo.Index.value()) + ") " +
-              SymbolName)
-                 .str();
+    Result =
+        ("(idx: " + Twine(*SymbolInfo.XCOFFSymInfo.Index) + ") " + SymbolName)
+            .str();
   else
     Result.append(SymbolName.begin(), SymbolName.end());
 

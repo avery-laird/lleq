@@ -31,6 +31,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -123,7 +124,7 @@ FileManager::getDirectoryRef(StringRef DirName, bool CacheFailure) {
       DirName != llvm::sys::path::root_path(DirName) &&
       llvm::sys::path::is_separator(DirName.back()))
     DirName = DirName.substr(0, DirName.size()-1);
-  Optional<std::string> DirNameStr;
+  std::optional<std::string> DirNameStr;
   if (is_style_windows(llvm::sys::path::Style::native)) {
     // Fixing a problem with "clang C:test.c" on Windows.
     // Stat("C:") does not recognize "C:" as a valid directory
@@ -318,7 +319,7 @@ FileManager::getFileRef(StringRef Filename, bool openFile, bool CacheFailure) {
 
     // Cache the redirection in the previously-inserted entry, still available
     // in the tentative return value.
-    NamedFileEnt->second = FileEntryRef::MapValue(Redirection);
+    NamedFileEnt->second = FileEntryRef::MapValue(Redirection, DirInfo);
   }
 
   FileEntryRef ReturnedRef(*NamedFileEnt);
@@ -402,8 +403,7 @@ FileEntryRef FileManager::getVirtualFileRef(StringRef Filename, off_t Size,
     FileEntryRef::MapValue Value = *NamedFileEnt.second;
     if (LLVM_LIKELY(Value.V.is<FileEntry *>()))
       return FileEntryRef(NamedFileEnt);
-    return FileEntryRef(*reinterpret_cast<const FileEntryRef::MapEntry *>(
-        Value.V.get<const void *>()));
+    return FileEntryRef(*Value.V.get<const FileEntryRef::MapEntry *>());
   }
 
   // We've not seen this before, or the file is cached as non-existent.
@@ -470,11 +470,11 @@ FileEntryRef FileManager::getVirtualFileRef(StringRef Filename, off_t Size,
   return FileEntryRef(NamedFileEnt);
 }
 
-llvm::Optional<FileEntryRef> FileManager::getBypassFile(FileEntryRef VF) {
+OptionalFileEntryRef FileManager::getBypassFile(FileEntryRef VF) {
   // Stat of the file and return nullptr if it doesn't exist.
   llvm::vfs::Status Status;
   if (getStatValue(VF.getName(), Status, /*isFile=*/true, /*F=*/nullptr))
-    return None;
+    return std::nullopt;
 
   if (!SeenBypassFileEntries)
     SeenBypassFileEntries = std::make_unique<
@@ -631,16 +631,15 @@ void FileManager::GetUniqueIDMapping(
     UIDToFiles[VFE->getUID()] = VFE;
 }
 
-StringRef FileManager::getCanonicalName(const DirectoryEntry *Dir) {
-  llvm::DenseMap<const void *, llvm::StringRef>::iterator Known
-    = CanonicalNames.find(Dir);
+StringRef FileManager::getCanonicalName(DirectoryEntryRef Dir) {
+  auto Known = CanonicalNames.find(Dir);
   if (Known != CanonicalNames.end())
     return Known->second;
 
-  StringRef CanonicalName(Dir->getName());
+  StringRef CanonicalName(Dir.getName());
 
   SmallString<4096> CanonicalNameBuf;
-  if (!FS->getRealPath(Dir->getName(), CanonicalNameBuf))
+  if (!FS->getRealPath(Dir.getName(), CanonicalNameBuf))
     CanonicalName = CanonicalNameBuf.str().copy(CanonicalNameStorage);
 
   CanonicalNames.insert({Dir, CanonicalName});

@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -203,9 +204,9 @@ public:
 
   bool SetOSVersion(llvm::VersionTuple os_version);
 
-  llvm::Optional<std::string> GetOSBuildString();
+  std::optional<std::string> GetOSBuildString();
 
-  llvm::Optional<std::string> GetOSKernelDescription();
+  std::optional<std::string> GetOSKernelDescription();
 
   // Returns the name of the platform
   llvm::StringRef GetName() { return GetPluginName(); }
@@ -231,12 +232,12 @@ public:
   // HostInfo::GetOSVersion().
   virtual bool GetRemoteOSVersion() { return false; }
 
-  virtual llvm::Optional<std::string> GetRemoteOSBuildString() {
-    return llvm::None;
+  virtual std::optional<std::string> GetRemoteOSBuildString() {
+    return std::nullopt;
   }
 
-  virtual llvm::Optional<std::string> GetRemoteOSKernelDescription() {
-    return llvm::None;
+  virtual std::optional<std::string> GetRemoteOSKernelDescription() {
+    return std::nullopt;
   }
 
   // Remote Platform subclasses need to override this function
@@ -447,13 +448,15 @@ public:
   // Used for column widths
   size_t GetMaxGroupIDNameLength() const { return m_max_gid_name_len; }
 
-  ConstString GetSDKRootDirectory() const { return m_sdk_sysroot; }
+  const std::string &GetSDKRootDirectory() const { return m_sdk_sysroot; }
 
-  void SetSDKRootDirectory(ConstString dir) { m_sdk_sysroot = dir; }
+  void SetSDKRootDirectory(std::string dir) { m_sdk_sysroot = std::move(dir); }
 
-  ConstString GetSDKBuild() const { return m_sdk_build; }
+  const std::string &GetSDKBuild() const { return m_sdk_build; }
 
-  void SetSDKBuild(ConstString sdk_build) { m_sdk_build = sdk_build; }
+  void SetSDKBuild(std::string sdk_build) {
+    m_sdk_build = std::move(sdk_build);
+  }
 
   // Override this to return true if your platform supports Clang modules. You
   // may also need to override AddClangModuleCompilationOptions to pass the
@@ -846,6 +849,34 @@ public:
     return nullptr;
   }
 
+  /// Detect a binary in memory that will determine which Platform and
+  /// DynamicLoader should be used in this target/process, and update
+  /// the Platform/DynamicLoader.
+  /// The binary will be loaded into the Target, or will be registered with
+  /// the DynamicLoader so that it will be loaded at a later stage.  Returns
+  /// true to indicate that this is a platform binary and has been
+  /// loaded/registered, no further action should be taken by the caller.
+  ///
+  /// \param[in] process
+  ///     Process read memory from, a Process must be provided.
+  ///
+  /// \param[in] addr
+  ///     Address of a binary in memory.
+  ///
+  /// \param[in] notify
+  ///     Whether ModulesDidLoad should be called, if a binary is loaded.
+  ///     Caller may prefer to call ModulesDidLoad for multiple binaries
+  ///     that were loaded at the same time.
+  ///
+  /// \return
+  ///     Returns true if the binary was loaded in the target (or will be
+  ///     via a DynamicLoader).  Returns false if the binary was not
+  ///     loaded/registered, and the caller must load it into the target.
+  virtual bool LoadPlatformBinaryAndSetup(Process *process, lldb::addr_t addr,
+                                          bool notify) {
+    return false;
+  }
+
   virtual CompilerType GetSiginfoType(const llvm::Triple &triple);
   
   virtual Args GetExtraStartupCommands();
@@ -871,9 +902,9 @@ protected:
   // the once we call HostInfo::GetOSVersion().
   bool m_os_version_set_while_connected;
   bool m_system_arch_set_while_connected;
-  ConstString
+  std::string
       m_sdk_sysroot; // the root location of where the SDK files are all located
-  ConstString m_sdk_build;
+  std::string m_sdk_build;
   FileSpec m_working_dir; // The working directory which is used when installing
                           // modules that have no install path set
   std::string m_remote_url;
@@ -1025,6 +1056,32 @@ public:
                                std::vector<lldb::PlatformSP> &candidates);
 
   lldb::PlatformSP Create(llvm::StringRef name);
+
+  /// Detect a binary in memory that will determine which Platform and
+  /// DynamicLoader should be used in this target/process, and update
+  /// the Platform/DynamicLoader.
+  /// The binary will be loaded into the Target, or will be registered with
+  /// the DynamicLoader so that it will be loaded at a later stage.  Returns
+  /// true to indicate that this is a platform binary and has been
+  /// loaded/registered, no further action should be taken by the caller.
+  ///
+  /// \param[in] process
+  ///     Process read memory from, a Process must be provided.
+  ///
+  /// \param[in] addr
+  ///     Address of a binary in memory.
+  ///
+  /// \param[in] notify
+  ///     Whether ModulesDidLoad should be called, if a binary is loaded.
+  ///     Caller may prefer to call ModulesDidLoad for multiple binaries
+  ///     that were loaded at the same time.
+  ///
+  /// \return
+  ///     Returns true if the binary was loaded in the target (or will be
+  ///     via a DynamicLoader).  Returns false if the binary was not
+  ///     loaded/registered, and the caller must load it into the target.
+  bool LoadPlatformBinaryAndSetup(Process *process, lldb::addr_t addr,
+                                  bool notify);
 
 protected:
   typedef std::vector<lldb::PlatformSP> collection;

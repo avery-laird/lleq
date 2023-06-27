@@ -11,7 +11,6 @@
 
 #include "mlir/IR/BuiltinAttributeInterfaces.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
-#include "mlir/IR/SubElementInterfaces.h"
 
 namespace llvm {
 class BitVector;
@@ -28,6 +27,8 @@ class AffineMap;
 class FloatType;
 class IndexType;
 class IntegerType;
+class MemRefType;
+class RankedTensorType;
 class StringAttr;
 class TypeRange;
 
@@ -46,6 +47,11 @@ public:
   static FloatType getF64(MLIRContext *ctx);
   static FloatType getF80(MLIRContext *ctx);
   static FloatType getF128(MLIRContext *ctx);
+  static FloatType getFloat8E5M2(MLIRContext *ctx);
+  static FloatType getFloat8E4M3FN(MLIRContext *ctx);
+  static FloatType getFloat8E5M2FNUZ(MLIRContext *ctx);
+  static FloatType getFloat8E4M3FNUZ(MLIRContext *ctx);
+  static FloatType getFloat8E4M3B11FNUZ(MLIRContext *ctx);
 
   /// Methods for support type inquiry through isa, cast, and dyn_cast.
   static bool classof(Type type);
@@ -87,9 +93,20 @@ public:
   ArrayRef<int64_t> getShape() const;
 
   /// Clone this type with the given shape and element type. If the
-  /// provided shape is `None`, the current shape of the type is used.
-  TensorType cloneWith(Optional<ArrayRef<int64_t>> shape,
+  /// provided shape is `std::nullopt`, the current shape of the type is used.
+  TensorType cloneWith(std::optional<ArrayRef<int64_t>> shape,
                        Type elementType) const;
+
+  // Make sure that base class overloads are visible.
+  using ShapedType::Trait<TensorType>::clone;
+
+  /// Return a clone of this type with the given new shape and element type.
+  /// The returned type is ranked, even if this type is unranked.
+  RankedTensorType clone(ArrayRef<int64_t> shape, Type elementType) const;
+
+  /// Return a clone of this type with the given new shape. The returned type
+  /// is ranked, even if this type is unranked.
+  RankedTensorType clone(ArrayRef<int64_t> shape) const;
 
   /// Return true if the specified element type is ok in a tensor.
   static bool isValidElementType(Type type);
@@ -98,7 +115,7 @@ public:
   static bool classof(Type type);
 
   /// Allow implicit conversion to ShapedType.
-  operator ShapedType() const { return cast<ShapedType>(); }
+  operator ShapedType() const { return llvm::cast<ShapedType>(*this); }
 };
 
 //===----------------------------------------------------------------------===//
@@ -123,9 +140,20 @@ public:
   ArrayRef<int64_t> getShape() const;
 
   /// Clone this type with the given shape and element type. If the
-  /// provided shape is `None`, the current shape of the type is used.
-  BaseMemRefType cloneWith(Optional<ArrayRef<int64_t>> shape,
+  /// provided shape is `std::nullopt`, the current shape of the type is used.
+  BaseMemRefType cloneWith(std::optional<ArrayRef<int64_t>> shape,
                            Type elementType) const;
+
+  // Make sure that base class overloads are visible.
+  using ShapedType::Trait<BaseMemRefType>::clone;
+
+  /// Return a clone of this type with the given new shape and element type.
+  /// The returned type is ranked, even if this type is unranked.
+  MemRefType clone(ArrayRef<int64_t> shape, Type elementType) const;
+
+  /// Return a clone of this type with the given new shape. The returned type
+  /// is ranked, even if this type is unranked.
+  MemRefType clone(ArrayRef<int64_t> shape) const;
 
   /// Return true if the specified element type is ok in a memref.
   static bool isValidElementType(Type type);
@@ -141,7 +169,7 @@ public:
   unsigned getMemorySpaceAsInt() const;
 
   /// Allow implicit conversion to ShapedType.
-  operator ShapedType() const { return cast<ShapedType>(); }
+  operator ShapedType() const { return llvm::cast<ShapedType>(*this); }
 };
 
 } // namespace mlir
@@ -278,17 +306,28 @@ public:
   /// Build from another VectorType.
   explicit Builder(VectorType other)
       : shape(other.getShape()), elementType(other.getElementType()),
-        numScalableDims(other.getNumScalableDims()) {}
+        numScalableDims(other.getNumScalableDims()),
+        scalableDims(other.getScalableDims()) {}
 
   /// Build from scratch.
   Builder(ArrayRef<int64_t> shape, Type elementType,
-          unsigned numScalableDims = 0)
+          unsigned numScalableDims = 0, ArrayRef<bool> scalableDims = {})
       : shape(shape), elementType(elementType),
-        numScalableDims(numScalableDims) {}
+        numScalableDims(numScalableDims) {
+    if (scalableDims.empty())
+      scalableDims = SmallVector<bool>(shape.size(), false);
+    else
+      this->scalableDims = scalableDims;
+  }
 
-  Builder &setShape(ArrayRef<int64_t> newShape,
-                    unsigned newNumScalableDims = 0) {
+  Builder &setShape(ArrayRef<int64_t> newShape, unsigned newNumScalableDims = 0,
+                    ArrayRef<bool> newIsScalableDim = {}) {
     numScalableDims = newNumScalableDims;
+    if (newIsScalableDim.empty())
+      scalableDims = SmallVector<bool>(shape.size(), false);
+    else
+      scalableDims = newIsScalableDim;
+
     shape = newShape;
     return *this;
   }
@@ -305,8 +344,13 @@ public:
       numScalableDims--;
     if (storage.empty())
       storage.append(shape.begin(), shape.end());
+    if (storageScalableDims.empty())
+      storageScalableDims.append(scalableDims.begin(), scalableDims.end());
     storage.erase(storage.begin() + pos);
+    storageScalableDims.erase(storageScalableDims.begin() + pos);
     shape = {storage.data(), storage.size()};
+    scalableDims =
+        ArrayRef<bool>(storageScalableDims.data(), storageScalableDims.size());
     return *this;
   }
 
@@ -316,7 +360,7 @@ public:
   operator Type() {
     if (shape.empty())
       return elementType;
-    return VectorType::get(shape, elementType, numScalableDims);
+    return VectorType::get(shape, elementType, numScalableDims, scalableDims);
   }
 
 private:
@@ -325,6 +369,9 @@ private:
   SmallVector<int64_t> storage;
   Type elementType;
   unsigned numScalableDims;
+  ArrayRef<bool> scalableDims;
+  // Owning scalableDims data for copy-on-write operations.
+  SmallVector<bool> storageScalableDims;
 };
 
 /// Given an `originalShape` and a `reducedShape` assumed to be a subset of
@@ -333,9 +380,9 @@ private:
 /// `reducedShape`. The returned mask can be applied as a projection to
 /// `originalShape` to obtain the `reducedShape`. This mask is useful to track
 /// which dimensions must be kept when e.g. compute MemRef strides under
-/// rank-reducing operations. Return None if reducedShape cannot be obtained
-/// by dropping only `1` entries in `originalShape`.
-llvm::Optional<llvm::SmallDenseSet<unsigned>>
+/// rank-reducing operations. Return std::nullopt if reducedShape cannot be
+/// obtained by dropping only `1` entries in `originalShape`.
+std::optional<llvm::SmallDenseSet<unsigned>>
 computeRankReductionMask(ArrayRef<int64_t> originalShape,
                          ArrayRef<int64_t> reducedShape);
 
@@ -363,18 +410,41 @@ SliceVerificationResult isRankReducedType(ShapedType originalType,
 //===----------------------------------------------------------------------===//
 
 inline bool BaseMemRefType::classof(Type type) {
-  return type.isa<MemRefType, UnrankedMemRefType>();
+  return llvm::isa<MemRefType, UnrankedMemRefType>(type);
 }
 
 inline bool BaseMemRefType::isValidElementType(Type type) {
   return type.isIntOrIndexOrFloat() ||
-         type.isa<ComplexType, MemRefType, VectorType, UnrankedMemRefType>() ||
-         type.isa<MemRefElementTypeInterface>();
+         llvm::isa<ComplexType, MemRefType, VectorType, UnrankedMemRefType>(
+             type) ||
+         llvm::isa<MemRefElementTypeInterface>(type);
 }
 
 inline bool FloatType::classof(Type type) {
-  return type.isa<BFloat16Type, Float16Type, Float32Type, Float64Type,
-                  Float80Type, Float128Type>();
+  return llvm::isa<Float8E5M2Type, Float8E4M3FNType, Float8E5M2FNUZType,
+                   Float8E4M3FNUZType, Float8E4M3B11FNUZType, BFloat16Type,
+                   Float16Type, Float32Type, Float64Type, Float80Type,
+                   Float128Type>(type);
+}
+
+inline FloatType FloatType::getFloat8E5M2(MLIRContext *ctx) {
+  return Float8E5M2Type::get(ctx);
+}
+
+inline FloatType FloatType::getFloat8E4M3FN(MLIRContext *ctx) {
+  return Float8E4M3FNType::get(ctx);
+}
+
+inline FloatType FloatType::getFloat8E5M2FNUZ(MLIRContext *ctx) {
+  return Float8E5M2FNUZType::get(ctx);
+}
+
+inline FloatType FloatType::getFloat8E4M3FNUZ(MLIRContext *ctx) {
+  return Float8E4M3FNUZType::get(ctx);
+}
+
+inline FloatType FloatType::getFloat8E4M3B11FNUZ(MLIRContext *ctx) {
+  return Float8E4M3B11FNUZType::get(ctx);
 }
 
 inline FloatType FloatType::getBF16(MLIRContext *ctx) {
@@ -402,7 +472,7 @@ inline FloatType FloatType::getF128(MLIRContext *ctx) {
 }
 
 inline bool TensorType::classof(Type type) {
-  return type.isa<RankedTensorType, UnrankedTensorType>();
+  return llvm::isa<RankedTensorType, UnrankedTensorType>(type);
 }
 
 //===----------------------------------------------------------------------===//
@@ -413,38 +483,28 @@ inline bool TensorType::classof(Type type) {
 /// MemRefs with a layout map in strided form include:
 ///   1. empty or identity layout map, in which case the stride information is
 ///      the canonical form computed from sizes;
-///   2. single affine map layout of the form `K + k0 * d0 + ... kn * dn`,
-///      where K and ki's are constants or symbols.
+///   2. a StridedLayoutAttr layout;
+///   3. any other layout that be converted into a single affine map layout of
+///      the form `K + k0 * d0 + ... kn * dn`, where K and ki's are constants or
+///      symbols.
 ///
 /// A stride specification is a list of integer values that are either static
-/// or dynamic (encoded with getDynamicStrideOrOffset()). Strides encode the
-/// distance in the number of elements between successive entries along a
+/// or dynamic (encoded with ShapedType::kDynamic). Strides encode
+/// the distance in the number of elements between successive entries along a
 /// particular dimension.
-///
-/// For example, `memref<42x16xf32, (64 * d0 + d1)>` specifies a view into a
-/// non-contiguous memory region of `42` by `16` `f32` elements in which the
-/// distance between two consecutive elements along the outer dimension is `1`
-/// and the distance between two consecutive elements along the inner dimension
-/// is `64`.
-///
-/// The convention is that the strides for dimensions d0, .. dn appear in
-/// order to make indexing intuitive into the result.
 LogicalResult getStridesAndOffset(MemRefType t,
                                   SmallVectorImpl<int64_t> &strides,
                                   int64_t &offset);
-LogicalResult getStridesAndOffset(MemRefType t,
-                                  SmallVectorImpl<AffineExpr> &strides,
-                                  AffineExpr &offset);
+
+/// Wrapper around getStridesAndOffset(MemRefType, SmallVectorImpl<int64_t>,
+/// int64_t) that will assert if the logical result is not succeeded.
+std::pair<SmallVector<int64_t>, int64_t> getStridesAndOffset(MemRefType t);
 
 /// Return a version of `t` with identity layout if it can be determined
 /// statically that the layout is the canonical contiguous strided layout.
 /// Otherwise pass `t`'s layout into `simplifyAffineMap` and return a copy of
 /// `t` with simplified layout.
 MemRefType canonicalizeStridedLayout(MemRefType t);
-
-/// Return a version of `t` with a layout that has all dynamic offset and
-/// strides. This is used to erase the static layout.
-MemRefType eraseStridedLayout(MemRefType t);
 
 /// Given MemRef `sizes` that are either static or dynamic, returns the
 /// canonical "contiguous" strides AffineExpr. Strides are multiplicative and
@@ -471,15 +531,6 @@ AffineExpr makeCanonicalStridedLayoutExpr(ArrayRef<int64_t> sizes,
 
 /// Return true if the layout for `t` is compatible with strided semantics.
 bool isStrided(MemRefType t);
-
-/// Return the layout map in strided linear layout AffineMap form.
-/// Return null if the layout is not compatible with a strided layout.
-AffineMap getStridedLinearLayoutMap(MemRefType t);
-
-/// Helper determining if a memref is static-shape and contiguous-row-major
-/// layout, while still allowing for an arbitrary offset (any static or
-/// dynamic value).
-bool isStaticShapeAndContiguousRowMajor(MemRefType memrefType);
 
 } // namespace mlir
 

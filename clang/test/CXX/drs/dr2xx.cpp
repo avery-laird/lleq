@@ -3,6 +3,7 @@
 // RUN: %clang_cc1 -std=c++14 %s -verify -fexceptions -fcxx-exceptions -pedantic-errors
 // RUN: %clang_cc1 -std=c++17 %s -verify -fexceptions -fcxx-exceptions -pedantic-errors
 // RUN: %clang_cc1 -std=c++20 %s -verify -fexceptions -fcxx-exceptions -pedantic-errors
+// RUN: %clang_cc1 -std=c++23 %s -verify -fexceptions -fcxx-exceptions -pedantic-errors
 
 // PR13819 -- __SIZE_TYPE__ is incompatible.
 typedef __SIZE_TYPE__ size_t; // expected-error 0-1 {{extension}}
@@ -141,6 +142,7 @@ namespace dr217 { // dr217: yes
 }
 
 namespace dr218 { // dr218: yes
+                  // NB: also dup 405
   namespace A {
     struct S {};
     void f(S);
@@ -243,13 +245,16 @@ namespace dr222 { // dr222: dup 637
 
 // dr223: na
 
-namespace dr224 { // dr224: no
+namespace dr224 { // dr224: 16
   namespace example1 {
     template <class T> class A {
       typedef int type;
       A::type a;
       A<T>::type b;
-      A<T*>::type c; // expected-error {{missing 'typename'}}
+      A<T*>::type c;
+#if __cplusplus <= 201703L
+      // expected-error@-2 {{implicit 'typename' is a C++20 extension}}
+#endif
       ::dr224::example1::A<T>::type d;
 
       class B {
@@ -257,12 +262,18 @@ namespace dr224 { // dr224: no
 
         A::type a;
         A<T>::type b;
-        A<T*>::type c; // expected-error {{missing 'typename'}}
+        A<T*>::type c;
+#if __cplusplus <= 201703L
+        // expected-error@-2 {{implicit 'typename' is a C++20 extension}}
+#endif
         ::dr224::example1::A<T>::type d;
 
         B::type e;
         A<T>::B::type f;
-        A<T*>::B::type g; // expected-error {{missing 'typename'}}
+        A<T*>::B::type g;
+#if __cplusplus <= 201703L
+        // expected-error@-2 {{implicit 'typename' is a C++20 extension}}
+#endif
         typename A<T*>::B::type h;
       };
     };
@@ -270,21 +281,32 @@ namespace dr224 { // dr224: no
     template <class T> class A<T*> {
       typedef int type;
       A<T*>::type a;
-      A<T>::type b; // expected-error {{missing 'typename'}}
+      A<T>::type b;
+#if __cplusplus <= 201703L
+        // expected-error@-2 {{implicit 'typename' is a C++20 extension}}
+#endif
     };
 
     template <class T1, class T2, int I> struct B {
       typedef int type;
       B<T1, T2, I>::type b1;
-      B<T2, T1, I>::type b2; // expected-error {{missing 'typename'}}
+      B<T2, T1, I>::type b2;
+#if __cplusplus <= 201703L
+      // expected-error@-2 {{implicit 'typename' is a C++20 extension}}
+#endif
 
       typedef T1 my_T1;
       static const int my_I = I;
       static const int my_I2 = I+0;
       static const int my_I3 = my_I;
-      B<my_T1, T2, my_I>::type b3; // FIXME: expected-error {{missing 'typename'}}
-      B<my_T1, T2, my_I2>::type b4; // expected-error {{missing 'typename'}}
-      B<my_T1, T2, my_I3>::type b5; // FIXME: expected-error {{missing 'typename'}}
+      B<my_T1, T2, my_I>::type b3;
+      B<my_T1, T2, my_I2>::type b4;
+      B<my_T1, T2, my_I3>::type b5;
+#if __cplusplus <= 201703L
+      // expected-error@-4 {{implicit 'typename' is a C++20 extension}}
+      // expected-error@-4 {{implicit 'typename' is a C++20 extension}}
+      // expected-error@-4 {{implicit 'typename' is a C++20 extension}}
+#endif
     };
   }
 
@@ -295,7 +317,10 @@ namespace dr224 { // dr224: no
       X<i, int>::type w;
       X<A::i, char>::type x;
       X<A<T>::i, double>::type y;
-      X<A<T*>::i, long>::type z; // expected-error {{missing 'typename'}}
+      X<A<T*>::i, long>::type z;
+#if __cplusplus <= 201703L
+      // expected-error@-2 {{implicit 'typename' is a C++20 extension}}
+#endif
       int f();
     };
     template <class T> int A<T>::f() {
@@ -475,6 +500,7 @@ namespace dr243 { // dr243: yes
 }
 
 namespace dr244 { // dr244: 11
+                  // NB: this test is reused by dr399
   struct B {}; // expected-note {{type 'dr244::B' found by destructor name lookup}}
   struct D : B {};
 
@@ -667,6 +693,14 @@ namespace dr254 { // dr254: yes
   A<B>::type n;
   A<C>::type n; // expected-note {{instantiation of}}
 }
+
+namespace dr255 { // dr255: yes
+struct S {
+  void operator delete(void *){};
+  void operator delete(void *, int){};
+};
+void f(S *p) { delete p; }
+} // namespace dr255
 
 // dr256: dup 624
 

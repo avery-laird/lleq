@@ -36,6 +36,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Transforms/Utils/SanitizerStats.h"
+#include <optional>
 
 namespace llvm {
 class Module;
@@ -589,7 +590,10 @@ private:
   MetadataTypeMap VirtualMetadataIdMap;
   MetadataTypeMap GeneralizedMetadataIdMap;
 
-  llvm::DenseMap<const llvm::Constant *, llvm::GlobalVariable *> RTTIProxyMap;
+  // Helps squashing blocks of TopLevelStmtDecl into a single llvm::Function
+  // when used with -fincremental-extensions.
+  std::pair<std::unique_ptr<CodeGenFunction>, const TopLevelStmtDecl *>
+      GlobalTopLevelStmtBlockInFlight;
 
 public:
   CodeGenModule(ASTContext &C, IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS,
@@ -715,7 +719,8 @@ public:
 
   llvm::MDNode *getNoObjCARCExceptionsMetadata() {
     if (!NoObjCARCExceptionsMetadata)
-      NoObjCARCExceptionsMetadata = llvm::MDNode::get(getLLVMContext(), None);
+      NoObjCARCExceptionsMetadata =
+          llvm::MDNode::get(getLLVMContext(), std::nullopt);
     return NoObjCARCExceptionsMetadata;
   }
 
@@ -751,6 +756,10 @@ public:
   CodeGenVTables &getVTables() { return VTables; }
 
   ItaniumVTableContext &getItaniumVTableContext() {
+    return VTables.getItaniumVTableContext();
+  }
+
+  const ItaniumVTableContext &getItaniumVTableContext() const {
     return VTables.getItaniumVTableContext();
   }
 
@@ -805,7 +814,7 @@ public:
     return getTBAAAccessInfo(AccessType);
   }
 
-  bool isTypeConstant(QualType QTy, bool ExcludeCtorDtor);
+  bool isTypeConstant(QualType QTy, bool ExcludeCtor, bool ExcludeDtor);
 
   bool isPaddedAtomicType(QualType type);
   bool isPaddedAtomicType(const AtomicType *type);
@@ -870,7 +879,7 @@ public:
   llvm::GlobalVariable *
   CreateOrReplaceCXXRuntimeVariable(StringRef Name, llvm::Type *Ty,
                                     llvm::GlobalValue::LinkageTypes Linkage,
-                                    unsigned Alignment);
+                                    llvm::Align Alignment);
 
   llvm::Function *CreateGlobalInitOrCleanUpFunction(
       llvm::FunctionType *ty, const Twine &name, const CGFunctionInfo &FI,
@@ -1079,7 +1088,8 @@ public:
   llvm::Constant *getBuiltinLibFunction(const FunctionDecl *FD,
                                         unsigned BuiltinID);
 
-  llvm::Function *getIntrinsic(unsigned IID, ArrayRef<llvm::Type*> Tys = None);
+  llvm::Function *getIntrinsic(unsigned IID,
+                               ArrayRef<llvm::Type *> Tys = std::nullopt);
 
   /// Emit code for a single top level declaration.
   void EmitTopLevelDecl(Decl *D);
@@ -1260,6 +1270,8 @@ public:
   /// function which relies on particular fast-math attributes for correctness.
   /// It's up to you to ensure that this is safe.
   void addDefaultFunctionDefinitionAttributes(llvm::Function &F);
+  void mergeDefaultFunctionDefinitionAttributes(llvm::Function &F,
+                                                bool WillInternalize);
 
   /// Like the overload taking a `Function &`, but intended specifically
   /// for frontends that want to build on Clang's target-configuration logic.
@@ -1410,7 +1422,7 @@ public:
   void EmitOMPAllocateDecl(const OMPAllocateDecl *D);
 
   /// Return the alignment specified in an allocate directive, if present.
-  llvm::Optional<CharUnits> getOMPAllocateAlignment(const VarDecl *VD);
+  std::optional<CharUnits> getOMPAllocateAlignment(const VarDecl *VD);
 
   /// Returns whether the given record has hidden LTO visibility and therefore
   /// may participate in (single-module) CFI and whole-program vtable
@@ -1436,6 +1448,8 @@ public:
   void EmitVTableTypeMetadata(const CXXRecordDecl *RD,
                               llvm::GlobalVariable *VTable,
                               const VTableLayout &VTLayout);
+
+  llvm::Type *getVTableComponentType() const;
 
   /// Generate a cross-DSO type identifier for MD.
   llvm::ConstantInt *CreateCrossDsoCfiTypeId(llvm::Metadata *MD);
@@ -1469,7 +1483,8 @@ public:
 
   /// Whether this function's return type has no side effects, and thus may
   /// be trivially discarded if it is unused.
-  bool MayDropFunctionReturn(const ASTContext &Context, QualType ReturnType);
+  bool MayDropFunctionReturn(const ASTContext &Context,
+                             QualType ReturnType) const;
 
   /// Returns whether this module needs the "all-vtables" type identifier.
   bool NeedAllVtablesTypeId() const;
@@ -1485,9 +1500,6 @@ public:
   /// including C itself, that does not have any bases.
   std::vector<const CXXRecordDecl *>
   getMostBaseClasses(const CXXRecordDecl *RD);
-
-  llvm::GlobalVariable *
-  GetOrCreateRTTIProxyGlobalVariable(llvm::Constant *Addr);
 
   /// Get the declaration of std::terminate for the platform.
   llvm::FunctionCallee getTerminateFn();
@@ -1566,7 +1578,8 @@ private:
                         ForDefinition_t IsForDefinition = NotForDefinition);
 
   bool GetCPUAndFeaturesAttributes(GlobalDecl GD,
-                                   llvm::AttrBuilder &AttrBuilder);
+                                   llvm::AttrBuilder &AttrBuilder,
+                                   bool SetTargetFeatures = true);
   void setNonAliasAttributes(GlobalDecl GD, llvm::GlobalObject *GO);
 
   /// Set function attributes for a function declaration.
@@ -1590,6 +1603,7 @@ private:
 
   void EmitDeclContext(const DeclContext *DC);
   void EmitLinkageSpec(const LinkageSpecDecl *D);
+  void EmitTopLevelStmt(const TopLevelStmtDecl *D);
 
   /// Emit the function that initializes C++ thread_local variables.
   void EmitCXXThreadLocalInitFunc();
@@ -1695,7 +1709,7 @@ private:
 
   /// Emit the module flag metadata used to pass options controlling the
   /// the backend to LLVM.
-  void EmitBackendOptionsMetadata(const CodeGenOptions CodeGenOpts);
+  void EmitBackendOptionsMetadata(const CodeGenOptions &CodeGenOpts);
 
   /// Emits OpenCL specific Metadata e.g. OpenCL version.
   void EmitOpenCLMetadata();
@@ -1717,6 +1731,12 @@ private:
   /// Check whether we can use a "simpler", more core exceptions personality
   /// function.
   void SimplifyPersonality();
+
+  /// Helper function for getDefaultFunctionAttributes. Builds a set of function
+  /// attributes which can be simply added to a function.
+  void getTrivialDefaultFunctionAttributes(StringRef Name, bool HasOptnone,
+                                           bool AttrOnCallSite,
+                                           llvm::AttrBuilder &FuncAttrs);
 
   /// Helper function for ConstructAttributeList and
   /// addDefaultFunctionDefinitionAttributes.  Builds a set of function

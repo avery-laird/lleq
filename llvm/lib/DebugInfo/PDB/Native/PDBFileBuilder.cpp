@@ -7,6 +7,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/DebugInfo/PDB/Native/PDBFileBuilder.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/DebugInfo/CodeView/CodeView.h"
 #include "llvm/DebugInfo/CodeView/GUID.h"
 #include "llvm/DebugInfo/MSF/MSFBuilder.h"
@@ -354,7 +356,7 @@ Error PDBFileBuilder::commit(StringRef Filename, codeview::GUID *Guid) {
   } else {
     H->Age = Info->getAge();
     H->Guid = Info->getGuid();
-    Optional<uint32_t> Sig = Info->getSignature();
+    std::optional<uint32_t> Sig = Info->getSignature();
     H->Signature = Sig ? *Sig : time(nullptr);
   }
 

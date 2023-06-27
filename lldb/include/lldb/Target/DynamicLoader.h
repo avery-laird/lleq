@@ -226,6 +226,13 @@ public:
   /// \param[in] process
   ///     The process to add this binary to.
   ///
+  /// \param[in] name
+  ///     Name of the binary, if available.  If this method cannot find a
+  ///     matching binary on the debug host, it may create a memory module
+  ///     out of live memory, and the provided name will be used.  If an
+  ///     empty StringRef is provided, a name will be constructed for the module
+  ///     based on the address it is loaded at.
+  ///
   /// \param[in] uuid
   ///     UUID of the binary to be loaded.  UUID may be empty, and if a
   ///     load address is supplied, will read the binary from memory, get
@@ -249,12 +256,21 @@ public:
   ///     to the Target.  The caller may prefer to batch up these when loading
   ///     multiple binaries.
   ///
+  /// \param[in] set_address_in_target
+  ///     Whether the address of the binary should be set in the Target if it
+  ///     is added.  The caller may want to set the section addresses
+  ///     individually, instead of loading the binary the entire based on the
+  ///     start address or slide.  The caller is responsible for setting the
+  ///     load address for the binary or its segments in the Target if it passes
+  ///     true.
+  ///
   /// \return
   ///     Returns a shared pointer for the Module that has been added.
   static lldb::ModuleSP
-  LoadBinaryWithUUIDAndAddress(Process *process, UUID uuid, lldb::addr_t value,
+  LoadBinaryWithUUIDAndAddress(Process *process, llvm::StringRef name,
+                               UUID uuid, lldb::addr_t value,
                                bool value_is_offset, bool force_symbol_search,
-                               bool notify);
+                               bool notify, bool set_address_in_target);
 
   /// Get information about the shared cache for a process, if possible.
   ///

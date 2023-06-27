@@ -2,5 +2,10 @@ omp_*
 *llvm_*
 __kmpc_*
 
+_ZN4ompx*
+
+IsSPMDMode
+
 memcmp
 printf
+__assert_fail

@@ -10,13 +10,11 @@
 #define LLDB_UTILITY_ARCHSPEC_H
 
 #include "lldb/Utility/CompletionRequest.h"
-#include "lldb/Utility/ConstString.h"
 #include "lldb/lldb-enumerations.h"
 #include "lldb/lldb-forward.h"
 #include "lldb/lldb-private-enumerations.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/Triple.h"
-#include "llvm/Support/YAMLTraits.h"
+#include "llvm/TargetParser/Triple.h"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -109,6 +107,12 @@ public:
     eRISCVSubType_riscv64,
   };
 
+  enum LoongArchSubType {
+    eLoongArchSubType_unknown,
+    eLoongArchSubType_loongarch32,
+    eLoongArchSubType_loongarch64,
+  };
+
   enum Core {
     eCore_arm_generic,
     eCore_arm_armv4,
@@ -167,6 +171,8 @@ public:
     eCore_mips64r5el,
     eCore_mips64r6el,
 
+    eCore_msp430,
+
     eCore_ppc_generic,
     eCore_ppc_ppc601,
     eCore_ppc_ppc602,
@@ -204,6 +210,9 @@ public:
 
     eCore_riscv32,
     eCore_riscv64,
+
+    eCore_loongarch32,
+    eCore_loongarch64,
 
     eCore_uknownMach32,
     eCore_uknownMach64,
@@ -331,20 +340,6 @@ public:
   ///
   /// \return An LLVM arch type.
   llvm::Triple::ArchType GetMachine() const;
-
-  /// Returns the distribution id of the architecture.
-  ///
-  /// This will be something like "ubuntu", "fedora", etc. on Linux.
-  ///
-  /// \return A ConstString ref containing the distribution id,
-  ///         potentially empty.
-  ConstString GetDistributionId() const;
-
-  /// Set the distribution id of the architecture.
-  ///
-  /// This will be something like "ubuntu", "fedora", etc. on Linux. This
-  /// should be the same value returned by HostInfo::GetDistributionId ().
-  void SetDistributionId(const char *distribution_id);
 
   /// Tests if this ArchSpec is valid.
   ///
@@ -545,8 +540,6 @@ protected:
   // these are application specific extensions like micromips, mips16 etc.
   uint32_t m_flags = 0;
 
-  ConstString m_distribution_id;
-
   // Called when m_def or m_entry are changed.  Fills in all remaining members
   // with default values.
   void CoreUpdated(bool update_triple);
@@ -567,17 +560,5 @@ bool operator==(const ArchSpec &lhs, const ArchSpec &rhs);
 bool ParseMachCPUDashSubtypeTriple(llvm::StringRef triple_str, ArchSpec &arch);
 
 } // namespace lldb_private
-
-namespace llvm {
-namespace yaml {
-template <> struct ScalarTraits<lldb_private::ArchSpec> {
-  static void output(const lldb_private::ArchSpec &, void *, raw_ostream &);
-  static StringRef input(StringRef, void *, lldb_private::ArchSpec &);
-  static QuotingType mustQuote(StringRef S) { return QuotingType::Double; }
-};
-} // namespace yaml
-} // namespace llvm
-
-LLVM_YAML_IS_SEQUENCE_VECTOR(lldb_private::ArchSpec)
 
 #endif // LLDB_UTILITY_ARCHSPEC_H

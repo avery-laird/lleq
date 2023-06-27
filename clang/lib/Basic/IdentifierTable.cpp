@@ -109,7 +109,8 @@ namespace {
     KEYMSCOMPAT   = 0x400000,
     KEYSYCL       = 0x800000,
     KEYCUDA       = 0x1000000,
-    KEYMAX        = KEYCUDA, // The maximum key
+    KEYHLSL       = 0x2000000,
+    KEYMAX        = KEYHLSL, // The maximum key
     KEYALLCXX = KEYCXX | KEYCXX11 | KEYCXX20,
     KEYALL = (KEYMAX | (KEYMAX-1)) & ~KEYNOMS18 &
              ~KEYNOOPENCL // KEYNOMS18 and KEYNOOPENCL are used to exclude.
@@ -190,7 +191,7 @@ static KeywordStatus getKeywordStatusHelper(const LangOptions &LangOpts,
   case KEYCOROUTINES:
     return LangOpts.Coroutines ? KS_Enabled : KS_Unknown;
   case KEYMODULES:
-    return LangOpts.ModulesTS ? KS_Enabled : KS_Unknown;
+    return KS_Unknown;
   case KEYOPENCLCXX:
     return LangOpts.OpenCLCPlusPlus ? KS_Enabled : KS_Unknown;
   case KEYMSCOMPAT:
@@ -199,6 +200,8 @@ static KeywordStatus getKeywordStatusHelper(const LangOptions &LangOpts,
     return LangOpts.isSYCL() ? KS_Enabled : KS_Unknown;
   case KEYCUDA:
     return LangOpts.CUDA ? KS_Enabled : KS_Unknown;
+  case KEYHLSL:
+    return LangOpts.HLSL ? KS_Enabled : KS_Unknown;
   case KEYNOCXX:
     // This is enabled in all non-C++ modes, but might be enabled for other
     // reasons as well.
@@ -276,6 +279,16 @@ static void AddObjCKeyword(StringRef Name,
   Table.get(Name).setObjCKeywordID(ObjCID);
 }
 
+static void AddInterestingIdentifier(StringRef Name,
+                                     tok::InterestingIdentifierKind BTID,
+                                     IdentifierTable &Table) {
+  // Don't add 'not_interesting' identifier.
+  if (BTID != tok::not_interesting) {
+    IdentifierInfo &Info = Table.get(Name, tok::identifier);
+    Info.setInterestingIdentifierID(BTID);
+  }
+}
+
 /// AddKeywords - Add all keywords to the symbol table.
 ///
 void IdentifierTable::AddKeywords(const LangOptions &LangOpts) {
@@ -292,6 +305,9 @@ void IdentifierTable::AddKeywords(const LangOptions &LangOpts) {
 #define OBJC_AT_KEYWORD(NAME)  \
   if (LangOpts.ObjC)           \
     AddObjCKeyword(StringRef(#NAME), tok::objc_##NAME, *this);
+#define INTERESTING_IDENTIFIER(NAME)                                           \
+  AddInterestingIdentifier(StringRef(#NAME), tok::NAME, *this);
+
 #define TESTING_KEYWORD(NAME, FLAGS)
 #include "clang/Basic/TokenKinds.def"
 
@@ -842,6 +858,21 @@ StringRef clang::getNullabilitySpelling(NullabilityKind kind,
 
   case NullabilityKind::Unspecified:
     return isContextSensitive ? "null_unspecified" : "_Null_unspecified";
+  }
+  llvm_unreachable("Unknown nullability kind.");
+}
+
+llvm::raw_ostream &clang::operator<<(llvm::raw_ostream &OS,
+                                     NullabilityKind NK) {
+  switch (NK) {
+  case NullabilityKind::NonNull:
+    return OS << "NonNull";
+  case NullabilityKind::Nullable:
+    return OS << "Nullable";
+  case NullabilityKind::NullableResult:
+    return OS << "NullableResult";
+  case NullabilityKind::Unspecified:
+    return OS << "Unspecified";
   }
   llvm_unreachable("Unknown nullability kind.");
 }

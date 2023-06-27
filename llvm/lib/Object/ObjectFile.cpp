@@ -96,6 +96,11 @@ bool ObjectFile::isBerkeleyData(DataRefImpl Sec) const {
 
 bool ObjectFile::isDebugSection(DataRefImpl Sec) const { return false; }
 
+bool ObjectFile::hasDebugInfo() const {
+  return any_of(sections(),
+                [](SectionRef Sec) { return Sec.isDebugSection(); });
+}
+
 Expected<section_iterator>
 ObjectFile::getRelocatedSection(DataRefImpl Sec) const {
   return section_iterator(SectionRef(Sec, this));
@@ -124,6 +129,10 @@ Triple ObjectFile::makeTriple() const {
     // XCOFF implies AIX.
     TheTriple.setOS(Triple::AIX);
     TheTriple.setObjectFormat(Triple::XCOFF);
+  }
+  else if (isGOFF()) {
+    TheTriple.setOS(Triple::ZOS);
+    TheTriple.setObjectFormat(Triple::GOFF);
   }
 
   return TheTriple;

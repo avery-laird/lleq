@@ -39,6 +39,7 @@ class RestrictedPtrType<Type type> : Type {
 def VarArgType : NamedType<"...">;
 def VoidType : NamedType<"void">;
 def IntType : NamedType<"int">;
+def UnsignedIntType : NamedType<"unsigned int">;
 def LongType : NamedType<"long">;
 def UnsignedLongType : NamedType<"unsigned long">;
 def LongLongType : NamedType<"long long">;
@@ -58,10 +59,16 @@ def SizeTType : NamedType<"size_t">;
 def SizeTPtr : PtrType<SizeTType>;
 def RestrictedSizeTPtr : RestrictedPtrType<SizeTType>;
 
+def WCharType : NamedType<"wchar_t">;
+def WIntType : NamedType<"wint_t">;
+
 def LongDoublePtr : PtrType<LongDoubleType>;
 
 def IntMaxTType : NamedType<"intmax_t">;
 def UIntMaxTType : NamedType<"uintmax_t">;
+
+def UInt16Type : NamedType<"uint16_t">;
+def UInt32Type : NamedType<"uint32_t">;
 
 def OffTType : NamedType<"off_t">;
 def OffTPtr : PtrType<OffTType>;
@@ -79,6 +86,7 @@ def ConstCharPtr : ConstType<CharPtr>;
 def CharRestrictedPtr : RestrictedPtrType<CharType>;
 def CharRestrictedPtrPtr : RestrictedPtrType<CharPtr>;
 def ConstCharRestrictedPtr : ConstType<CharRestrictedPtr>;
+def ConstCharRestrictedPtrPtr : PtrType<ConstCharRestrictedPtr>;
 
 def OnceFlagType : NamedType<"once_flag">;
 def OnceFlagTypePtr : PtrType<OnceFlagType>;
@@ -112,6 +120,18 @@ def FILEPtr : PtrType<FILE>;
 def FILERestrictedPtr : RestrictedPtrType<FILE>;
 
 def PThreadTType : NamedType<"pthread_t">;
+
+def PidT : NamedType<"pid_t">;
+def RestrictedPidTPtr : RestrictedPtrType<PidT>;
+
+def StructRUsage : NamedType<"struct rusage">;
+def StructRUsagePtr : PtrType<StructRUsage>;
+
+def StructTimevalType : NamedType<"struct timeval">;
+def StructTimevalPtr : PtrType<StructTimevalType>;
+def RestrictedStructTimevalPtr : RestrictedPtrType<StructTimevalType>;
+
+def SuSecondsT : NamedType<"suseconds_t">;
 
 //added because __assert_fail needs it.
 def UnsignedType : NamedType<"unsigned">;

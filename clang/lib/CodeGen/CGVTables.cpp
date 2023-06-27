@@ -128,7 +128,7 @@ static void resolveTopLevelMetadata(llvm::Function *Fn,
 
   // Find all llvm.dbg.declare intrinsics and resolve the DILocalVariable nodes
   // they are referencing.
-  for (auto &BB : Fn->getBasicBlockList()) {
+  for (auto &BB : *Fn) {
     for (auto &I : BB) {
       if (auto *DII = dyn_cast<llvm::DbgVariableIntrinsic>(&I)) {
         auto *DILocal = DII->getVariable();
@@ -678,15 +678,23 @@ void CodeGenVTables::addRelativeComponent(ConstantArrayBuilder &builder,
                                       /*position=*/vtableAddressPoint);
 }
 
-bool CodeGenVTables::useRelativeLayout() const {
+static bool UseRelativeLayout(const CodeGenModule &CGM) {
   return CGM.getTarget().getCXXABI().isItaniumFamily() &&
          CGM.getItaniumVTableContext().isRelativeLayout();
 }
 
+bool CodeGenVTables::useRelativeLayout() const {
+  return UseRelativeLayout(CGM);
+}
+
+llvm::Type *CodeGenModule::getVTableComponentType() const {
+  if (UseRelativeLayout(*this))
+    return Int32Ty;
+  return Int8PtrTy;
+}
+
 llvm::Type *CodeGenVTables::getVTableComponentType() const {
-  if (useRelativeLayout())
-    return CGM.Int32Ty;
-  return CGM.Int8PtrTy;
+  return CGM.getVTableComponentType();
 }
 
 static void AddPointerLayoutOffset(const CodeGenModule &CGM,
@@ -901,7 +909,7 @@ llvm::GlobalVariable *CodeGenVTables::GenerateConstructionVTable(
   if (Linkage == llvm::GlobalVariable::AvailableExternallyLinkage)
     Linkage = llvm::GlobalVariable::InternalLinkage;
 
-  unsigned Align = CGM.getDataLayout().getABITypeAlignment(VTType);
+  llvm::Align Align = CGM.getDataLayout().getABITypeAlign(VTType);
 
   // Create the variable that will hold the construction vtable.
   llvm::GlobalVariable *VTable =
@@ -1037,19 +1045,20 @@ CodeGenModule::getVTableLinkage(const CXXRecordDecl *RD) {
     switch (keyFunction->getTemplateSpecializationKind()) {
       case TSK_Undeclared:
       case TSK_ExplicitSpecialization:
-        assert((def || CodeGenOpts.OptimizationLevel > 0 ||
-                CodeGenOpts.getDebugInfo() != codegenoptions::NoDebugInfo) &&
-               "Shouldn't query vtable linkage without key function, "
-               "optimizations, or debug info");
-        if (!def && CodeGenOpts.OptimizationLevel > 0)
-          return llvm::GlobalVariable::AvailableExternallyLinkage;
+      assert(
+          (def || CodeGenOpts.OptimizationLevel > 0 ||
+           CodeGenOpts.getDebugInfo() != llvm::codegenoptions::NoDebugInfo) &&
+          "Shouldn't query vtable linkage without key function, "
+          "optimizations, or debug info");
+      if (!def && CodeGenOpts.OptimizationLevel > 0)
+        return llvm::GlobalVariable::AvailableExternallyLinkage;
 
-        if (keyFunction->isInlined())
-          return !Context.getLangOpts().AppleKext ?
-                   llvm::GlobalVariable::LinkOnceODRLinkage :
-                   llvm::Function::InternalLinkage;
+      if (keyFunction->isInlined())
+        return !Context.getLangOpts().AppleKext
+                   ? llvm::GlobalVariable::LinkOnceODRLinkage
+                   : llvm::Function::InternalLinkage;
 
-        return llvm::GlobalVariable::ExternalLinkage;
+      return llvm::GlobalVariable::ExternalLinkage;
 
       case TSK_ImplicitInstantiation:
         return !Context.getLangOpts().AppleKext ?
@@ -1163,9 +1172,16 @@ bool CodeGenVTables::isVTableExternal(const CXXRecordDecl *RD) {
   if (!keyFunction)
     return false;
 
+  const FunctionDecl *Def;
   // Otherwise, if we don't have a definition of the key function, the
   // vtable must be defined somewhere else.
-  return !keyFunction->hasBody();
+  if (!keyFunction->hasBody(Def))
+    return true;
+
+  assert(Def && "The body of the key function is not assigned to Def?");
+  // If the non-inline key function comes from another module unit, the vtable
+  // must be defined there.
+  return Def->isInAnotherModuleUnit() && !Def->isInlineSpecified();
 }
 
 /// Given that we're currently at the end of the translation unit, and
@@ -1203,7 +1219,8 @@ void CodeGenModule::EmitDeferredVTables() {
 }
 
 bool CodeGenModule::AlwaysHasLTOVisibilityPublic(const CXXRecordDecl *RD) {
-  if (RD->hasAttr<LTOVisibilityPublicAttr>() || RD->hasAttr<UuidAttr>())
+  if (RD->hasAttr<LTOVisibilityPublicAttr>() || RD->hasAttr<UuidAttr>() ||
+      RD->hasAttr<DLLExportAttr>() || RD->hasAttr<DLLImportAttr>())
     return true;
 
   if (!getCodeGenOpts().LTOVisibilityPublicStd)
@@ -1230,13 +1247,9 @@ bool CodeGenModule::HasHiddenLTOVisibility(const CXXRecordDecl *RD) {
   if (!isExternallyVisible(LV.getLinkage()))
     return true;
 
-  if (getTriple().isOSBinFormatCOFF()) {
-    if (RD->hasAttr<DLLExportAttr>() || RD->hasAttr<DLLImportAttr>())
-      return false;
-  } else {
-    if (LV.getVisibility() != HiddenVisibility)
-      return false;
-  }
+  if (!getTriple().isOSBinFormatCOFF() &&
+      LV.getVisibility() != HiddenVisibility)
+    return false;
 
   return !AlwaysHasLTOVisibilityPublic(RD);
 }
@@ -1260,13 +1273,13 @@ llvm::GlobalObject::VCallVisibility CodeGenModule::GetVCallVisibilityLevel(
   else
     TypeVis = llvm::GlobalObject::VCallVisibilityPublic;
 
-  for (auto B : RD->bases())
+  for (const auto &B : RD->bases())
     if (B.getType()->getAsCXXRecordDecl()->isDynamicClass())
       TypeVis = std::min(
           TypeVis,
           GetVCallVisibilityLevel(B.getType()->getAsCXXRecordDecl(), Visited));
 
-  for (auto B : RD->vbases())
+  for (const auto &B : RD->vbases())
     if (B.getType()->getAsCXXRecordDecl()->isDynamicClass())
       TypeVis = std::min(
           TypeVis,
@@ -1281,8 +1294,7 @@ void CodeGenModule::EmitVTableTypeMetadata(const CXXRecordDecl *RD,
   if (!getCodeGenOpts().LTOUnit)
     return;
 
-  CharUnits PointerWidth =
-      Context.toCharUnitsFromBits(Context.getTargetInfo().getPointerWidth(0));
+  CharUnits ComponentWidth = GetTargetTypeStoreSize(getVTableComponentType());
 
   typedef std::pair<const CXXRecordDecl *, unsigned> AddressPoint;
   std::vector<AddressPoint> AddressPoints;
@@ -1320,7 +1332,7 @@ void CodeGenModule::EmitVTableTypeMetadata(const CXXRecordDecl *RD,
   ArrayRef<VTableComponent> Comps = VTLayout.vtable_components();
   for (auto AP : AddressPoints) {
     // Create type metadata for the address point.
-    AddVTableTypeMetadata(VTable, PointerWidth * AP.second, AP.first);
+    AddVTableTypeMetadata(VTable, ComponentWidth * AP.second, AP.first);
 
     // The class associated with each address point could also potentially be
     // used for indirect calls via a member function pointer, so we need to
@@ -1333,7 +1345,7 @@ void CodeGenModule::EmitVTableTypeMetadata(const CXXRecordDecl *RD,
           Context.getMemberPointerType(
               Comps[I].getFunctionDecl()->getType(),
               Context.getRecordType(AP.first).getTypePtr()));
-      VTable->addTypeMetadata((PointerWidth * I).getQuantity(), MD);
+      VTable->addTypeMetadata((ComponentWidth * I).getQuantity(), MD);
     }
   }
 

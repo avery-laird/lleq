@@ -41,11 +41,18 @@ public:
   /// given JITDylib.
   static Expected<std::unique_ptr<COFFPlatform>>
   Create(ExecutionSession &ES, ObjectLinkingLayer &ObjLinkingLayer,
-         JITDylib &PlatformJD, const char *OrcRuntimePath,
-         LoadDynamicLibrary LoadDynLibrary, const char *VCRuntimePath = nullptr,
-         Optional<SymbolAliasMap> RuntimeAliases = None);
+         JITDylib &PlatformJD,
+         std::unique_ptr<MemoryBuffer> OrcRuntimeArchiveBuffer,
+         LoadDynamicLibrary LoadDynLibrary, bool StaticVCRuntime = false,
+         const char *VCRuntimePath = nullptr,
+         std::optional<SymbolAliasMap> RuntimeAliases = std::nullopt);
 
-  Error bootstrap(JITDylib &PlatformJD);
+  static Expected<std::unique_ptr<COFFPlatform>>
+  Create(ExecutionSession &ES, ObjectLinkingLayer &ObjLinkingLayer,
+         JITDylib &PlatformJD, const char *OrcRuntimePath,
+         LoadDynamicLibrary LoadDynLibrary, bool StaticVCRuntime = false,
+         const char *VCRuntimePath = nullptr,
+         std::optional<SymbolAliasMap> RuntimeAliases = std::nullopt);
 
   ExecutionSession &getExecutionSession() const { return ES; }
   ObjectLinkingLayer &getObjectLinkingLayer() const { return ObjLinkingLayer; }
@@ -67,10 +74,6 @@ public:
   /// Returns the array of standard runtime utility aliases for COFF.
   static ArrayRef<std::pair<const char *, const char *>>
   standardRuntimeUtilityAliases();
-
-  static bool isInitializerSection(StringRef Name) {
-    return Name.startswith(".CRT");
-  }
 
   static StringRef getSEHFrameSectionName() { return ".pdata"; }
 
@@ -105,11 +108,11 @@ private:
       return Error::success();
     }
 
-    Error notifyRemovingResources(ResourceKey K) override {
+    Error notifyRemovingResources(JITDylib &JD, ResourceKey K) override {
       return Error::success();
     }
 
-    void notifyTransferringResources(ResourceKey DstKey,
+    void notifyTransferringResources(JITDylib &JD, ResourceKey DstKey,
                                      ResourceKey SrcKey) override {}
 
   private:
@@ -145,7 +148,10 @@ private:
       ExecutionSession &ES, ObjectLinkingLayer &ObjLinkingLayer,
       JITDylib &PlatformJD,
       std::unique_ptr<StaticLibraryDefinitionGenerator> OrcRuntimeGenerator,
-      LoadDynamicLibrary LoadDynLibrary, const char *VCRuntimePath, Error &Err);
+      std::unique_ptr<MemoryBuffer> OrcRuntimeArchiveBuffer,
+      std::unique_ptr<object::Archive> OrcRuntimeArchive,
+      LoadDynamicLibrary LoadDynLibrary, bool StaticVCRuntime,
+      const char *VCRuntimePath, Error &Err);
 
   // Associate COFFPlatform JIT-side runtime support functions with handlers.
   Error associateRuntimeSupportFunctions(JITDylib &PlatformJD);
@@ -164,6 +170,8 @@ private:
   // Build dependency graph of a JITDylib
   Expected<JITDylibDepMap> buildJDDepMap(JITDylib &JD);
 
+  Expected<MemoryBufferRef> getPerJDObjectFile();
+
   // Implements rt_pushInitializers by making repeat async lookups for
   // initializer symbols (each lookup may spawn more initializer symbols if
   // it pulls in new materializers, e.g. from objects in a static library).
@@ -181,6 +189,9 @@ private:
 
   LoadDynamicLibrary LoadDynLibrary;
   std::unique_ptr<COFFVCRuntimeBootstrapper> VCRuntimeBootstrap;
+  std::unique_ptr<MemoryBuffer> OrcRuntimeArchiveBuffer;
+  std::unique_ptr<object::Archive> OrcRuntimeArchive;
+  bool StaticVCRuntime;
 
   SymbolStringPtr COFFHeaderStartSymbol;
 

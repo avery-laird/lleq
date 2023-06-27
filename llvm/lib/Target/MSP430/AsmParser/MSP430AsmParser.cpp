@@ -45,8 +45,9 @@ class MSP430AsmParser : public MCTargetAsmParser {
                                uint64_t &ErrorInfo,
                                bool MatchingInlineAsm) override;
 
-  bool ParseRegister(unsigned &RegNo, SMLoc &StartLoc, SMLoc &EndLoc) override;
-  OperandMatchResultTy tryParseRegister(unsigned &RegNo, SMLoc &StartLoc,
+  bool parseRegister(MCRegister &RegNo, SMLoc &StartLoc,
+                     SMLoc &EndLoc) override;
+  OperandMatchResultTy tryParseRegister(MCRegister &RegNo, SMLoc &StartLoc,
                                         SMLoc &EndLoc) override;
 
   bool ParseInstruction(ParseInstructionInfo &Info, StringRef Name,
@@ -289,7 +290,7 @@ bool MSP430AsmParser::MatchAndEmitInstruction(SMLoc Loc, unsigned &Opcode,
 static unsigned MatchRegisterName(StringRef Name);
 static unsigned MatchRegisterAltName(StringRef Name);
 
-bool MSP430AsmParser::ParseRegister(unsigned &RegNo, SMLoc &StartLoc,
+bool MSP430AsmParser::parseRegister(MCRegister &RegNo, SMLoc &StartLoc,
                                     SMLoc &EndLoc) {
   switch (tryParseRegister(RegNo, StartLoc, EndLoc)) {
   case MatchOperand_ParseFail:
@@ -303,7 +304,7 @@ bool MSP430AsmParser::ParseRegister(unsigned &RegNo, SMLoc &StartLoc,
   llvm_unreachable("unknown match result type");
 }
 
-OperandMatchResultTy MSP430AsmParser::tryParseRegister(unsigned &RegNo,
+OperandMatchResultTy MSP430AsmParser::tryParseRegister(MCRegister &RegNo,
                                                        SMLoc &StartLoc,
                                                        SMLoc &EndLoc) {
   if (getLexer().getKind() == AsmToken::Identifier) {
@@ -329,7 +330,7 @@ OperandMatchResultTy MSP430AsmParser::tryParseRegister(unsigned &RegNo,
 bool MSP430AsmParser::parseJccInstruction(ParseInstructionInfo &Info,
                                           StringRef Name, SMLoc NameLoc,
                                           OperandVector &Operands) {
-  if (!Name.startswith_insensitive("j"))
+  if (!Name.starts_with_insensitive("j"))
     return true;
 
   auto CC = Name.drop_front().lower();
@@ -362,8 +363,7 @@ bool MSP430AsmParser::parseJccInstruction(ParseInstructionInfo &Info,
   }
 
   // Skip optional '$' sign.
-  if (getLexer().getKind() == AsmToken::Dollar)
-    getLexer().Lex(); // Eat '$'
+  (void)parseOptionalToken(AsmToken::Dollar);
 
   const MCExpr *Val;
   SMLoc ExprLoc = getLexer().getLoc();
@@ -392,7 +392,7 @@ bool MSP430AsmParser::ParseInstruction(ParseInstructionInfo &Info,
                                        StringRef Name, SMLoc NameLoc,
                                        OperandVector &Operands) {
   // Drop .w suffix
-  if (Name.endswith_insensitive(".w"))
+  if (Name.ends_with_insensitive(".w"))
     Name = Name.drop_back(2);
 
   if (!parseJccInstruction(Info, Name, NameLoc, Operands))
@@ -410,11 +410,8 @@ bool MSP430AsmParser::ParseInstruction(ParseInstructionInfo &Info,
     return true;
 
   // Parse second operand if any
-  if (getLexer().is(AsmToken::Comma)) {
-    getLexer().Lex(); // Eat ','
-    if (ParseOperand(Operands))
-      return true;
-  }
+  if (parseOptionalToken(AsmToken::Comma) && ParseOperand(Operands))
+    return true;
 
   if (getLexer().isNot(AsmToken::EndOfStatement)) {
     SMLoc Loc = getLexer().getLoc();
@@ -455,9 +452,9 @@ bool MSP430AsmParser::ParseOperand(OperandVector &Operands) {
     default: return true;
     case AsmToken::Identifier: {
       // try rN
-      unsigned RegNo;
+      MCRegister RegNo;
       SMLoc StartLoc, EndLoc;
-      if (!ParseRegister(RegNo, StartLoc, EndLoc)) {
+      if (!parseRegister(RegNo, StartLoc, EndLoc)) {
         Operands.push_back(MSP430Operand::CreateReg(RegNo, StartLoc, EndLoc));
         return false;
       }
@@ -470,18 +467,16 @@ bool MSP430AsmParser::ParseOperand(OperandVector &Operands) {
       const MCExpr *Val;
       // Try constexpr[(rN)]
       if (!getParser().parseExpression(Val)) {
-        unsigned RegNo = MSP430::PC;
+        MCRegister RegNo = MSP430::PC;
         SMLoc EndLoc = getParser().getTok().getLoc();
         // Try (rN)
-        if (getLexer().getKind() == AsmToken::LParen) {
-          getLexer().Lex(); // Eat '('
+        if (parseOptionalToken(AsmToken::LParen)) {
           SMLoc RegStartLoc;
-          if (ParseRegister(RegNo, RegStartLoc, EndLoc))
-            return true;
-          if (getLexer().getKind() != AsmToken::RParen)
+          if (parseRegister(RegNo, RegStartLoc, EndLoc))
             return true;
           EndLoc = getParser().getTok().getEndLoc();
-          getLexer().Lex(); // Eat ')'
+          if (!parseOptionalToken(AsmToken::RParen))
+            return true;
         }
         Operands.push_back(MSP430Operand::CreateMem(RegNo, Val, StartLoc,
           EndLoc));
@@ -506,13 +501,12 @@ bool MSP430AsmParser::ParseOperand(OperandVector &Operands) {
       // Try @rN[+]
       SMLoc StartLoc = getParser().getTok().getLoc();
       getLexer().Lex(); // Eat '@'
-      unsigned RegNo;
+      MCRegister RegNo;
       SMLoc RegStartLoc, EndLoc;
-      if (ParseRegister(RegNo, RegStartLoc, EndLoc))
+      if (parseRegister(RegNo, RegStartLoc, EndLoc))
         return true;
-      if (getLexer().getKind() == AsmToken::Plus) {
+      if (parseOptionalToken(AsmToken::Plus)) {
         Operands.push_back(MSP430Operand::CreatePostIndReg(RegNo, StartLoc, EndLoc));
-        getLexer().Lex(); // Eat '+'
         return false;
       }
       if (Operands.size() > 1) // Emulate @rd in destination position as 0(rd)

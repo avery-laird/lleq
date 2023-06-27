@@ -1,4 +1,7 @@
-// RUN: %clang_analyze_cc1 -analyzer-checker=core,alpha.unix.Stream -analyzer-output text -verify %s
+// RUN: %clang_analyze_cc1 -analyzer-checker=core,alpha.unix.Stream -analyzer-output text \
+// RUN:   -verify %s
+// RUN: %clang_analyze_cc1 -analyzer-checker=core,alpha.unix.Stream,alpha.unix.StdCLibraryFunctions -analyzer-output text \
+// RUN:   -analyzer-config alpha.unix.StdCLibraryFunctions:ModelPOSIX=true -verify=expected,stdargs %s
 
 #include "Inputs/system-header-simulator.h"
 
@@ -86,7 +89,7 @@ void check_track_null(void) {
     return;
   }
   fclose(F); // expected-warning {{Stream pointer might be NULL}}
-  // expected-note@-1 {{Stream pointer might be NULL}}
+             // expected-note@-1 {{Stream pointer might be NULL}}
 }
 
 void check_eof_notes_feof_after_feof(void) {

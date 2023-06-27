@@ -17,13 +17,17 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/BinaryFormat/ELF.h"
+#include "llvm/Option/ArgList.h"
 #include "llvm/Support/CachePruning.h"
 #include "llvm/Support/CodeGen.h"
+#include "llvm/Support/Compiler.h"
+#include "llvm/Support/Compression.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/GlobPattern.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace lld::elf {
@@ -34,7 +38,9 @@ class BitcodeFile;
 class ELFFileBase;
 class SharedFile;
 class InputSectionBase;
+class EhInputSection;
 class Symbol;
+class BitcodeCompiler;
 
 enum ELFKind : uint8_t {
   ELFNoneKind,
@@ -67,7 +73,14 @@ enum class UnresolvedPolicy { ReportError, Warn, Ignore };
 enum class OrphanHandlingPolicy { Place, Warn, Error };
 
 // For --sort-section and linkerscript sorting rules.
-enum class SortSectionPolicy { Default, None, Alignment, Name, Priority };
+enum class SortSectionPolicy {
+  Default,
+  None,
+  Alignment,
+  Name,
+  Priority,
+  Reverse,
+};
 
 // For --target2
 enum class Target2Policy { Abs, Rel, GotRel };
@@ -96,11 +109,36 @@ struct VersionDefinition {
   SmallVector<SymbolVersion, 0> localPatterns;
 };
 
+class LinkerDriver {
+public:
+  void linkerMain(ArrayRef<const char *> args);
+  void addFile(StringRef path, bool withLOption);
+  void addLibrary(StringRef name);
+
+private:
+  void createFiles(llvm::opt::InputArgList &args);
+  void inferMachineType();
+  void link(llvm::opt::InputArgList &args);
+  template <class ELFT> void compileBitcodeFiles(bool skipLinkedOutput);
+
+  // True if we are in --whole-archive and --no-whole-archive.
+  bool inWholeArchive = false;
+
+  // True if we are in --start-lib and --end-lib.
+  bool inLib = false;
+
+  std::unique_ptr<BitcodeCompiler> lto;
+  std::vector<InputFile *> files;
+
+public:
+  SmallVector<std::pair<StringRef, unsigned>, 0> archiveFiles;
+};
+
 // This struct contains the global configuration for the linker.
 // Most fields are direct mapping from the command line options
 // and such fields have the same name as the corresponding options.
-// Most fields are initialized by the driver.
-struct Configuration {
+// Most fields are initialized by the ctx.driver.
+struct Config {
   uint8_t osabi = 0;
   uint32_t andFeatures = 0;
   llvm::CachePruningPolicy thinLTOCachePolicy;
@@ -123,7 +161,7 @@ struct Configuration {
   llvm::StringRef mapFile;
   llvm::StringRef outputFile;
   llvm::StringRef optRemarksFilename;
-  llvm::Optional<uint64_t> optRemarksHotnessThreshold = 0;
+  std::optional<uint64_t> optRemarksHotnessThreshold = 0;
   llvm::StringRef optRemarksPasses;
   llvm::StringRef optRemarksFormat;
   llvm::StringRef optStatsFilename;
@@ -139,7 +177,9 @@ struct Configuration {
   StringRef zCetReport = "none";
   llvm::StringRef ltoBasicBlockSections;
   std::pair<llvm::StringRef, llvm::StringRef> thinLTOObjectSuffixReplace;
-  std::pair<llvm::StringRef, llvm::StringRef> thinLTOPrefixReplace;
+  llvm::StringRef thinLTOPrefixReplaceOld;
+  llvm::StringRef thinLTOPrefixReplaceNew;
+  llvm::StringRef thinLTOPrefixReplaceNativeObject;
   std::string rpath;
   llvm::SmallVector<VersionDefinition, 0> versionDefinitions;
   llvm::SmallVector<llvm::StringRef, 0> auxiliaryList;
@@ -151,6 +191,7 @@ struct Configuration {
   llvm::SmallVector<llvm::StringRef, 0> undefined;
   llvm::SmallVector<SymbolVersion, 0> dynamicList;
   llvm::SmallVector<uint8_t, 0> buildIdVector;
+  llvm::SmallVector<llvm::StringRef, 0> mllvmOpts;
   llvm::MapVector<std::pair<const InputSectionBase *, const InputSectionBase *>,
                   uint64_t>
       callGraphProfile;
@@ -160,11 +201,12 @@ struct Configuration {
   bool armHasMovtMovw = false;
   bool armJ1J2BranchEncoding = false;
   bool asNeeded = false;
+  bool armBe8 = false;
   BsymbolicKind bsymbolic = BsymbolicKind::None;
   bool callGraphProfileSort;
   bool checkSections;
   bool checkDynamicRelocs;
-  bool compressDebugSections;
+  llvm::DebugCompressionType compressDebugSections;
   bool cref;
   llvm::SmallVector<std::pair<llvm::GlobPattern, uint64_t>, 0>
       deadRelocInNonAlloc;
@@ -203,7 +245,6 @@ struct Configuration {
   bool nostdlib;
   bool oFormatBinary;
   bool omagic;
-  bool opaquePointers;
   bool optEB = false;
   bool optEL = false;
   bool optimizeBBJumps;
@@ -212,7 +253,9 @@ struct Configuration {
   bool pie;
   bool printGcSections;
   bool printIcfSections;
+  bool printMemoryUsage;
   bool relax;
+  bool relaxGP;
   bool relocatable;
   bool relrGlibc = false;
   bool relrPackDynRelocs = false;
@@ -279,13 +322,14 @@ struct Configuration {
   SeparateSegmentKind zSeparate;
   ELFKind ekind = ELFNoneKind;
   uint16_t emachine = llvm::ELF::EM_NONE;
-  llvm::Optional<uint64_t> imageBase;
+  std::optional<uint64_t> imageBase;
   uint64_t commonPageSize;
   uint64_t maxPageSize;
   uint64_t mipsGotSize;
   uint64_t zStackSize;
   unsigned ltoPartitions;
   unsigned ltoo;
+  llvm::CodeGenOpt::Level ltoCgo;
   unsigned optimize;
   StringRef thinLTOJobs;
   unsigned timeTraceGranularity;
@@ -321,9 +365,6 @@ struct Configuration {
   // little-endian written in the little-endian order, but I don't know
   // if that's true.)
   bool isMips64EL;
-
-  // True if we need to reserve two .got entries for local-dynamic TLS model.
-  bool needsTlsLd = false;
 
   // True if we need to set the DF_STATIC_TLS flag to an output file, which
   // works as a hint to the dynamic loader that the shared object contains code
@@ -366,10 +407,21 @@ struct Configuration {
   // this means to map the primary and thread stacks as PROT_MTE. Note: This is
   // not supported on Android 11 & 12.
   bool androidMemtagStack;
+
+  unsigned threadCount;
+
+  // If an input file equals a key, remap it to the value.
+  llvm::DenseMap<llvm::StringRef, llvm::StringRef> remapInputs;
+  // If an input file matches a wildcard pattern, remap it to the value.
+  llvm::SmallVector<std::pair<llvm::GlobPattern, llvm::StringRef>, 0>
+      remapInputsWildcards;
+};
+struct ConfigWrapper {
+  Config c;
+  Config *operator->() { return &c; }
 };
 
-// The only instance of Configuration struct.
-extern std::unique_ptr<Configuration> config;
+LLVM_LIBRARY_VISIBILITY extern ConfigWrapper config;
 
 struct DuplicateSymbol {
   const Symbol *sym;
@@ -379,19 +431,20 @@ struct DuplicateSymbol {
 };
 
 struct Ctx {
+  LinkerDriver driver;
   SmallVector<std::unique_ptr<MemoryBuffer>> memoryBuffers;
   SmallVector<ELFFileBase *, 0> objectFiles;
   SmallVector<SharedFile *, 0> sharedFiles;
   SmallVector<BinaryFile *, 0> binaryFiles;
   SmallVector<BitcodeFile *, 0> bitcodeFiles;
   SmallVector<BitcodeFile *, 0> lazyBitcodeFiles;
+  SmallVector<InputSectionBase *, 0> inputSections;
+  SmallVector<EhInputSection *, 0> ehInputSections;
   // Duplicate symbol candidates.
   SmallVector<DuplicateSymbol, 0> duplicates;
   // Symbols in a non-prevailing COMDAT group which should be changed to an
   // Undefined.
   SmallVector<std::pair<Symbol *, unsigned>, 0> nonPrevailingSyms;
-  // True if SHT_LLVM_SYMPART is used.
-  std::atomic<bool> hasSympart{false};
   // A tuple of (reference, extractedFile, sym). Used by --why-extract=.
   SmallVector<std::tuple<std::string, const InputFile *, const Symbol &>, 0>
       whyExtractRecords;
@@ -400,15 +453,22 @@ struct Ctx {
   llvm::DenseMap<const Symbol *,
                  std::pair<const InputFile *, const InputFile *>>
       backwardReferences;
+  // True if SHT_LLVM_SYMPART is used.
+  std::atomic<bool> hasSympart{false};
+  // True if there are TLS IE relocations. Set DF_STATIC_TLS if -shared.
+  std::atomic<bool> hasTlsIe{false};
+  // True if we need to reserve two .got entries for local-dynamic TLS model.
+  std::atomic<bool> needsTlsLd{false};
+
+  void reset();
 };
 
-// The only instance of Ctx struct.
-extern std::unique_ptr<Ctx> ctx;
+LLVM_LIBRARY_VISIBILITY extern Ctx ctx;
 
 // The first two elements of versionDefinitions represent VER_NDX_LOCAL and
 // VER_NDX_GLOBAL. This helper returns other elements.
 static inline ArrayRef<VersionDefinition> namedVersionDefs() {
-  return llvm::makeArrayRef(config->versionDefinitions).slice(2);
+  return llvm::ArrayRef(config->versionDefinitions).slice(2);
 }
 
 void errorOrWarn(const Twine &msg);

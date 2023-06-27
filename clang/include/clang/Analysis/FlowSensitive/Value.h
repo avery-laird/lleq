@@ -19,6 +19,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/raw_ostream.h"
 #include <cassert>
 #include <utility>
 
@@ -38,6 +39,7 @@ public:
     Struct,
 
     // Synthetic boolean values are either atomic values or logical connectives.
+    TopBool,
     AtomicBool,
     Conjunction,
     Disjunction,
@@ -61,8 +63,7 @@ public:
   /// Returns the value of the synthetic property with the given `Name` or null
   /// if the property isn't assigned a value.
   Value *getProperty(llvm::StringRef Name) const {
-    auto It = Properties.find(Name);
-    return It == Properties.end() ? nullptr : It->second;
+    return Properties.lookup(Name);
   }
 
   /// Assigns `Val` as the value of the synthetic property with the given
@@ -71,10 +72,26 @@ public:
     Properties.insert_or_assign(Name, &Val);
   }
 
+  llvm::iterator_range<llvm::StringMap<Value *>::const_iterator>
+  properties() const {
+    return {Properties.begin(), Properties.end()};
+  }
+
 private:
   Kind ValKind;
   llvm::StringMap<Value *> Properties;
 };
+
+/// An equivalence relation for values. It obeys reflexivity, symmetry and
+/// transitivity. It does *not* include comparison of `Properties`.
+///
+/// Computes equivalence for these subclasses:
+/// * ReferenceValue, PointerValue -- pointee locations are equal. Does not
+///   compute deep equality of `Value` at said location.
+/// * TopBoolValue -- both are `TopBoolValue`s.
+///
+/// Otherwise, falls back to pointer equality.
+bool areEquivalentValues(const Value &Val1, const Value &Val2);
 
 /// Models a boolean.
 class BoolValue : public Value {
@@ -82,12 +99,24 @@ public:
   explicit BoolValue(Kind ValueKind) : Value(ValueKind) {}
 
   static bool classof(const Value *Val) {
-    return Val->getKind() == Kind::AtomicBool ||
+    return Val->getKind() == Kind::TopBool ||
+           Val->getKind() == Kind::AtomicBool ||
            Val->getKind() == Kind::Conjunction ||
            Val->getKind() == Kind::Disjunction ||
            Val->getKind() == Kind::Negation ||
            Val->getKind() == Kind::Implication ||
            Val->getKind() == Kind::Biconditional;
+  }
+};
+
+/// Models the trivially true formula, which is Top in the lattice of boolean
+/// formulas.
+class TopBoolValue final : public BoolValue {
+public:
+  TopBoolValue() : BoolValue(Kind::TopBool) {}
+
+  static bool classof(const Value *Val) {
+    return Val->getKind() == Kind::TopBool;
   }
 };
 
@@ -272,19 +301,25 @@ public:
 
   /// Returns the child value that is assigned for `D` or null if the child is
   /// not initialized.
-  Value *getChild(const ValueDecl &D) const {
-    auto It = Children.find(&D);
-    if (It == Children.end())
-      return nullptr;
-    return It->second;
-  }
+  Value *getChild(const ValueDecl &D) const { return Children.lookup(&D); }
 
   /// Assigns `Val` as the child value for `D`.
   void setChild(const ValueDecl &D, Value &Val) { Children[&D] = &Val; }
 
+  /// Clears any value assigned as the child value for `D`.
+  void clearChild(const ValueDecl &D) { Children.erase(&D); }
+
+  llvm::iterator_range<
+      llvm::DenseMap<const ValueDecl *, Value *>::const_iterator>
+  children() const {
+    return {Children.begin(), Children.end()};
+  }
+
 private:
   llvm::DenseMap<const ValueDecl *, Value *> Children;
 };
+
+raw_ostream &operator<<(raw_ostream &OS, const Value &Val);
 
 } // namespace dataflow
 } // namespace clang

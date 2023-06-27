@@ -10,7 +10,6 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/Triple.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Compiler.h"
@@ -20,9 +19,10 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FileUtilities.h"
-#include "llvm/Support/Host.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Host.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Testing/Support/Error.h"
 #include "llvm/Testing/Support/SupportHelpers.h"
 #include "gmock/gmock.h"
@@ -454,7 +454,7 @@ std::string getEnvWin(const wchar_t *Var) {
 // RAII helper to set and restore an environment variable.
 class WithEnv {
   const char *Var;
-  llvm::Optional<std::string> OriginalValue;
+  std::optional<std::string> OriginalValue;
 
 public:
   WithEnv(const char *Var, const char *Value) : Var(Var) {
@@ -499,7 +499,8 @@ TEST(Support, HomeDirectoryWithNoEnv) {
 
   // Don't run the test if we have nothing to compare against.
   struct passwd *pw = getpwuid(getuid());
-  if (!pw || !pw->pw_dir) return;
+  if (!pw || !pw->pw_dir)
+    GTEST_SKIP();
   std::string PwDir = pw->pw_dir;
 
   SmallString<128> HomeDir;
@@ -1463,33 +1464,6 @@ TEST_F(FileSystemTest, FileMapping) {
   ASSERT_NO_ERROR(fs::remove(TempPath));
 }
 
-TEST_F(FileSystemTest, FileMappingSync) {
-  // Create a temp file.
-  int FD;
-  SmallString<64> TempPath;
-  ASSERT_NO_ERROR(fs::createTemporaryFile("prefix", "temp", FD, TempPath));
-  StringRef Content("hello there");
-  ASSERT_NO_ERROR(fs::resize_file_before_mapping_readwrite(FD, Content.size()));
-
-  {
-    // Map in the file and write some content.
-    std::error_code EC;
-    fs::mapped_file_region mfr(fs::convertFDToNativeFile(FD),
-                               fs::mapped_file_region::readwrite,
-                               Content.size(), 0, EC);
-    ASSERT_NO_ERROR(EC);
-    ASSERT_EQ(close(FD), 0);
-    std::copy(Content.begin(), Content.end(), mfr.data());
-
-    // Synchronize and check the contents before unmapping.
-    mfr.sync();
-    auto Buffer = MemoryBuffer::getFile(TempPath);
-    ASSERT_TRUE((bool)Buffer);
-    ASSERT_EQ(Content, Buffer->get()->getBuffer());
-  }
-  ASSERT_NO_ERROR(fs::remove(TempPath));
-}
-
 TEST(Support, NormalizePath) {
   //                           Input,        Expected Win, Expected Posix
   using TestTuple = std::tuple<const char *, const char *, const char *>;
@@ -1794,7 +1768,7 @@ static void verifyFileContents(const Twine &Path, StringRef Contents) {
 
 TEST_F(FileSystemTest, CreateNew) {
   int FD;
-  Optional<FileDescriptorCloser> Closer;
+  std::optional<FileDescriptorCloser> Closer;
 
   // Succeeds if the file does not exist.
   ASSERT_FALSE(fs::exists(NonExistantFile));
@@ -1818,7 +1792,7 @@ TEST_F(FileSystemTest, CreateNew) {
 
 TEST_F(FileSystemTest, CreateAlways) {
   int FD;
-  Optional<FileDescriptorCloser> Closer;
+  std::optional<FileDescriptorCloser> Closer;
 
   // Succeeds if the file does not exist.
   ASSERT_FALSE(fs::exists(NonExistantFile));
@@ -1896,7 +1870,7 @@ TEST_F(FileSystemTest, AppendSetsCorrectFileOffset) {
   // the specified disposition.
   for (fs::CreationDisposition Disp : Disps) {
     int FD;
-    Optional<FileDescriptorCloser> Closer;
+    std::optional<FileDescriptorCloser> Closer;
 
     createFileWithData(NonExistantFile, false, fs::CD_CreateNew, "Fizz");
 
@@ -1987,7 +1961,7 @@ TEST_F(FileSystemTest, readNativeFile) {
       return FD.takeError();
     auto Close = make_scope_exit([&] { fs::closeFile(*FD); });
     if (Expected<size_t> BytesRead = fs::readNativeFile(
-            *FD, makeMutableArrayRef(&*Buf.begin(), Buf.size())))
+            *FD, MutableArrayRef(&*Buf.begin(), Buf.size())))
       return Buf.substr(0, *BytesRead);
     else
       return BytesRead.takeError();
@@ -2002,7 +1976,7 @@ TEST_F(FileSystemTest, readNativeFileToEOF) {
   createFileWithData(NonExistantFile, false, fs::CD_CreateNew, Content);
   FileRemover Cleanup(NonExistantFile);
   const auto &Read = [&](SmallVectorImpl<char> &V,
-                         Optional<ssize_t> ChunkSize) {
+                         std::optional<ssize_t> ChunkSize) {
     Expected<fs::file_t> FD = fs::openNativeFileForRead(NonExistantFile);
     if (!FD)
       return FD.takeError();
@@ -2021,7 +1995,7 @@ TEST_F(FileSystemTest, readNativeFileToEOF) {
         static_cast<SmallVectorImpl<char> *>(&StaysSmall),
     };
     for (SmallVectorImpl<char> *V : Vectors) {
-      ASSERT_THAT_ERROR(Read(*V, None), Succeeded());
+      ASSERT_THAT_ERROR(Read(*V, std::nullopt), Succeeded());
       ASSERT_EQ(Content, StringRef(V->begin(), V->size()));
     }
     ASSERT_EQ(fs::DefaultReadChunkSize + Content.size(), StaysSmall.capacity());
@@ -2031,7 +2005,7 @@ TEST_F(FileSystemTest, readNativeFileToEOF) {
       constexpr StringLiteral Prefix = "prefix-";
       for (SmallVectorImpl<char> *V : Vectors) {
         V->assign(Prefix.begin(), Prefix.end());
-        ASSERT_THAT_ERROR(Read(*V, None), Succeeded());
+        ASSERT_THAT_ERROR(Read(*V, std::nullopt), Succeeded());
         ASSERT_EQ((Prefix + Content).str(), StringRef(V->begin(), V->size()));
       }
     }
@@ -2054,7 +2028,7 @@ TEST_F(FileSystemTest, readNativeFileSlice) {
                          size_t ToRead) -> Expected<std::string> {
     std::string Buf(ToRead, '?');
     if (Expected<size_t> BytesRead = fs::readNativeFileSlice(
-            *FD, makeMutableArrayRef(&*Buf.begin(), Buf.size()), Offset))
+            *FD, MutableArrayRef(&*Buf.begin(), Buf.size()), Offset))
       return Buf.substr(0, *BytesRead);
     else
       return BytesRead.takeError();

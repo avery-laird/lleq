@@ -35,6 +35,7 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include <cassert>
+#include <optional>
 
 using namespace llvm;
 
@@ -169,10 +170,6 @@ static void scalarizeMaskedLoad(const DataLayout &DL, CallInst *CI,
   // Adjust alignment for the scalar instruction.
   const Align AdjustedAlignVal =
       commonAlignment(AlignVal, EltTy->getPrimitiveSizeInBits() / 8);
-  // Bitcast %addr from i8* to EltTy*
-  Type *NewPtrType =
-      EltTy->getPointerTo(Ptr->getType()->getPointerAddressSpace());
-  Value *FirstEltPtr = Builder.CreateBitCast(Ptr, NewPtrType);
   unsigned VectorWidth = cast<FixedVectorType>(VecType)->getNumElements();
 
   // The result vector
@@ -182,7 +179,7 @@ static void scalarizeMaskedLoad(const DataLayout &DL, CallInst *CI,
     for (unsigned Idx = 0; Idx < VectorWidth; ++Idx) {
       if (cast<Constant>(Mask)->getAggregateElement(Idx)->isNullValue())
         continue;
-      Value *Gep = Builder.CreateConstInBoundsGEP1_32(EltTy, FirstEltPtr, Idx);
+      Value *Gep = Builder.CreateConstInBoundsGEP1_32(EltTy, Ptr, Idx);
       LoadInst *Load = Builder.CreateAlignedLoad(EltTy, Gep, AdjustedAlignVal);
       VResult = Builder.CreateInsertElement(VResult, Load, Idx);
     }
@@ -231,7 +228,7 @@ static void scalarizeMaskedLoad(const DataLayout &DL, CallInst *CI,
     CondBlock->setName("cond.load");
 
     Builder.SetInsertPoint(CondBlock->getTerminator());
-    Value *Gep = Builder.CreateConstInBoundsGEP1_32(EltTy, FirstEltPtr, Idx);
+    Value *Gep = Builder.CreateConstInBoundsGEP1_32(EltTy, Ptr, Idx);
     LoadInst *Load = Builder.CreateAlignedLoad(EltTy, Gep, AdjustedAlignVal);
     Value *NewVResult = Builder.CreateInsertElement(VResult, Load, Idx);
 
@@ -308,10 +305,6 @@ static void scalarizeMaskedStore(const DataLayout &DL, CallInst *CI,
   // Adjust alignment for the scalar instruction.
   const Align AdjustedAlignVal =
       commonAlignment(AlignVal, EltTy->getPrimitiveSizeInBits() / 8);
-  // Bitcast %addr from i8* to EltTy*
-  Type *NewPtrType =
-      EltTy->getPointerTo(Ptr->getType()->getPointerAddressSpace());
-  Value *FirstEltPtr = Builder.CreateBitCast(Ptr, NewPtrType);
   unsigned VectorWidth = cast<FixedVectorType>(VecType)->getNumElements();
 
   if (isConstantIntVector(Mask)) {
@@ -319,7 +312,7 @@ static void scalarizeMaskedStore(const DataLayout &DL, CallInst *CI,
       if (cast<Constant>(Mask)->getAggregateElement(Idx)->isNullValue())
         continue;
       Value *OneElt = Builder.CreateExtractElement(Src, Idx);
-      Value *Gep = Builder.CreateConstInBoundsGEP1_32(EltTy, FirstEltPtr, Idx);
+      Value *Gep = Builder.CreateConstInBoundsGEP1_32(EltTy, Ptr, Idx);
       Builder.CreateAlignedStore(OneElt, Gep, AdjustedAlignVal);
     }
     CI->eraseFromParent();
@@ -366,7 +359,7 @@ static void scalarizeMaskedStore(const DataLayout &DL, CallInst *CI,
 
     Builder.SetInsertPoint(CondBlock->getTerminator());
     Value *OneElt = Builder.CreateExtractElement(Src, Idx);
-    Value *Gep = Builder.CreateConstInBoundsGEP1_32(EltTy, FirstEltPtr, Idx);
+    Value *Gep = Builder.CreateConstInBoundsGEP1_32(EltTy, Ptr, Idx);
     Builder.CreateAlignedStore(OneElt, Gep, AdjustedAlignVal);
 
     // Create "else" block, fill it in the next iteration
@@ -656,8 +649,8 @@ static void scalarizeMaskedExpandLoad(const DataLayout &DL, CallInst *CI,
   // shuffle blend with the pass through value.
   if (isConstantIntVector(Mask)) {
     unsigned MemIndex = 0;
-    VResult = UndefValue::get(VecType);
-    SmallVector<int, 16> ShuffleMask(VectorWidth, UndefMaskElem);
+    VResult = PoisonValue::get(VecType);
+    SmallVector<int, 16> ShuffleMask(VectorWidth, PoisonMaskElem);
     for (unsigned Idx = 0; Idx < VectorWidth; ++Idx) {
       Value *InsertElt;
       if (cast<Constant>(Mask)->getAggregateElement(Idx)->isNullValue()) {
@@ -861,7 +854,7 @@ static void scalarizeMaskedCompressStore(const DataLayout &DL, CallInst *CI,
 
 static bool runImpl(Function &F, const TargetTransformInfo &TTI,
                     DominatorTree *DT) {
-  Optional<DomTreeUpdater> DTU;
+  std::optional<DomTreeUpdater> DTU;
   if (DT)
     DTU.emplace(DT, DomTreeUpdater::UpdateStrategy::Lazy);
 
@@ -873,7 +866,7 @@ static bool runImpl(Function &F, const TargetTransformInfo &TTI,
     for (BasicBlock &BB : llvm::make_early_inc_range(F)) {
       bool ModifiedDTOnIteration = false;
       MadeChange |= optimizeBlock(BB, ModifiedDTOnIteration, TTI, DL,
-                                  DTU ? DTU.getPointer() : nullptr);
+                                  DTU ? &*DTU : nullptr);
 
       // Restart BB iteration if the dominator tree of the Function was changed
       if (ModifiedDTOnIteration)

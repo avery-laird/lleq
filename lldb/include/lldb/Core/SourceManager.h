@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -41,7 +42,7 @@ public:
 
     void UpdateIfNeeded();
 
-    size_t DisplaySourceLines(uint32_t line, llvm::Optional<size_t> column,
+    size_t DisplaySourceLines(uint32_t line, std::optional<size_t> column,
                               uint32_t context_before, uint32_t context_after,
                               Stream *s);
     void FindLinesMatchingRegex(RegularExpression &regex, uint32_t start_line,
@@ -63,6 +64,8 @@ public:
     uint32_t GetLineLength(uint32_t line, bool include_newline_chars);
 
     uint32_t GetNumLines();
+
+    llvm::sys::TimePoint<> GetTimestamp() const { return m_mod_time; }
 
   protected:
     bool CalculateLineOffsets(uint32_t line = UINT32_MAX);
@@ -103,6 +106,8 @@ public:
 
     // Removes all elements from the cache.
     void Clear() { m_file_cache.clear(); }
+
+    void Dump(Stream &stream) const;
 
   protected:
     typedef std::map<FileSpec, FileSP> FileCache;

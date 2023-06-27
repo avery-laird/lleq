@@ -69,7 +69,7 @@ struct PlatformShellCommand {
   std::string m_output;
   int m_status = 0;
   int m_signo = 0;
-  Timeout<std::ratio<1>> m_timeout = llvm::None;
+  Timeout<std::ratio<1>> m_timeout = std::nullopt;
 };
 // SBPlatformConnectOptions
 SBPlatformConnectOptions::SBPlatformConnectOptions(const char *url)
@@ -100,7 +100,7 @@ const char *SBPlatformConnectOptions::GetURL() {
 
   if (m_opaque_ptr->m_url.empty())
     return nullptr;
-  return m_opaque_ptr->m_url.c_str();
+  return ConstString(m_opaque_ptr->m_url.c_str()).GetCString();
 }
 
 void SBPlatformConnectOptions::SetURL(const char *url) {
@@ -203,7 +203,7 @@ const char *SBPlatformShellCommand::GetShell() {
 
   if (m_opaque_ptr->m_shell.empty())
     return nullptr;
-  return m_opaque_ptr->m_shell.c_str();
+  return ConstString(m_opaque_ptr->m_shell.c_str()).GetCString();
 }
 
 void SBPlatformShellCommand::SetShell(const char *shell_interpreter) {
@@ -220,7 +220,7 @@ const char *SBPlatformShellCommand::GetCommand() {
 
   if (m_opaque_ptr->m_command.empty())
     return nullptr;
-  return m_opaque_ptr->m_command.c_str();
+  return ConstString(m_opaque_ptr->m_command.c_str()).GetCString();
 }
 
 void SBPlatformShellCommand::SetCommand(const char *shell_command) {
@@ -237,7 +237,7 @@ const char *SBPlatformShellCommand::GetWorkingDirectory() {
 
   if (m_opaque_ptr->m_working_dir.empty())
     return nullptr;
-  return m_opaque_ptr->m_working_dir.c_str();
+  return ConstString(m_opaque_ptr->m_working_dir.c_str()).GetCString();
 }
 
 void SBPlatformShellCommand::SetWorkingDirectory(const char *path) {
@@ -261,7 +261,7 @@ void SBPlatformShellCommand::SetTimeoutSeconds(uint32_t sec) {
   LLDB_INSTRUMENT_VA(this, sec);
 
   if (sec == UINT32_MAX)
-    m_opaque_ptr->m_timeout = llvm::None;
+    m_opaque_ptr->m_timeout = std::nullopt;
   else
     m_opaque_ptr->m_timeout = std::chrono::seconds(sec);
 }
@@ -283,7 +283,7 @@ const char *SBPlatformShellCommand::GetOutput() {
 
   if (m_opaque_ptr->m_output.empty())
     return nullptr;
-  return m_opaque_ptr->m_output.c_str();
+  return ConstString(m_opaque_ptr->m_output.c_str()).GetCString();
 }
 
 // SBPlatform
@@ -454,7 +454,7 @@ const char *SBPlatform::GetHostname() {
 
   PlatformSP platform_sp(GetSP());
   if (platform_sp)
-    return platform_sp->GetHostname();
+    return ConstString(platform_sp->GetHostname()).GetCString();
   return nullptr;
 }
 
@@ -488,7 +488,7 @@ uint32_t SBPlatform::GetOSUpdateVersion() {
 void SBPlatform::SetSDKRoot(const char *sysroot) {
   LLDB_INSTRUMENT_VA(this, sysroot);
   if (PlatformSP platform_sp = GetSP())
-    platform_sp->SetSDKRootDirectory(ConstString(sysroot));
+    platform_sp->SetSDKRootDirectory(llvm::StringRef(sysroot).str());
 }
 
 SBError SBPlatform::Get(SBFileSpec &src, SBFileSpec &dst) {

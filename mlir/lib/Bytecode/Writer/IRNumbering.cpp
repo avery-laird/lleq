@@ -8,9 +8,11 @@
 
 #include "IRNumbering.h"
 #include "mlir/Bytecode/BytecodeImplementation.h"
-#include "mlir/Bytecode/BytecodeWriter.h"
+#include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OpDefinition.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir;
 using namespace mlir::bytecode::detail;
@@ -23,7 +25,14 @@ struct IRNumberingState::NumberingDialectWriter : public DialectBytecodeWriter {
   NumberingDialectWriter(IRNumberingState &state) : state(state) {}
 
   void writeAttribute(Attribute attr) override { state.number(attr); }
+  void writeOptionalAttribute(Attribute attr) override {
+    if (attr)
+      state.number(attr);
+  }
   void writeType(Type type) override { state.number(type); }
+  void writeResourceHandle(const AsmDialectResourceHandle &resource) override {
+    state.number(resource.getDialect(), resource);
+  }
 
   /// Stubbed out methods that are not used for numbering.
   void writeVarInt(uint64_t) override {}
@@ -34,6 +43,12 @@ struct IRNumberingState::NumberingDialectWriter : public DialectBytecodeWriter {
     // TODO: It might be nice to prenumber strings and sort by the number of
     // references. This could potentially be useful for optimizing things like
     // file locations.
+  }
+  void writeOwnedBlob(ArrayRef<char> blob) override {}
+  void writeOwnedBool(bool value) override {}
+
+  int64_t getBytecodeVersion() const override {
+    llvm_unreachable("unexpected querying of version in IRNumbering");
   }
 
   /// The parent numbering state that is populated by this writer.
@@ -58,6 +73,8 @@ static void groupByDialectPerByte(T range) {
                           const auto &rhs) {
     if (lhs->dialect->number == dialectToOrderFirst)
       return rhs->dialect->number != dialectToOrderFirst;
+    if (rhs->dialect->number == dialectToOrderFirst)
+      return false;
     return lhs->dialect->number < rhs->dialect->number;
   };
 
@@ -91,11 +108,19 @@ static void groupByDialectPerByte(T range) {
   }
 
   // Assign the entry numbers based on the sort order.
-  for (auto &entry : llvm::enumerate(range))
-    entry.value()->number = entry.index();
+  for (auto [idx, value] : llvm::enumerate(range))
+    value->number = idx;
 }
 
-IRNumberingState::IRNumberingState(Operation *op) {
+IRNumberingState::IRNumberingState(Operation *op,
+                                   const BytecodeWriterConfig &config)
+    : config(config) {
+  // Compute a global operation ID numbering according to the pre-order walk of
+  // the IR. This is used as reference to construct use-list orders.
+  unsigned operationID = 0;
+  op->walk<WalkOrder::PreOrder>(
+      [&](Operation *op) { operationIDs.try_emplace(op, operationID++); });
+
   // Number the root operation.
   number(*op);
 
@@ -125,8 +150,8 @@ IRNumberingState::IRNumberingState(Operation *op) {
   // found, given that the number of dialects on average is small enough to fit
   // within a singly byte (128). If we ever have real world use cases that have
   // a huge number of dialects, this could be made more intelligent.
-  for (auto &it : llvm::enumerate(dialects))
-    it.value().second->number = it.index();
+  for (auto [idx, dialect] : llvm::enumerate(dialects))
+    dialect.second->number = idx;
 
   // Number each of the recorded components within each dialect.
 
@@ -145,9 +170,12 @@ IRNumberingState::IRNumberingState(Operation *op) {
   // bytes it takes to encode a varint index to that sub-section. This allows
   // for more efficiently encoding components of the same dialect (e.g. we only
   // have to encode the dialect reference once).
-  groupByDialectPerByte(llvm::makeMutableArrayRef(orderedAttrs));
-  groupByDialectPerByte(llvm::makeMutableArrayRef(orderedOpNames));
-  groupByDialectPerByte(llvm::makeMutableArrayRef(orderedTypes));
+  groupByDialectPerByte(llvm::MutableArrayRef(orderedAttrs));
+  groupByDialectPerByte(llvm::MutableArrayRef(orderedOpNames));
+  groupByDialectPerByte(llvm::MutableArrayRef(orderedTypes));
+
+  // Finalize the numbering of the dialect resources.
+  finalizeDialectResourceNumberings(op);
 }
 
 void IRNumberingState::number(Attribute attr) {
@@ -164,7 +192,7 @@ void IRNumberingState::number(Attribute attr) {
   // have a registered dialect when it got created. We don't want to encode this
   // as the builtin OpaqueAttr, we want to encode it as if the dialect was
   // actually loaded.
-  if (OpaqueAttr opaqueAttr = attr.dyn_cast<OpaqueAttr>()) {
+  if (OpaqueAttr opaqueAttr = dyn_cast<OpaqueAttr>(attr)) {
     numbering->dialect = &numberDialect(opaqueAttr.getDialectNamespace());
     return;
   }
@@ -174,12 +202,23 @@ void IRNumberingState::number(Attribute attr) {
   // dummy writing to number any nested components.
   if (const auto *interface = numbering->dialect->interface) {
     // TODO: We don't allow custom encodings for mutable attributes right now.
-    if (attr.hasTrait<AttributeTrait::IsMutable>())
-      return;
-
-    NumberingDialectWriter writer(*this);
-    (void)interface->writeAttribute(attr, writer);
+    if (!attr.hasTrait<AttributeTrait::IsMutable>()) {
+      NumberingDialectWriter writer(*this);
+      if (succeeded(interface->writeAttribute(attr, writer)))
+        return;
+    }
   }
+  // If this attribute will be emitted using the fallback, number the nested
+  // dialect resources. We don't number everything (e.g. no nested
+  // attributes/types), because we don't want to encode things we won't decode
+  // (the textual format can't really share much).
+  AsmState tempState(attr.getContext());
+  llvm::raw_null_ostream dummyOS;
+  attr.print(dummyOS, tempState);
+
+  // Number the used dialect resources.
+  for (const auto &it : tempState.getDialectResources())
+    number(it.getFirst(), it.getSecond().getArrayRef());
 }
 
 void IRNumberingState::number(Block &block) {
@@ -203,6 +242,7 @@ auto IRNumberingState::numberDialect(Dialect *dialect) -> DialectNumbering & {
   if (!numbering) {
     numbering = &numberDialect(dialect->getNamespace());
     numbering->interface = dyn_cast<BytecodeDialectInterface>(dialect);
+    numbering->asmInterface = dyn_cast<OpAsmDialectInterface>(dialect);
   }
   return *numbering;
 }
@@ -223,7 +263,7 @@ void IRNumberingState::number(Region &region) {
 
   // Number the blocks within this region.
   size_t blockCount = 0;
-  for (auto &it : llvm::enumerate(region)) {
+  for (auto it : llvm::enumerate(region)) {
     blockIDs.try_emplace(&it.value(), it.index());
     number(it.value());
     ++blockCount;
@@ -244,9 +284,29 @@ void IRNumberingState::number(Operation &op) {
   }
 
   // Only number the operation's dictionary if it isn't empty.
-  DictionaryAttr dictAttr = op.getAttrDictionary();
+  DictionaryAttr dictAttr = op.getDiscardableAttrDictionary();
+  // Prior to version 5 we need to number also the merged dictionnary
+  // containing both the inherent and discardable attribute.
+  if (config.getDesiredBytecodeVersion() < 5)
+    dictAttr = op.getAttrDictionary();
   if (!dictAttr.empty())
     number(dictAttr);
+
+  // Visit the operation properties (if any) to make sure referenced attributes
+  // are numbered.
+  if (config.getDesiredBytecodeVersion() >= 5 &&
+      op.getPropertiesStorageSize()) {
+    if (op.isRegistered()) {
+      // Operation that have properties *must* implement this interface.
+      auto iface = cast<BytecodeOpInterface>(op);
+      NumberingDialectWriter writer(*this);
+      iface.writeProperties(writer);
+    } else {
+      // Unregistered op are storing properties as an optional attribute.
+      if (Attribute prop = *op.getPropertiesStorage().as<Attribute *>())
+        number(prop);
+    }
+  }
 
   number(op.getLoc());
 }
@@ -282,7 +342,7 @@ void IRNumberingState::number(Type type) {
   // registered dialect when it got created. We don't want to encode this as the
   // builtin OpaqueType, we want to encode it as if the dialect was actually
   // loaded.
-  if (OpaqueType opaqueType = type.dyn_cast<OpaqueType>()) {
+  if (OpaqueType opaqueType = dyn_cast<OpaqueType>(type)) {
     numbering->dialect = &numberDialect(opaqueType.getDialectNamespace());
     return;
   }
@@ -292,10 +352,92 @@ void IRNumberingState::number(Type type) {
   // writing to number any nested components.
   if (const auto *interface = numbering->dialect->interface) {
     // TODO: We don't allow custom encodings for mutable types right now.
-    if (type.hasTrait<TypeTrait::IsMutable>())
+    if (!type.hasTrait<TypeTrait::IsMutable>()) {
+      NumberingDialectWriter writer(*this);
+      if (succeeded(interface->writeType(type, writer)))
+        return;
+    }
+  }
+  // If this type will be emitted using the fallback, number the nested dialect
+  // resources. We don't number everything (e.g. no nested attributes/types),
+  // because we don't want to encode things we won't decode (the textual format
+  // can't really share much).
+  AsmState tempState(type.getContext());
+  llvm::raw_null_ostream dummyOS;
+  type.print(dummyOS, tempState);
+
+  // Number the used dialect resources.
+  for (const auto &it : tempState.getDialectResources())
+    number(it.getFirst(), it.getSecond().getArrayRef());
+}
+
+void IRNumberingState::number(Dialect *dialect,
+                              ArrayRef<AsmDialectResourceHandle> resources) {
+  DialectNumbering &dialectNumber = numberDialect(dialect);
+  assert(
+      dialectNumber.asmInterface &&
+      "expected dialect owning a resource to implement OpAsmDialectInterface");
+
+  for (const auto &resource : resources) {
+    // Check if this is a newly seen resource.
+    if (!dialectNumber.resources.insert(resource))
       return;
 
-    NumberingDialectWriter writer(*this);
-    (void)interface->writeType(type, writer);
+    auto *numbering =
+        new (resourceAllocator.Allocate()) DialectResourceNumbering(
+            dialectNumber.asmInterface->getResourceKey(resource));
+    dialectNumber.resourceMap.insert({numbering->key, numbering});
+    dialectResources.try_emplace(resource, numbering);
+  }
+}
+
+namespace {
+/// A dummy resource builder used to number dialect resources.
+struct NumberingResourceBuilder : public AsmResourceBuilder {
+  NumberingResourceBuilder(DialectNumbering *dialect, unsigned &nextResourceID)
+      : dialect(dialect), nextResourceID(nextResourceID) {}
+  ~NumberingResourceBuilder() override = default;
+
+  void buildBlob(StringRef key, ArrayRef<char>, uint32_t) final {
+    numberEntry(key);
+  }
+  void buildBool(StringRef key, bool) final { numberEntry(key); }
+  void buildString(StringRef key, StringRef) final {
+    // TODO: We could pre-number the value string here as well.
+    numberEntry(key);
+  }
+
+  /// Number the dialect entry for the given key.
+  void numberEntry(StringRef key) {
+    // TODO: We could pre-number resource key strings here as well.
+
+    auto it = dialect->resourceMap.find(key);
+    if (it != dialect->resourceMap.end()) {
+      it->second->number = nextResourceID++;
+      it->second->isDeclaration = false;
+    }
+  }
+
+  DialectNumbering *dialect;
+  unsigned &nextResourceID;
+};
+} // namespace
+
+void IRNumberingState::finalizeDialectResourceNumberings(Operation *rootOp) {
+  unsigned nextResourceID = 0;
+  for (DialectNumbering &dialect : getDialects()) {
+    if (!dialect.asmInterface)
+      continue;
+    NumberingResourceBuilder entryBuilder(&dialect, nextResourceID);
+    dialect.asmInterface->buildResources(rootOp, dialect.resources,
+                                         entryBuilder);
+
+    // Number any resources that weren't added by the dialect. This can happen
+    // if there was no backing data to the resource, but we still want these
+    // resource references to roundtrip, so we number them and indicate that the
+    // data is missing.
+    for (const auto &it : dialect.resourceMap)
+      if (it.second->isDeclaration)
+        it.second->number = nextResourceID++;
   }
 }

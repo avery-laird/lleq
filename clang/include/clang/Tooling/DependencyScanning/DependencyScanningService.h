@@ -35,25 +35,26 @@ enum class ScanningOutputFormat {
   /// intermodule dependency information.
   Make,
 
-  /// This outputs the full module dependency graph suitable for use for
+  /// This outputs the full clang module dependency graph suitable for use for
   /// explicitly building modules.
   Full,
+
+  /// This outputs the dependency graph for standard c++ modules in P1689R5
+  /// format.
+  P1689,
 };
 
-/// The dependency scanning service contains the shared state that is used by
-/// the invidual dependency scanning workers.
+/// The dependency scanning service contains shared configuration and state that
+/// is used by the individual dependency scanning workers.
 class DependencyScanningService {
 public:
   DependencyScanningService(ScanningMode Mode, ScanningOutputFormat Format,
-                            bool ReuseFileManager = true,
                             bool OptimizeArgs = false,
                             bool EagerLoadModules = false);
 
   ScanningMode getMode() const { return Mode; }
 
   ScanningOutputFormat getFormat() const { return Format; }
-
-  bool canReuseFileManager() const { return ReuseFileManager; }
 
   bool canOptimizeArgs() const { return OptimizeArgs; }
 
@@ -66,7 +67,6 @@ public:
 private:
   const ScanningMode Mode;
   const ScanningOutputFormat Format;
-  const bool ReuseFileManager;
   /// Whether to optimize the modules' command-line arguments.
   const bool OptimizeArgs;
   /// Whether to set up command-lines to load PCM files eagerly.

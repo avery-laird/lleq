@@ -13,7 +13,7 @@ target datalayout = "E-m:a-p:32:32-i64:64-n32"
 define i32 @main() #0 !dbg !8 {
 entry:
   %retval = alloca i32, align 4
-  store i32 0, i32* %retval, align 4
+  store i32 0, ptr %retval, align 4
   ret i32 0, !dbg !12
 }
 
@@ -67,7 +67,7 @@ entry:
 ; ASM32-NEXT:                                          # -IsFloatingPointOperationLogOrAbortEnabled
 ; ASM32-NEXT:          .byte   0x40                            # -IsInterruptHandler, +IsFunctionNamePresent, -IsAllocaUsed
 ; ASM32-NEXT:                                          # OnConditionDirective = 0, -IsCRSaved, -IsLRSaved
-; ASM32-NEXT:          .byte   0x80                            # +IsBackChainStored, -IsFixup, NumOfFPRsSaved = 0
+; ASM32-NEXT:          .byte   0x00                            # -IsBackChainStored, -IsFixup, NumOfFPRsSaved = 0
 ; ASM32-NEXT:          .byte   0x00                            # -HasExtensionTable, -HasVectorInfo, NumOfGPRsSaved = 0
 ; ASM32-NEXT:          .byte   0x00                            # NumberOfFixedParms = 0
 ; ASM32-NEXT:          .byte   0x01                            # NumberOfFPParms = 0, +HasParmsOnStack
@@ -268,7 +268,7 @@ entry:
 ; ASM64-NEXT:                                          # -IsFloatingPointOperationLogOrAbortEnabled
 ; ASM64-NEXT:          .byte   0x40                            # -IsInterruptHandler, +IsFunctionNamePresent, -IsAllocaUsed
 ; ASM64-NEXT:                                          # OnConditionDirective = 0, -IsCRSaved, -IsLRSaved
-; ASM64-NEXT:          .byte   0x80                            # +IsBackChainStored, -IsFixup, NumOfFPRsSaved = 0
+; ASM64-NEXT:          .byte   0x00                            # -IsBackChainStored, -IsFixup, NumOfFPRsSaved = 0
 ; ASM64-NEXT:          .byte   0x00                            # -HasExtensionTable, -HasVectorInfo, NumOfGPRsSaved = 0
 ; ASM64-NEXT:          .byte   0x00                            # NumberOfFixedParms = 0
 ; ASM64-NEXT:          .byte   0x01                            # NumberOfFPParms = 0, +HasParmsOnStack

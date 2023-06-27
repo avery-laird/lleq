@@ -99,6 +99,7 @@ enum MachineTypes : unsigned {
   IMAGE_FILE_MACHINE_ARMNT = 0x1C4,
   IMAGE_FILE_MACHINE_ARM64 = 0xAA64,
   IMAGE_FILE_MACHINE_ARM64EC = 0xA641,
+  IMAGE_FILE_MACHINE_ARM64X = 0xA64E,
   IMAGE_FILE_MACHINE_EBC = 0xEBC,
   IMAGE_FILE_MACHINE_I386 = 0x14C,
   IMAGE_FILE_MACHINE_IA64 = 0x200,
@@ -119,6 +120,15 @@ enum MachineTypes : unsigned {
   IMAGE_FILE_MACHINE_THUMB = 0x1C2,
   IMAGE_FILE_MACHINE_WCEMIPSV2 = 0x169
 };
+
+template <typename T> bool isArm64EC(T Machine) {
+  return Machine == IMAGE_FILE_MACHINE_ARM64EC ||
+         Machine == IMAGE_FILE_MACHINE_ARM64X;
+}
+
+template <typename T> bool isAnyArm64(T Machine) {
+  return Machine == IMAGE_FILE_MACHINE_ARM64 || isArm64EC(Machine);
+}
 
 enum Characteristics : unsigned {
   C_Invalid = 0,
@@ -770,6 +780,23 @@ struct ImportHeader {
 enum CodeViewIdentifiers {
   DEBUG_SECTION_MAGIC = 0x4,
   DEBUG_HASHES_SECTION_MAGIC = 0x133C9C5
+};
+
+// These flags show up in the @feat.00 symbol. They appear to be some kind of
+// compiler features bitfield read by link.exe.
+enum Feat00Flags : uint32_t {
+  // Object is compatible with /safeseh.
+  SafeSEH = 0x1,
+  // Object was compiled with /GS.
+  GuardStack = 0x100,
+  // Object was compiled with /sdl.
+  SDL = 0x200,
+  // Object was compiled with /guard:cf.
+  GuardCF = 0x800,
+  // Object was compiled with /guard:ehcont.
+  GuardEHCont = 0x4000,
+  // Object was compiled with /kernel.
+  Kernel = 0x40000000,
 };
 
 inline bool isReservedSectionNumber(int32_t SectionNumber) {

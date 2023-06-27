@@ -15,6 +15,7 @@
 #include "clang/Basic/LangOptions.h"
 #include "clang/Basic/TargetInfo.h"
 #include "llvm/Support/ConvertUTF.h"
+#include <optional>
 
 using clang::analyze_format_string::ArgType;
 using clang::analyze_format_string::FormatStringHandler;
@@ -350,10 +351,12 @@ ArgType::matchesType(ASTContext &C, QualType argTy) const {
     case AnyCharTy: {
       if (const auto *ETy = argTy->getAs<EnumType>()) {
         // If the enum is incomplete we know nothing about the underlying type.
-        // Assume that it's 'int'.
+        // Assume that it's 'int'. Do not use the underlying type for a scoped
+        // enumeration.
         if (!ETy->getDecl()->isComplete())
           return NoMatch;
-        argTy = ETy->getDecl()->getIntegerType();
+        if (ETy->isUnscopedEnumerationType())
+          argTy = ETy->getDecl()->getIntegerType();
       }
 
       if (const auto *BT = argTy->getAs<BuiltinType>()) {
@@ -390,10 +393,11 @@ ArgType::matchesType(ASTContext &C, QualType argTy) const {
     case SpecificTy: {
       if (const EnumType *ETy = argTy->getAs<EnumType>()) {
         // If the enum is incomplete we know nothing about the underlying type.
-        // Assume that it's 'int'.
+        // Assume that it's 'int'. Do not use the underlying type for a scoped
+        // enumeration as that needs an exact match.
         if (!ETy->getDecl()->isComplete())
           argTy = C.IntTy;
-        else
+        else if (ETy->isUnscopedEnumerationType())
           argTy = ETy->getDecl()->getIntegerType();
       }
       argTy = C.getCanonicalType(argTy).getUnqualifiedType();
@@ -510,7 +514,7 @@ ArgType::matchesType(ASTContext &C, QualType argTy) const {
       if (C.getCanonicalType(argTy).getUnqualifiedType() == WInt)
         return Match;
 
-      QualType PromoArg = argTy->isPromotableIntegerType()
+      QualType PromoArg = C.isPromotableIntegerType(argTy)
                               ? C.getPromotedIntegerType(argTy)
                               : argTy;
       PromoArg = C.getCanonicalType(PromoArg).getUnqualifiedType();
@@ -734,13 +738,13 @@ const char *ConversionSpecifier::toString() const {
   return nullptr;
 }
 
-Optional<ConversionSpecifier>
+std::optional<ConversionSpecifier>
 ConversionSpecifier::getStandardSpecifier() const {
   ConversionSpecifier::Kind NewKind;
 
   switch (getKind()) {
   default:
-    return None;
+    return std::nullopt;
   case DArg:
     NewKind = dArg;
     break;
@@ -847,6 +851,8 @@ bool FormatSpecifier::hasValidLengthModifier(const TargetInfo &Target,
       }
 
       switch (CS.getKind()) {
+        case ConversionSpecifier::bArg:
+        case ConversionSpecifier::BArg:
         case ConversionSpecifier::dArg:
         case ConversionSpecifier::DArg:
         case ConversionSpecifier::iArg:
@@ -1031,7 +1037,8 @@ bool FormatSpecifier::hasStandardLengthConversionCombination() const {
   return true;
 }
 
-Optional<LengthModifier> FormatSpecifier::getCorrectedLengthModifier() const {
+std::optional<LengthModifier>
+FormatSpecifier::getCorrectedLengthModifier() const {
   if (CS.isAnyIntArg() || CS.getKind() == ConversionSpecifier::nArg) {
     if (LM.getKind() == LengthModifier::AsLongDouble ||
         LM.getKind() == LengthModifier::AsQuad) {
@@ -1041,7 +1048,7 @@ Optional<LengthModifier> FormatSpecifier::getCorrectedLengthModifier() const {
     }
   }
 
-  return None;
+  return std::nullopt;
 }
 
 bool FormatSpecifier::namedTypeToLengthModifier(QualType QT,

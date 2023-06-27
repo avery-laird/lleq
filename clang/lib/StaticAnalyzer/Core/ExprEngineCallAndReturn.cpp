@@ -25,6 +25,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/SaveAndRestore.h"
+#include <optional>
 
 using namespace clang;
 using namespace ento;
@@ -85,10 +86,10 @@ static std::pair<const Stmt*,
     const ProgramPoint &PP = Node->getLocation();
 
     if (PP.getStackFrame() == SF) {
-      if (Optional<StmtPoint> SP = PP.getAs<StmtPoint>()) {
+      if (std::optional<StmtPoint> SP = PP.getAs<StmtPoint>()) {
         S = SP->getStmt();
         break;
-      } else if (Optional<CallExitEnd> CEE = PP.getAs<CallExitEnd>()) {
+      } else if (std::optional<CallExitEnd> CEE = PP.getAs<CallExitEnd>()) {
         S = CEE->getCalleeContext()->getCallSite();
         if (S)
           break;
@@ -96,17 +97,17 @@ static std::pair<const Stmt*,
         // If there is no statement, this is an implicitly-generated call.
         // We'll walk backwards over it and then continue the loop to find
         // an actual statement.
-        Optional<CallEnter> CE;
+        std::optional<CallEnter> CE;
         do {
           Node = Node->getFirstPred();
           CE = Node->getLocationAs<CallEnter>();
         } while (!CE || CE->getCalleeContext() != CEE->getCalleeContext());
 
         // Continue searching the graph.
-      } else if (Optional<BlockEdge> BE = PP.getAs<BlockEdge>()) {
+      } else if (std::optional<BlockEdge> BE = PP.getAs<BlockEdge>()) {
         Blk = BE->getSrc();
       }
-    } else if (Optional<CallEnter> CE = PP.getAs<CallEnter>()) {
+    } else if (std::optional<CallEnter> CE = PP.getAs<CallEnter>()) {
       // If we reached the CallEnter for this function, it has no statements.
       if (CE->getCalleeContext() == SF)
         break;
@@ -222,6 +223,26 @@ static unsigned getElementCountOfArrayBeingDestructed(
   return 0;
 }
 
+ProgramStateRef ExprEngine::removeStateTraitsUsedForArrayEvaluation(
+    ProgramStateRef State, const CXXConstructExpr *E,
+    const LocationContext *LCtx) {
+
+  assert(LCtx && "Location context must be provided!");
+
+  if (E) {
+    if (getPendingInitLoop(State, E, LCtx))
+      State = removePendingInitLoop(State, E, LCtx);
+
+    if (getIndexOfElementToConstruct(State, E, LCtx))
+      State = removeIndexOfElementToConstruct(State, E, LCtx);
+  }
+
+  if (getPendingArrayDestruction(State, LCtx))
+    State = removePendingArrayDestruction(State, LCtx);
+
+  return State;
+}
+
 /// The call exit is simulated with a sequence of nodes, which occur between
 /// CallExitBegin and CallExitEnd. The following operations occur between the
 /// two program points:
@@ -268,9 +289,6 @@ void ExprEngine::processCallExit(ExplodedNode *CEBNode) {
 
       auto ThisVal = svalBuilder.getCXXThis(DtorDecl->getParent(), calleeCtx);
       state = state->killBinding(ThisVal);
-
-      if (!ShouldRepeatCall)
-        state = removePendingArrayDestruction(state, callerCtx);
     }
   }
 
@@ -304,14 +322,6 @@ void ExprEngine::processCallExit(ExplodedNode *CEBNode) {
       state = state->BindExpr(CCE, callerCtx, ThisV);
 
       ShouldRepeatCall = shouldRepeatCtorCall(state, CCE, callerCtx);
-
-      if (!ShouldRepeatCall) {
-        if (getIndexOfElementToConstruct(state, CCE, callerCtx))
-          state = removeIndexOfElementToConstruct(state, CCE, callerCtx);
-
-        if (getPendingInitLoop(state, CCE, callerCtx))
-          state = removePendingInitLoop(state, CCE, callerCtx);
-      }
     }
 
     if (const auto *CNE = dyn_cast<CXXNewExpr>(CE)) {
@@ -328,6 +338,11 @@ void ExprEngine::processCallExit(ExplodedNode *CEBNode) {
       state = addObjectUnderConstruction(state, CNE, calleeCtx->getParent(),
                                          AllocV);
     }
+  }
+
+  if (!ShouldRepeatCall) {
+    state = removeStateTraitsUsedForArrayEvaluation(
+        state, dyn_cast_or_null<CXXConstructExpr>(CE), callerCtx);
   }
 
   // Step 3: BindedRetNode -> CleanedNodes
@@ -377,9 +392,8 @@ void ExprEngine::processCallExit(ExplodedNode *CEBNode) {
     // result onto the work list.
     // CEENode -> Dst -> WorkList
     NodeBuilderContext Ctx(Engine, calleeCtx->getCallSiteBlock(), CEENode);
-    SaveAndRestore<const NodeBuilderContext*> NBCSave(currBldrCtx,
-        &Ctx);
-    SaveAndRestore<unsigned> CBISave(currStmtIdx, calleeCtx->getIndex());
+    SaveAndRestore<const NodeBuilderContext *> NBCSave(currBldrCtx, &Ctx);
+    SaveAndRestore CBISave(currStmtIdx, calleeCtx->getIndex());
 
     CallEventRef<> UpdatedCall = Call.cloneWithState(CEEState);
 
@@ -596,8 +610,8 @@ void ExprEngine::VisitCallExpr(const CallExpr *CE, ExplodedNode *Pred,
   // Get the call in its initial state. We use this as a template to perform
   // all the checks.
   CallEventManager &CEMgr = getStateManager().getCallEventManager();
-  CallEventRef<> CallTemplate
-    = CEMgr.getSimpleCall(CE, Pred->getState(), Pred->getLocationContext());
+  CallEventRef<> CallTemplate = CEMgr.getSimpleCall(
+      CE, Pred->getState(), Pred->getLocationContext(), getCFGElementRef());
 
   // Evaluate the function call.  We try each of the checkers
   // to see if the can evaluate the function call.
@@ -626,8 +640,7 @@ ProgramStateRef ExprEngine::finishArgumentConstruction(ProgramStateRef State,
   const LocationContext *LC = Call.getLocationContext();
   for (unsigned CallI = 0, CallN = Call.getNumArgs(); CallI != CallN; ++CallI) {
     unsigned I = Call.getASTArgumentIndex(CallI);
-    if (Optional<SVal> V =
-            getObjectUnderConstruction(State, {E, I}, LC)) {
+    if (std::optional<SVal> V = getObjectUnderConstruction(State, {E, I}, LC)) {
       SVal VV = *V;
       (void)VV;
       assert(cast<VarRegion>(VV.castAs<loc::MemRegionVal>().getRegion())
@@ -760,9 +773,9 @@ ProgramStateRef ExprEngine::bindReturnValue(const CallEvent &Call,
     SVal Target;
     assert(RTC->getStmt() == Call.getOriginExpr());
     EvalCallOptions CallOpts; // FIXME: We won't really need those.
-    std::tie(State, Target) =
-        handleConstructionContext(Call.getOriginExpr(), State, LCtx,
-                                  RTC->getConstructionContext(), CallOpts);
+    std::tie(State, Target) = handleConstructionContext(
+        Call.getOriginExpr(), State, currBldrCtx, LCtx,
+        RTC->getConstructionContext(), CallOpts);
     const MemRegion *TargetR = Target.getAsRegion();
     assert(TargetR);
     // Invalidate the region so that it didn't look uninitialized. If this is
@@ -824,7 +837,8 @@ void ExprEngine::conservativeEvalCall(const CallEvent &Call, NodeBuilder &Bldr,
   State = bindReturnValue(Call, Pred->getLocationContext(), State);
 
   // And make the result node.
-  Bldr.generateNode(Call.getProgramPoint(), State, Pred);
+  static SimpleProgramPointTag PT("ExprEngine", "Conservative eval call");
+  Bldr.generateNode(Call.getProgramPoint(false, &PT), State, Pred);
 }
 
 ExprEngine::CallInlinePolicy
@@ -1077,9 +1091,9 @@ bool ExprEngine::shouldInlineCall(const CallEvent &Call, const Decl *D,
     return false;
 
   // Check if this function has been marked as non-inlinable.
-  Optional<bool> MayInline = Engine.FunctionSummaries->mayInline(D);
+  std::optional<bool> MayInline = Engine.FunctionSummaries->mayInline(D);
   if (MayInline) {
-    if (!MayInline.value())
+    if (!*MayInline)
       return false;
 
   } else {
@@ -1151,7 +1165,7 @@ bool ExprEngine::shouldInlineArrayConstruction(const ProgramStateRef State,
 
   // Check if we're inside an ArrayInitLoopExpr, and it's sufficiently small.
   if (auto Size = getPendingInitLoop(State, CE, LCtx))
-    return *Size <= AMgr.options.maxBlockVisitOnPath;
+    return shouldInlineArrayDestruction(*Size);
 
   return false;
 }
@@ -1246,7 +1260,12 @@ void ExprEngine::defaultEvalCall(NodeBuilder &Bldr, ExplodedNode *Pred,
     }
   }
 
-  // If we can't inline it, handle the return value and invalidate the regions.
+  // If we can't inline it, clean up the state traits used only if the function
+  // is inlined.
+  State = removeStateTraitsUsedForArrayEvaluation(
+      State, dyn_cast_or_null<CXXConstructExpr>(E), Call->getLocationContext());
+
+  // Also handle the return value and invalidate the regions.
   conservativeEvalCall(*Call, Bldr, Pred, State);
 }
 
