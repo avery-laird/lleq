@@ -760,6 +760,8 @@ public:
               "GEPOperators with multiple indices are not supported.");
         auto &Idx = *GEP->indices().begin();
         Instruction *Inst = dyn_cast<Instruction>(&Idx);
+        if (Inst == nullptr)
+          continue ;
         WorkList.push_back(Inst);
         while (WorkList.size()) {
           Value *Current = WorkList.back();
@@ -2853,7 +2855,7 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
 
   GEMV MV(Converter);
   GEMV_reset MVReset(Converter);
-  SPMM GEMM(Converter, C, SE, Ctx, "GEMM", "SPMM");
+//  SPMM GEMM(Converter, C, SE, Ctx, "GEMM", "SPMM");
   std::vector<Kernel *> Kernels = {&MV,
                                    &MVReset,
 //                                   &GEMM
@@ -2901,8 +2903,10 @@ PreservedAnalyses RevAnalysisPass::run(Function &F,
     // otherwise the kernel is invalid and skip
     Kernel *K = E.first;
     K->setMatchingFormats(&E.second);
-    if (K->checkEquality(LiveOut, F, DT, Ctx, Slv, Scope, InputKernel))
+    if (K->checkEquality(LiveOut, F, DT, Ctx, Slv, Scope, InputKernel)) {
       PossibleResult.push_back(E);
+      break; // just do one check for now
+    }
   }
   EqualityCheck.stopTimer();
 
