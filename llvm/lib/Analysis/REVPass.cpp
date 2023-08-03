@@ -49,6 +49,10 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
     }
 }
 
+//void denseLocateFunctions() {
+//
+//}
+
 std::string getNameOrAsOperand(Value *V) {
   //  if (!V->getName().empty())
   //    return std::string(V->getName());
@@ -62,24 +66,59 @@ std::string getNameOrAsOperand(Value *V) {
 
 enum LevelTypeEnum {
   COMPRESSED,
-  DENSE
+  DENSE,
+  UNKNOWN
 };
+
 
 struct LevelBounds {
   LevelTypeEnum LevelType;
+  PHINode *Iterator = nullptr;
   Value *LowerBound = nullptr;
   Value *UpperBound = nullptr;
+  Value *IndexExpr = nullptr;
+  Value *BasePtr = nullptr;
 };
 
-void inferDataLayout(LoopNest *LN, ScalarEvolution *SE, DenseMap<PHINode*, LevelBounds> &Levels) {
+void findCrd(PHINode *IndVar, Value **Crd) {
+  std::vector<Value*> Queue;
+  SmallPtrSet<Value*, 4> Visited;
+  Queue.push_back(IndVar);
+  int LoadCount = 0;
+  while (!Queue.empty()) {
+    auto *ToVisit = Queue.back();
+    Queue.pop_back();
+    if (!Visited.contains(ToVisit)) {
+      Visited.insert(ToVisit);
+      if (auto *Load = dyn_cast<LoadInst>(ToVisit)) {
+        if (LoadCount++ == 1)
+          return;
+        auto *GEP = dyn_cast<GEPOperator>(Load->getPointerOperand());
+        *Crd = GEP->getPointerOperand();
+      }
+      for (auto *Use : ToVisit->users()) {
+        Queue.push_back(Use);
+      }
+    }
+  }
+  return;
+}
+
+void makeLevelBounds(LoopNest *LN, ScalarEvolution *SE, std::vector<LevelBounds> &Levels) {
   DataLayout DL = SE->getDataLayout();
-  PHINode *PrevLevel = nullptr;
+//  PHINode *PrevLevel = nullptr;
   for (auto *Loop : LN->getLoops()) {
     auto Bounds = Loop->getBounds(*SE);
     if (!Bounds.has_value())
       return;
     auto *IndVar = Loop->getInductionVariable(*SE);
-    LLVM_DEBUG(dbgs() << getNameOrAsOperand(IndVar) << " = [" << Bounds->getInitialIVValue() << ", " << Bounds->getFinalIVValue() << ") -> ");
+    LLVM_DEBUG(dbgs() << getNameOrAsOperand(IndVar) << " = [" << Bounds->getInitialIVValue() << ", " << Bounds->getFinalIVValue() << ") -> \n");
+
+//    std::vector<Value*> Uses;
+//    followUses(IndVar, Uses);
+//    for (auto *V : Uses) {
+//      LLVM_DEBUG(dbgs() << *V << "\n");
+//    }
 
     Value *LowerBound = &Bounds->getInitialIVValue();
     Value *UpperBound = &Bounds->getFinalIVValue();
@@ -88,11 +127,10 @@ void inferDataLayout(LoopNest *LN, ScalarEvolution *SE, DenseMap<PHINode*, Level
     bool IsInt = isa<ConstantInt>(UpperBound) || isa<Argument>(UpperBound);
     if (IsZero && IsInt) {
       LLVM_DEBUG(dbgs() << "dense\n");
-      Levels[IndVar] = {DENSE, LowerBound, UpperBound};
-      PrevLevel = IndVar;
+      Levels.push_back({DENSE, IndVar, LowerBound, UpperBound});
+//      PrevLevel = IndVar;
       continue ;
     }
-
 
     // Detect Compressed Form: pos[i] ==> pos[i+1]
     LoadInst *LowInstr = dyn_cast<LoadInst>(LowerBound);
@@ -117,16 +155,56 @@ void inferDataLayout(LoopNest *LN, ScalarEvolution *SE, DenseMap<PHINode*, Level
           HighPtrBase = PCast->getOperand(0);
         bool SameBase = LowPtrBase == HighPtrBase;
         bool OneOffset = OffsetIndex->isOne();
-        bool UsesAncestor = PrevLevel == IndexExpr;
-        if (SameBase && OneOffset && UsesAncestor) {
+//        bool UsesAncestor = PrevLevel == IndexExpr;
+        if (SameBase && OneOffset) {
           LLVM_DEBUG(dbgs() << "sparse\n");
-          Levels[IndVar] = {COMPRESSED, LowerBound, UpperBound};
-          PrevLevel = IndVar;
-          return;
+          Levels.push_back({COMPRESSED, IndVar, LowerBound, UpperBound, IndexExpr, LowPtrBase});
+//          PrevLevel = IndVar;
+          continue;
         }
       }
     }
   }
+}
+
+struct CSRLevels {
+  LevelBounds I;
+  LevelBounds J;
+  Value *Pos = nullptr;
+  Value *Crd = nullptr;
+  Value *Val = nullptr;
+};
+
+void findSparseCrd(PHINode *Iterator) {
+  // array that is indexed by sparse iterator level
+  // and used to index another array
+  for (auto *User : Iterator->users()) {
+    if (isa<LoadInst>(User)) {
+
+    }
+  }
+}
+
+bool detectCSR(std::vector<LevelBounds> &Levels, struct CSRLevels *CSR) {
+  size_t I, J;
+  for (I = 0; I < Levels.size(); ++I) {
+    if (Levels[I].LevelType != DENSE)
+      continue;
+    for (J = I+1; J < Levels.size(); ++J) {
+      if (Levels[J].LevelType != COMPRESSED)
+        continue;
+      if (Levels[J].IndexExpr == nullptr)
+        continue;
+      if (Levels[J].IndexExpr != Levels[I].Iterator)
+        continue;
+      CSR->I = Levels[I];
+      CSR->J = Levels[J];
+      CSR->Pos = Levels[J].BasePtr;
+      findCrd(CSR->J.Iterator, &CSR->Crd);
+      return true;
+    }
+  }
+  return false;
 }
 
 static void GetLiveIns(Function *F, SmallPtrSet<Value *, 4> &LiveIns) {
@@ -254,7 +332,8 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
 
   Node *LO;
-  DenseMap<PHINode*, LevelBounds> Levels;
+  std::vector<LevelBounds> Levels;
+  struct CSRLevels CSR;
   if (LI.getTopLevelLoops().size() == 0) {
     // TODO handle memory too
     for (auto &BB: F) {
@@ -268,7 +347,9 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   } else {
 
     LoopNest LN(*LI.getTopLevelLoops()[0], SE);
-    inferDataLayout(&LN, &SE, Levels);
+    makeLevelBounds(&LN, &SE, Levels);
+//    bool IsCSR = detectCSR(Levels, &CSR);
+//    LLVM_DEBUG(dbgs() << "iscsr = " << IsCSR << "\n");
 
     SmallPtrSet<Value *, 4> LiveOuts;
     GetLiveOuts(&LN.getOutermostLoop(), LiveOuts);
@@ -287,14 +368,17 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   for (auto *LiveIn : LiveIns)
     LiveInList.push_back({getNameOrAsOperand(LiveIn), Type2String(LiveIn), ""});
 
-  SmallPtrSet<Value*, 4> WorkList(LiveIns);
-  for (auto &Elem : Levels) {
-    LevelBounds &Level = Elem.getSecond();
-    PHINode *Iterator = Elem.getFirst();
-    if (WorkList.contains(Level.LowerBound) || WorkList.contains(Level.UpperBound)) {
-
-    }
-  }
+//  std::vector<Value *> WorkList;
+//  WorkList.insert(WorkList.begin(), LiveIns.begin(), LiveIns.end());
+//  SmallPtrSet<Value *, 4> Dense;
+//  while(!WorkList.empty()) {
+//    Value *Head = WorkList.back();
+//    if (Head == CSR.I.UpperBound ||
+//        Head == CSR.Crd ||
+//        Head == CSR.Pos) {
+//      WorkList.pop_back();
+//    }
+//  }
 
   std::vector<BBNode> AllBBs;
   for (auto &BB : F) {
