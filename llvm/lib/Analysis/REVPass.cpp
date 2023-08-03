@@ -325,6 +325,16 @@ template <> struct MappingTraits<BBNode> {
 } // namespace llvm::yaml
 
 
+void allLoadsInCurrentScope(Loop *L, SmallPtrSet<LoadInst*, 4> &Loads) {
+  for (auto *BB : L->blocks()) {
+    for (auto &I : *BB) {
+      if (auto *Load = dyn_cast<LoadInst>(&I)) {
+        Loads.insert(Load);
+      }
+    }
+  }
+}
+
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   outs() << F.getName() << "\n";
 
@@ -345,8 +355,17 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
       }
     }
   } else {
-
     LoopNest LN(*LI.getTopLevelLoops()[0], SE);
+    for (int Depth = LN.getNestDepth(); Depth > 0; Depth--) {
+      for (auto *Loop : LN.getLoopsAtDepth(Depth)) {
+        LLVM_DEBUG(dbgs() << *Loop << "\n");
+        SmallPtrSet<LoadInst*, 4> Loads;
+        allLoadsInCurrentScope(Loop, Loads);
+        for (auto *Load : Loads)
+          LLVM_DEBUG(dbgs() << *Load << "\n");
+      }
+    }
+
     makeLevelBounds(&LN, &SE, Levels);
 //    bool IsCSR = detectCSR(Levels, &CSR);
 //    LLVM_DEBUG(dbgs() << "iscsr = " << IsCSR << "\n");
