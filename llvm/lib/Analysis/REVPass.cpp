@@ -17,6 +17,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/DDG.h"
+#include "llvm/IR/DerivedTypes.h"
 
 #define DEBUG_TYPE "revpass"
 
@@ -97,7 +98,10 @@ bool findCrd(Value *Inst, Value **Crd) {
       Visited.insert(ToVisit);
       if (auto *Load = dyn_cast<LoadInst>(ToVisit)) {
         if (LoadCount++ == 1) {
-          *Crd = PrevLoad;
+          auto *GEP = dyn_cast<GEPOperator>(getPointerOperand(PrevLoad));
+          if (GEP == nullptr)
+            return false;
+          *Crd = GEP->getPointerOperand();
           return true;
         } else {
           PrevLoad = Load;
@@ -118,7 +122,7 @@ void makeLevelBounds(LoopNest *LN, ScalarEvolution *SE, std::vector<LevelBounds>
   for (auto *Loop : LN->getLoops()) {
     auto Bounds = Loop->getBounds(*SE);
     if (!Bounds.has_value())
-      return;
+      continue;
     auto *IndVar = Loop->getInductionVariable(*SE);
     LLVM_DEBUG(dbgs() << getNameOrAsOperand(IndVar) << " = [" << Bounds->getInitialIVValue() << ", " << Bounds->getFinalIVValue() << ") -> \n");
 
@@ -132,7 +136,9 @@ void makeLevelBounds(LoopNest *LN, ScalarEvolution *SE, std::vector<LevelBounds>
     Value *UpperBound = &Bounds->getFinalIVValue();
 
     bool IsZero = match(LowerBound, m_ZeroInt());
-    bool IsInt = isa<ConstantInt>(UpperBound) || isa<Argument>(UpperBound);
+//    bool IsInt = isa<ConstantInt>(UpperBound) || isa<Argument>(UpperBound);
+    // TODO handle loads better (make sure that bounds are invariant)
+    bool IsInt = UpperBound->getType()->getTypeID() == IntegerType::IntegerTyID;
     if (IsZero && IsInt) {
       LLVM_DEBUG(dbgs() << "dense\n");
       Levels.push_back({DENSE, IndVar, LowerBound, UpperBound});
@@ -347,7 +353,7 @@ Value *skipCasts(Value *V) {
   return V;
 }
 
-bool detectCSR(Value *Root, Value **Row, Value **Col, Value **Val, DenseMap<Value*, LevelTypeEnum> &LevelMap) {
+bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val, DenseMap<Value*, LevelTypeEnum> &LevelMap) {
   // Col is optional
   Instruction *I, *J;
   *Row = *Col = *Val = I = J = nullptr;
@@ -375,7 +381,7 @@ bool detectCSR(Value *Root, Value **Row, Value **Col, Value **Val, DenseMap<Valu
     // unique incoming/non-backedge
     int NonBackedge = 0;
     for (size_t i = 0; i < Phi->getNumIncomingValues(); ++i) {
-      if (Phi->getIncomingBlock(i) == Phi->getParent())
+      if (LI->getLoopFor(Phi->getParent())->contains(Phi->getIncomingBlock(i)))
         continue;
       else {
         NonBackedge++;
@@ -413,12 +419,12 @@ bool detectCSR(Value *Root, Value **Row, Value **Col, Value **Val, DenseMap<Valu
   return true;
 }
 
-void coverAllLoads(Loop *L, ScalarEvolution *SE, SmallVector<LoadInst*> &Loads, DenseMap<Value*, LevelTypeEnum> &LevelMap) {
+void coverAllLoads(LoopInfo *LI, Loop *L, ScalarEvolution *SE, SmallVector<LoadInst*> &Loads, DenseMap<Value*, LevelTypeEnum> &LevelMap) {
   // 1. how the load is indexed? eg by dense or compressed level iterator
   // 2. how the load is used? eg as ptr (to index other array) or in computation?
   for (auto *Load : Loads) {
     Value *Row, *Col, *Val;
-    auto IsCSR = detectCSR(Load, &Row, &Col, &Val, LevelMap);
+    auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, LevelMap);
     if (IsCSR) {
       LLVM_DEBUG({
         dbgs() << "detected CSR:\n";
@@ -450,6 +456,8 @@ void coverAllLoads(Loop *L, ScalarEvolution *SE, SmallVector<LoadInst*> &Loads, 
 }
 
 void makeTopLevelInputs(Value *LiveOut, SmallVectorImpl<Value*> &Inputs) {
+  if (auto *Store = dyn_cast<StoreInst>(LiveOut))
+    LiveOut = Store->getValueOperand();
   auto *Inst = dyn_cast<Instruction>(LiveOut);
   if (Inst == nullptr)
     return; // no inputs, some constant value
@@ -549,7 +557,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
 
 //        for (auto *Load : Loads)
 //          LLVM_DEBUG(dbgs() << *Load << "\n");
-        coverAllLoads(Loop, &SE, InputLoads, LevelMap);
+        coverAllLoads(&LI, Loop, &SE, InputLoads, LevelMap);
         LLVM_DEBUG(dbgs() << "-----------------------\n");
       }
     }
