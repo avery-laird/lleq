@@ -18,6 +18,7 @@
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/DDG.h"
 #include "llvm/IR/DerivedTypes.h"
+#include <queue>
 
 #define DEBUG_TYPE "revpass"
 
@@ -323,27 +324,27 @@ enum Property {
   FULL, ORDERED, UNIQUE, BRANCHLESS, COMPACT
 };
 
-Value* findFirstDep(Value *Operand) {
-  std::vector<Value*> Stack;
+void findFirstDep(Value *Operand, SmallVectorImpl<Value*> &Inputs) {
+  std::queue<Value*> Queue;
   SmallPtrSet<Value*, 5> Visited;
-  Stack.push_back(Operand);
-  while (!Stack.empty()) {
-    auto *ToVisit = Stack.back();
-    Stack.pop_back();
-    if (!Visited.contains(ToVisit)) {
-      if (isa<LoadInst>(ToVisit) || isa<PHINode>(Operand)) {
-        return ToVisit;
-      }
-      Visited.insert(ToVisit);
-      if (auto *Inst = dyn_cast<Instruction>(ToVisit)) {
-        for (auto &Op : Inst->operands()) {
-          Stack.push_back(Op);
+  Queue.push(Operand);
+  while (!Queue.empty()) {
+    auto *ToVisit = Queue.front();
+    Queue.pop();
+    if (isa<LoadInst>(ToVisit) || isa<PHINode>(ToVisit)) {
+      Inputs.push_back(ToVisit);
+      continue;
+    }
+    if (auto *I = dyn_cast<Instruction>(ToVisit)) {
+      for (auto &Op : I->operands()) {
+        if (!Visited.contains(Op)) {
+          Visited.insert(Op);
+          Queue.push(Op);
         }
       }
     }
   }
-  // otherwise, just return the value
-  return Operand;
+  return;
 }
 
 // CSR val tree:
@@ -462,7 +463,9 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
   if (auto *Mul = dyn_cast<MulOperator>(Next)) {
     // Nk can't ever change and should be the close level upper bound
     *Nk = skipCasts(Mul->getOperand(1));
-    if (LevelMap[J].UpperBound != *Nk)
+//    if (LevelMap[J].UpperBound != *Nk)
+//      return false;
+    if (!LI->getLoopFor(LevelMap[J].Iterator->getParent())->isLoopInvariant(*Nk))
       return false;
     Next = skipCasts(Mul->getOperand(0));
   }
@@ -634,9 +637,9 @@ void makeTopLevelInputs(Value *LiveOut, SmallVectorImpl<Value*> &Inputs) {
   for (auto &Op : Inst->operands()) {
     if (isa<IntrinsicInst>(Inst) && isa<Function>(Op))
       continue;
-    Value *Dep = Op; //findFirstDep(Op);
+    findFirstDep(Op, Inputs);
 //    LLVM_DEBUG(dbgs() << *Dep << "\n");
-    Inputs.push_back(Dep);
+//    Inputs.push_back(Dep);
   }
 }
 
