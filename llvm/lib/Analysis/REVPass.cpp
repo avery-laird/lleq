@@ -419,7 +419,7 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
   return true;
 }
 
-void coverAllLoads(LoopInfo *LI, Loop *L, ScalarEvolution *SE, SmallVector<LoadInst*> &Loads, DenseMap<Value*, LevelTypeEnum> &LevelMap) {
+void coverAllLoads(LoopInfo *LI, ScalarEvolution *SE, SmallVector<LoadInst*> &Loads, DenseMap<Value*, LevelTypeEnum> &LevelMap) {
   // 1. how the load is indexed? eg by dense or compressed level iterator
   // 2. how the load is used? eg as ptr (to index other array) or in computation?
   for (auto *Load : Loads) {
@@ -466,7 +466,7 @@ void makeTopLevelInputs(Value *LiveOut, SmallVectorImpl<Value*> &Inputs) {
     if (isa<IntrinsicInst>(Inst) && isa<Function>(Op))
       continue;
     Value *Dep = Op; //findFirstDep(Op);
-    LLVM_DEBUG(dbgs() << *Dep << "\n");
+//    LLVM_DEBUG(dbgs() << *Dep << "\n");
     Inputs.push_back(Dep);
   }
 }
@@ -528,39 +528,63 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     for (auto &Level : Levels)
       LevelMap[Level.Iterator] = Level.LevelType;
 
-
-    for (int Depth = LN.getNestDepth(); Depth > 0; Depth--) {
-      for (auto *Loop : LN.getLoopsAtDepth(Depth)) {
-        LLVM_DEBUG(dbgs() << "-----------------------\n");
-        LLVM_DEBUG(dbgs() << "Loop at depth " << Depth << ":\n");
-        // collect all inputs (loads only) in the current scope
-        SmallPtrSet<LoadInst*, 4> Loads;
-        allLoadsInCurrentScope(Loop, Loads);
-
-        // collect live out (store or scalar live-out)
-        Value *LiveOut = findLiveOut(Loop, &LI);
-        if (LiveOut == nullptr) {
-          LLVM_DEBUG(dbgs() << "no liveouts.\n");
-          continue;
-        }
-        LLVM_DEBUG(dbgs() << "live out = " << *LiveOut << "\n");
-
-        // make top-level dependences (value arrays + scalar inputs)
-        SmallVector<Value*> TopLevelInputs;
-        LLVM_DEBUG(dbgs() << "Inputs ------------\n");
-        makeTopLevelInputs(LiveOut, TopLevelInputs);
-        LLVM_DEBUG(dbgs() << "-------------------\n");
-        SmallVector<LoadInst*> InputLoads;
-        for (auto *V : TopLevelInputs)
-          if (auto *Load = dyn_cast<LoadInst>(V))
-            InputLoads.push_back(Load);
-
-//        for (auto *Load : Loads)
-//          LLVM_DEBUG(dbgs() << *Load << "\n");
-        coverAllLoads(&LI, Loop, &SE, InputLoads, LevelMap);
-        LLVM_DEBUG(dbgs() << "-----------------------\n");
+    // get all liveouts
+    SmallVector<Value*> TopLevelInputs;
+    for (auto *Loop : LN.getLoops()) {
+      // collect live out (store or scalar live-out)
+      Value *LiveOut = findLiveOut(Loop, &LI);
+      if (LiveOut == nullptr) {
+        LLVM_DEBUG(dbgs() << "no liveouts.\n");
+        continue;
       }
+      LLVM_DEBUG(dbgs() << "live out = " << *LiveOut << "\n");
+      makeTopLevelInputs(LiveOut, TopLevelInputs);
     }
+    LLVM_DEBUG({
+        dbgs() << "Inputs ------------\n";
+        for (auto *In : TopLevelInputs)
+          dbgs() << *In << "\n";
+        dbgs() << "-------------------\n";
+    });
+
+    SmallVector<LoadInst*> TopLevelLoads;
+    for (auto *Input : TopLevelInputs)
+      if (auto *Load = dyn_cast<LoadInst>(Input))
+        TopLevelLoads.push_back(Load);
+    coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap);
+
+//    for (int Depth = LN.getNestDepth(); Depth > 0; Depth--) {
+//      for (auto *Loop : LN.getLoopsAtDepth(Depth)) {
+//        LLVM_DEBUG(dbgs() << "-----------------------\n");
+//        LLVM_DEBUG(dbgs() << "Loop at depth " << Depth << ":\n");
+//        // collect all inputs (loads only) in the current scope
+//        SmallPtrSet<LoadInst*, 4> Loads;
+//        allLoadsInCurrentScope(Loop, Loads);
+//
+//        // collect live out (store or scalar live-out)
+//        Value *LiveOut = findLiveOut(Loop, &LI);
+//        if (LiveOut == nullptr) {
+//          LLVM_DEBUG(dbgs() << "no liveouts.\n");
+//          continue;
+//        }
+//        LLVM_DEBUG(dbgs() << "live out = " << *LiveOut << "\n");
+//
+//        // make top-level dependences (value arrays + scalar inputs)
+//        SmallVector<Value*> TopLevelInputs;
+//        LLVM_DEBUG(dbgs() << "Inputs ------------\n");
+//        makeTopLevelInputs(LiveOut, TopLevelInputs);
+//        LLVM_DEBUG(dbgs() << "-------------------\n");
+//        SmallVector<LoadInst*> InputLoads;
+//        for (auto *V : TopLevelInputs)
+//          if (auto *Load = dyn_cast<LoadInst>(V))
+//            InputLoads.push_back(Load);
+//
+////        for (auto *Load : Loads)
+////          LLVM_DEBUG(dbgs() << *Load << "\n");
+//        coverAllLoads(&LI, Loop, &SE, InputLoads, LevelMap);
+//        LLVM_DEBUG(dbgs() << "-----------------------\n");
+//      }
+//    }
 
 
 //    bool IsCSR = detectCSR(Levels, &CSR);
