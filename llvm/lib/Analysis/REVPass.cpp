@@ -492,6 +492,33 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
   return false;
 }
 
+bool detectDense1D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **x, Value **Ik, DenseMap<Value*, LevelBounds> &LevelMap) {
+  *x = *Ik = nullptr;
+
+  Value *Next = nullptr;
+  if (auto *Load = dyn_cast<LoadInst>(Root))
+    Next = skipCasts(Load->getPointerOperand());
+  else
+    return false;
+
+  if (auto *GEP = dyn_cast<GEPOperator>(Next)) {
+    if (GEP->getNumIndices() != 1)
+      return false;
+    *x = GEP->getPointerOperand();
+    Next = skipCasts(GEP->getOperand(1));
+  } else {
+    return false;
+  }
+
+  if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
+    *Ik = Next;
+  } else {
+    return false;
+  }
+
+  return true;
+}
+
 bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE, SmallVector<LoadInst*> &Loads, DenseMap<Value*, LevelBounds> &LevelMap, SmallPtrSetImpl<LoadInst*> &Leftover) {
   // 1. how the load is indexed? eg by dense or compressed level iterator
   // 2. how the load is used? eg as ptr (to index other array) or in computation?
@@ -526,6 +553,18 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE, SmallVector<LoadInst*> &Lo
           dbgs() << "A = " << *A << "\n";
           dbgs() << "p_{k-1} = " << *Pk_1 << "\n";
           dbgs() << "N_k = " << *Nk << "\n";
+          dbgs() << "i_k = " << *Ik << "\n";
+        });
+        ToRemove.push_back(Load);
+        Change = true;
+        continue;
+      }
+      Value *x;
+      auto IsDense1D = detectDense1D(LI, SE, Load, &x, &Ik, LevelMap);
+      if (IsDense1D) {
+        LLVM_DEBUG({
+          dbgs() << "detected dense 1d\n";
+          dbgs() << "x = " << *x << "\n";
           dbgs() << "i_k = " << *Ik << "\n";
         });
         ToRemove.push_back(Load);
