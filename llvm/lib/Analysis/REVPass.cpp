@@ -87,36 +87,60 @@ struct LevelBounds {
 };
 
 bool findCrd(Value *Inst, Value **Crd) {
-  std::vector<Value*> Stack;
-  SmallPtrSet<Value*, 4> Visited;
-  Stack.push_back(Inst);
-  int LoadCount = 0;
-  Value *PrevLoad = nullptr;
-  while (!Stack.empty()) {
-    auto *ToVisit = Stack.back();
-    Stack.pop_back();
-    if (!Visited.contains(ToVisit)) {
-      Visited.insert(ToVisit);
-      if (auto *Load = dyn_cast<LoadInst>(ToVisit)) {
-        if (LoadCount++ == 1) {
-//          auto *GEP = dyn_cast<GEPOperator>(getPointerOperand(PrevLoad));
-//          if (GEP == nullptr)
-//            return false;
-//          *Crd = GEP->getPointerOperand();
-          *Crd = PrevLoad;
-          return true;
-        } else {
-          PrevLoad = Load;
+  std::function<bool(Value*, Value*, int, SmallPtrSet<Value*, 4>)> DFS;
+  DFS = [&Crd, &DFS](Value *V, Value *PrevLoad, int Loads, SmallPtrSet<Value*, 4> Visited) {
+    Visited.insert(V);
+    for (auto *U : V->users()) {
+      if (!Visited.contains(U)) {
+        if (auto *L = dyn_cast<LoadInst>(V)) {
+          if (Loads == 1) {
+            *Crd = PrevLoad;
+            return true;
+          } else {
+            PrevLoad = L;
+            Loads += 1;
+          }
         }
-      }
-      for (auto *Use : ToVisit->users()) {
-        if (auto *I = dyn_cast<Instruction>(Use))
-          Stack.push_back(I);
+        if (DFS(U, PrevLoad, Loads, Visited))
+          return true;
       }
     }
-  }
-  return false;
+    return false;
+  };
+  return DFS(Inst, nullptr, 0, {});
 }
+
+//bool findCrd(Value *Inst, Value **Crd) {
+//  std::vector<Value*> Stack;
+//  SmallPtrSet<Value*, 4> Visited;
+//  Stack.push_back(Inst);
+//  int LoadCount = 0;
+//  Value *PrevLoad = nullptr;
+//  while (!Stack.empty()) {
+//    auto *ToVisit = Stack.back();
+//    Stack.pop_back();
+//    if (!Visited.contains(ToVisit)) {
+//      Visited.insert(ToVisit);
+//      if (auto *Load = dyn_cast<LoadInst>(ToVisit)) {
+//        if (LoadCount++ == 1) {
+////          auto *GEP = dyn_cast<GEPOperator>(getPointerOperand(PrevLoad));
+////          if (GEP == nullptr)
+////            return false;
+////          *Crd = GEP->getPointerOperand();
+//          *Crd = PrevLoad;
+//          return true;
+//        } else {
+//          PrevLoad = Load;
+//        }
+//      }
+//      for (auto *Use : ToVisit->users()) {
+//        if (auto *I = dyn_cast<Instruction>(Use))
+//          Stack.push_back(I);
+//      }
+//    }
+//  }
+//  return false;
+//}
 
 void makeLevelBounds(LoopNest *LN, ScalarEvolution *SE, std::vector<LevelBounds> &Levels) {
   DataLayout DL = SE->getDataLayout();
@@ -355,6 +379,76 @@ Value *skipCasts(Value *V) {
   return V;
 }
 
+bool detectCSC(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val, DenseMap<Value*, LevelBounds> &LevelMap) {
+  // Row is optional
+  Instruction *I, *J;
+  *Row = *Col = *Val = I = J = nullptr;
+  // match 1st gep
+  Value *Next = nullptr;
+  if (auto *Load = dyn_cast<LoadInst>(Root))
+    Next = skipCasts(Load->getPointerOperand());
+  else
+    return false;
+
+  if (auto *GEP = dyn_cast<GEPOperator>(Next)) {
+    if (GEP->getNumIndices() != 1)
+      return false;
+    *Val = GEP->getPointerOperand();
+    Next = skipCasts(GEP->getOperand(1));
+  } else {
+    return false;
+  }
+
+  if (LevelMap.contains(Next) && LevelMap[Next].LevelType == COMPRESSED) {
+    J = dyn_cast<Instruction>(Next);
+    auto *Phi = dyn_cast<PHINode>(Next);
+    if (!Phi)
+      return false;
+    // unique incoming/non-backedge
+    int NonBackedge = 0;
+    for (size_t i = 0; i < Phi->getNumIncomingValues(); ++i) {
+      if (LI->getLoopFor(Phi->getParent())->contains(Phi->getIncomingBlock(i)))
+        continue;
+      else {
+        NonBackedge++;
+        if (NonBackedge > 1)
+          return false;
+        Next = skipCasts(Phi->getIncomingValue(i));
+      }
+    }
+  } else {
+    return false;
+  }
+
+  if (auto *Load = dyn_cast<LoadInst>(Next))
+    Next = skipCasts(Load->getPointerOperand());
+  else
+    return false;
+
+  if (auto *GEP = dyn_cast<GEPOperator>(Next)) {
+    if (GEP->getNumIndices() != 1)
+      return false;
+    *Row = GEP->getPointerOperand();
+    Next = skipCasts(GEP->getOperand(1));
+  } else {
+    return false;
+  }
+
+  if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
+    I = dyn_cast<Instruction>(Next);
+  } else {
+    return false;
+  }
+
+  // try for Col also
+  if (findCrd(J, Col)) {
+    auto JBounds = LevelMap[J];
+    JBounds.LevelType = DENSE;
+    LevelMap[*Col] = JBounds;
+  }
+  return true;
+}
+
 bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val, DenseMap<Value*, LevelBounds> &LevelMap) {
   // Col is optional
   Instruction *I, *J;
@@ -417,8 +511,7 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
   }
 
   // try for Col also
-  findCrd(J, Col);
-  if (*Col != nullptr) {
+  if (findCrd(J, Col)) {
     auto JBounds = LevelMap[J];
     JBounds.LevelType = DENSE;
     LevelMap[*Col] = JBounds;
@@ -532,7 +625,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE, SmallVector<LoadInst*> &Lo
   while (Change) {
     Change = false;
     SmallVector<LoadInst *> ToRemove;
-    for (auto *Load : WorkList) {
+    for (auto *Load : WorkList) { // TODO figure out how to undo LevelMap mutations
       Value *Row, *Col, *Val;
       auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, LevelMap);
       if (IsCSR) {
@@ -547,6 +640,19 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE, SmallVector<LoadInst*> &Lo
         Change = true;
         continue;
       }
+//      auto IsCSC = detectCSC(LI, Load, &Row, &Col, &Val, LevelMap);
+//      if (IsCSC) {
+//        LLVM_DEBUG({
+//          dbgs() << "detected CSC:\n";
+//          dbgs() << "val = " << *Val << "\n";
+//          dbgs() << "row = " << *Row << "\n";
+//          if (Col)
+//            dbgs() << "col = " << *Col << "\n";
+//        });
+//        ToRemove.push_back(Load);
+//        Change = true;
+//        continue;
+//      }
       Value *A, *Pk_1, *Nk, *Ik;
       auto IsDense2D =
           detectDense2D(LI, SE, Load, &A, &Pk_1, &Nk, &Ik, LevelMap);
