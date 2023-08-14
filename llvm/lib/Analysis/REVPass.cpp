@@ -18,6 +18,10 @@
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/DDG.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/Analysis/IVDescriptors.h"
+#include "llvm/Analysis/DemandedBits.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/IR/Dominators.h"
 #include <queue>
 
 #define DEBUG_TYPE "revpass"
@@ -784,6 +788,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
 
   LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
+  DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
 //  DDGAnalysis::Result &DDG = AM.getResult<DDGAnalysis>(F);
 
   Node *LO;
@@ -807,6 +812,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
       LevelMap[Level.Iterator] = Level;
 
     // get all liveouts
+    DenseMap<Loop*, Value*> LiveOutMap;
     SmallVector<Value*> TopLevelInputs;
     for (auto *Loop : LN.getLoops()) {
       // collect live out (store or scalar live-out)
@@ -816,6 +822,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
         continue;
       }
       LLVM_DEBUG(dbgs() << "live out = " << *LiveOut << "\n");
+      LiveOutMap[Loop] = LiveOut;
       makeTopLevelInputs(LiveOut, TopLevelInputs);
     }
 
@@ -843,6 +850,28 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
             dbgs() << *L << "\n";
         }
     });
+
+    AssumptionCache AC(F);
+    DemandedBits DB(F, AC, DT);
+
+    for (int Depth = LN.getNestDepth(); Depth > 0; Depth--) {
+      for (auto *Loop : LN.getLoopsAtDepth(Depth)) {
+//        PredicatedScalarEvolution PSE(SE, *Loop);
+        // get liveout for loop
+        Value *LiveOut = LiveOutMap[Loop];
+        // is it a reduction or recurrence?
+        for (auto &Phi : Loop->getHeader()->phis()) {
+          RecurrenceDescriptor RD;
+          if (!RecurrenceDescriptor::isReductionPHI(&Phi, Loop, RD, &DB, &AC, &DT, &SE))
+            continue;
+          // see if it's the liveout
+          if (RD.getReductionOpChain(&Phi, Loop).back() == LiveOut) {
+            LLVM_DEBUG(dbgs() << *LiveOut << " is a reduction.\n");
+
+          }
+        }
+      }
+    }
 
 //    for (int Depth = LN.getNestDepth(); Depth > 0; Depth--) {
 //      for (auto *Loop : LN.getLoopsAtDepth(Depth)) {
