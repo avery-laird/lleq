@@ -545,14 +545,18 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
   // TODO handle associativity
   if (auto *Add = dyn_cast<AddOperator>(Next)) {
     J = dyn_cast<Instruction>(skipCasts(Add->getOperand(1)));
-    if (J == nullptr)
-      return false;
-    if (LevelMap.contains(J) && LevelMap[J].LevelType == DENSE) {
+    if (J != nullptr && LevelMap.contains(J) && LevelMap[J].LevelType == DENSE) {
         *Ik = J;
+	Next = skipCasts(Add->getOperand(0));
     } else {
-      return false;
+        J = dyn_cast<Instruction>(skipCasts(Add->getOperand(0)));
+        if (J != nullptr && LevelMap.contains(J) && LevelMap[J].LevelType == DENSE) {
+            *Ik = J;
+        } else {
+            return false;
+	}
+        Next = skipCasts(Add->getOperand(1));
     }
-    Next = skipCasts(Add->getOperand(0));
   } else {
     return false;
   }
