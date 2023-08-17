@@ -541,41 +541,74 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
   } else {
     return false;
   }
+
+  if (auto *AddRecExpr = dyn_cast<SCEVAddRecExpr>(SE->getSCEV(Next))) {
+    AddRecExpr->dump();
+
+    auto *StartRec = dyn_cast<SCEVAddRecExpr>(AddRecExpr->getStart());
+    if (StartRec == nullptr)
+      return false;
+
+    J = dyn_cast<Instruction>(StartRec->getLoop()->getInductionVariable(*SE));
+    if (J == nullptr || !LevelMap.contains(J) || LevelMap[J].LevelType != DENSE)
+      return false;
+
+    auto *StepRec = dyn_cast<SCEVUnknown>(AddRecExpr->getStepRecurrence(*SE));
+    if (StepRec == nullptr)
+      StepRec = dyn_cast<SCEVUnknown>(StartRec->getStepRecurrence(*SE));
+      if (StepRec == nullptr)
+        return false;
+
+    auto *StepRecValue = skipCasts(StepRec->getValue());
+    if (!LI->getLoopFor(LevelMap[J].Iterator->getParent())->isLoopInvariant(StepRecValue))
+      return false;
+
+    I = dyn_cast<Instruction>(AddRecExpr->getLoop()->getInductionVariable(*SE));
+    if (I == nullptr || !LevelMap.contains(I) || LevelMap[I].LevelType != DENSE)
+      return false;
+
+    *Ik = J;
+    *Pk_1 = I;
+    *Nk = StepRecValue;
+  } else {
+    return false;
+  }
+
   // match the mul
   // TODO handle associativity
-  if (auto *Add = dyn_cast<AddOperator>(Next)) {
-    J = dyn_cast<Instruction>(skipCasts(Add->getOperand(1)));
-    if (J != nullptr && LevelMap.contains(J) && LevelMap[J].LevelType == DENSE) {
-        *Ik = J;
-	Next = skipCasts(Add->getOperand(0));
-    } else {
-        J = dyn_cast<Instruction>(skipCasts(Add->getOperand(0)));
-        if (J != nullptr && LevelMap.contains(J) && LevelMap[J].LevelType == DENSE) {
-            *Ik = J;
-        } else {
-            return false;
-	}
-        Next = skipCasts(Add->getOperand(1));
-    }
-  } else {
-    return false;
-  }
-
-  if (auto *Mul = dyn_cast<MulOperator>(Next)) {
-    // Nk can't ever change and should be the close level upper bound
-    *Nk = skipCasts(Mul->getOperand(1));
-//    if (LevelMap[J].UpperBound != *Nk)
+//  if (auto *Add = dyn_cast<AddOperator>(Next)) {
+//    J = dyn_cast<Instruction>(skipCasts(Add->getOperand(1)));
+//    if (J != nullptr && LevelMap.contains(J) && LevelMap[J].LevelType == DENSE) {
+//        *Ik = J;
+//	Next = skipCasts(Add->getOperand(0));
+//    } else {
+//        J = dyn_cast<Instruction>(skipCasts(Add->getOperand(0)));
+//        if (J != nullptr && LevelMap.contains(J) && LevelMap[J].LevelType == DENSE) {
+//            *Ik = J;
+//        } else {
+//            return false;
+//	}
+//        Next = skipCasts(Add->getOperand(1));
+//    }
+//  } else {
+//    return false;
+//  }
+//
+//  if (auto *Mul = dyn_cast<MulOperator>(Next)) {
+//    // Nk can't ever change and should be the close level upper bound
+//    *Nk = skipCasts(Mul->getOperand(1));
+////    if (LevelMap[J].UpperBound != *Nk)
+////      return false;
+//    if (!LI->getLoopFor(LevelMap[J].Iterator->getParent())->isLoopInvariant(*Nk))
 //      return false;
-    if (!LI->getLoopFor(LevelMap[J].Iterator->getParent())->isLoopInvariant(*Nk))
-      return false;
-    Next = skipCasts(Mul->getOperand(0));
-  }
-
-  if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
-    *Pk_1 = dyn_cast<Instruction>(Next);
-  } else {
-    return false;
-  }
+//    Next = skipCasts(Mul->getOperand(0));
+//  }
+//
+//  if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
+//    *Pk_1 = dyn_cast<Instruction>(Next);
+//  } else {
+//    return false;
+//  }
 
   return true;
 
