@@ -22,6 +22,7 @@
 #include "llvm/Analysis/DemandedBits.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/IR/Dominators.h"
+//#include <ostream>
 #include <queue>
 
 #define DEBUG_TYPE "revpass"
@@ -72,6 +73,67 @@ std::string getNameOrAsOperand(Value *V) {
   V->printAsOperand(OS, false);
   return OS.str();
 }
+
+enum Storage {
+  CONTIGUOUS, CSR, CSC
+};
+
+std::string Format2String(Storage F) {
+  switch (F) {
+  default:
+    llvm_unreachable("unknown format.");
+  case Storage::CONTIGUOUS:
+    return "Dense";
+  case Storage::CSR:
+    return "CSR";
+  case Storage::CSC:
+    return "CSC";
+  }
+}
+
+// TODO use templating
+class Tensor {
+public:
+  Tensor(std::vector<Value *> Shape, Value *Root, Storage Format)
+      : Shape(Shape), Root(Root), ElemType(Root->getType()), Format(Format) {
+    // row-major by default
+    for (size_t i = 0; i < Shape.size(); ++i)
+      DimOrder.push_back(i);
+  }
+  std::vector<Value *> Shape;
+  Value *Root;
+  Type *ElemType;
+  Storage Format;
+  std::vector<unsigned> DimOrder;
+  friend raw_ostream& operator<<(raw_ostream& os, Tensor const& t) {
+    std::string output = Format2String(t.Format) + "(<";
+    for (size_t i=0; i < t.Shape.size(); ++i) {
+      if (i > 0)
+        output += "x";
+      if (t.Shape[i] == nullptr)
+        output += "?";
+      else {
+        output += getNameOrAsOperand(t.Shape[i]);
+        //        std::string type;
+        //        raw_string_ostream rs(type);
+        //        t.Shape[i]->getType()->print(rs);
+        //        output += type;
+      }
+    }
+    output += ">)";
+    return os << output;
+  }
+};
+
+class CSR : Tensor {
+public:
+  CSR(std::vector<Value *> Shape, Value *Root, Storage Format, Value *Row,
+      Value *Col, Value *Val)
+      : Tensor(Shape, Root, Format), Row(Row), Col(Col), Val(Val) {}
+  Value *Row = nullptr;
+  Value *Col = nullptr;
+  Value *Val = nullptr;
+};
 
 
 enum LevelTypeEnum {
@@ -335,6 +397,24 @@ template <> struct MappingTraits<BBNode> {
     io.mapRequired("nodes", BN.Nodes);
   }
 };
+
+template <> struct MappingTraits<Tensor> {
+  static void mapping(IO &io, Tensor &T) {
+    std::string RootName = getNameOrAsOperand(T.Root);
+    std::string Format = Format2String(T.Format);
+    io.mapRequired("root", RootName);
+    io.mapRequired("format", Format);
+  }
+};
+template <>
+struct SequenceTraits<std::vector<Tensor>> {
+  static size_t size(IO &io, std::vector<Tensor> &list) {
+    return list.size();
+  }
+  static Tensor &element(IO &io, std::vector<Tensor> &list, size_t index) {
+    return list[index];
+  }
+};
 } // namespace llvm::yaml
 
 
@@ -352,15 +432,15 @@ enum Property {
   FULL, ORDERED, UNIQUE, BRANCHLESS, COMPACT
 };
 
-void findFirstDep(Value *Operand, SmallVectorImpl<Value*> &Inputs) {
+void findFirstDep(Value *Operand, SmallPtrSetImpl<Value*> &Inputs) {
   std::queue<Value*> Queue;
   SmallPtrSet<Value*, 5> Visited;
   Queue.push(Operand);
   while (!Queue.empty()) {
     auto *ToVisit = Queue.front();
     Queue.pop();
-    if (isa<LoadInst>(ToVisit) || isa<PHINode>(ToVisit)) {
-      Inputs.push_back(ToVisit);
+    if (isa<LoadInst>(ToVisit) /*|| isa<PHINode>(ToVisit)*/) {
+      Inputs.insert(ToVisit);
       continue;
     }
     if (auto *I = dyn_cast<Instruction>(ToVisit)) {
@@ -453,7 +533,7 @@ bool detectCSC(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
   return true;
 }
 
-bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val, DenseMap<Value*, LevelBounds> &LevelMap) {
+bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val, Value **Rows, DenseMap<Value*, LevelBounds> &LevelMap) {
   // Col is optional
   Instruction *I, *J;
   *Row = *Col = *Val = I = J = nullptr;
@@ -510,6 +590,7 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
 
   if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
     I = dyn_cast<Instruction>(Next);
+    *Rows = LevelMap[Next].UpperBound;
   } else {
     return false;
   }
@@ -619,9 +700,14 @@ bool detectDense1D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **x,
   return true;
 }
 
-bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE, SmallVector<LoadInst*> &Loads, DenseMap<Value*, LevelBounds> &LevelMap, SmallPtrSetImpl<LoadInst*> &Leftover) {
+bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
+                   SmallVector<LoadInst *> &Loads,
+                   DenseMap<Value *, LevelBounds> &LevelMap,
+                   SmallPtrSetImpl<LoadInst *> &Leftover,
+                   DenseMap<Value*, Tensor> &TensorMap) {
   // 1. how the load is indexed? eg by dense or compressed level iterator
-  // 2. how the load is used? eg as ptr (to index other array) or in computation?
+  // 2. how the load is used? eg as ptr (to index other array) or in
+  // computation?
   bool Change = true;
   SmallPtrSet<LoadInst *, 5> WorkList;
   for (auto *L : Loads)
@@ -629,44 +715,53 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE, SmallVector<LoadInst*> &Lo
   while (Change) {
     Change = false;
     SmallVector<LoadInst *> ToRemove;
-    for (auto *Load : WorkList) { // TODO figure out how to undo LevelMap mutations
-      Value *Row, *Col, *Val;
-      auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, LevelMap);
+    for (auto *Load :
+         WorkList) { // TODO figure out how to undo LevelMap mutations
+      Value *Row, *Col, *Val, *Rows;
+      auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, &Rows, LevelMap);
       if (IsCSR) {
+        Tensor CSR({Rows, nullptr}, Val, Storage::CSR);
+        TensorMap.insert({Load, CSR});
         LLVM_DEBUG({
           dbgs() << "detected CSR:\n";
           dbgs() << "val = " << *Val << "\n";
           dbgs() << "row = " << *Row << "\n";
           if (Col)
             dbgs() << "col = " << *Col << "\n";
+          dbgs() << CSR << "\n";
         });
         ToRemove.push_back(Load);
         Change = true;
         continue;
       }
-//      auto IsCSC = detectCSC(LI, Load, &Row, &Col, &Val, LevelMap);
-//      if (IsCSC) {
-//        LLVM_DEBUG({
-//          dbgs() << "detected CSC:\n";
-//          dbgs() << "val = " << *Val << "\n";
-//          dbgs() << "row = " << *Row << "\n";
-//          if (Col)
-//            dbgs() << "col = " << *Col << "\n";
-//        });
-//        ToRemove.push_back(Load);
-//        Change = true;
-//        continue;
-//      }
+      //      auto IsCSC = detectCSC(LI, Load, &Row, &Col, &Val, LevelMap);
+      //      if (IsCSC) {
+      //        LLVM_DEBUG({
+      //          dbgs() << "detected CSC:\n";
+      //          dbgs() << "val = " << *Val << "\n";
+      //          dbgs() << "row = " << *Row << "\n";
+      //          if (Col)
+      //            dbgs() << "col = " << *Col << "\n";
+      //        });
+      //        ToRemove.push_back(Load);
+      //        Change = true;
+      //        continue;
+      //      }
       Value *A, *Pk_1, *Nk, *Ik;
       auto IsDense2D =
           detectDense2D(LI, SE, Load, &A, &Pk_1, &Nk, &Ik, LevelMap);
       if (IsDense2D) {
+        auto *D1 = LevelMap[Pk_1].UpperBound;
+        auto *D2 = LevelMap[Ik].UpperBound;
+        Tensor Dense2D({D1, D2}, A, Storage::CONTIGUOUS);
+        TensorMap.insert({Load, Dense2D});
         LLVM_DEBUG({
           dbgs() << "detected dense 2d\n";
           dbgs() << "A = " << *A << "\n";
           dbgs() << "p_{k-1} = " << *Pk_1 << "\n";
           dbgs() << "N_k = " << *Nk << "\n";
           dbgs() << "i_k = " << *Ik << "\n";
+          dbgs() << Dense2D << "\n";
         });
         ToRemove.push_back(Load);
         Change = true;
@@ -675,10 +770,14 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE, SmallVector<LoadInst*> &Lo
       Value *x;
       auto IsDense1D = detectDense1D(LI, SE, Load, &x, &Ik, LevelMap);
       if (IsDense1D) {
+        auto *D1 = LevelMap[Ik].UpperBound;
+        Tensor Dense1D({D1}, x, Storage::CONTIGUOUS);
+        TensorMap.insert({Load, Dense1D});
         LLVM_DEBUG({
           dbgs() << "detected dense 1d\n";
           dbgs() << "x = " << *x << "\n";
           dbgs() << "i_k = " << *Ik << "\n";
+          dbgs() << Dense1D << "\n";
         });
         ToRemove.push_back(Load);
         Change = true;
@@ -692,52 +791,52 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE, SmallVector<LoadInst*> &Lo
   Leftover.insert(WorkList.begin(), WorkList.end());
 
   return WorkList.size() == 0;
-//  for (auto *Load : Loads) {
-//    Value *Row, *Col, *Val;
-//    auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, LevelMap);
-//    if (IsCSR) {
-//      LLVM_DEBUG({
-//        dbgs() << "detected CSR:\n";
-//         dbgs() << "val = " << *Val << "\n";
-//         dbgs() << "row = " << *Row << "\n";
-//         if (Col)
-//           dbgs() << "col = " << *Col << "\n";
-//      });
-//      continue;
-//    }
-//    Value *A, *Pk_1, *Nk, *Ik;
-//    auto IsDense2D = detectDense2D(LI, SE, Load, &A, &Pk_1, &Nk, &Ik, LevelMap);
-//    if (IsDense2D) {
-//      LLVM_DEBUG({
-//          dbgs() << "detected dense 2d\n";
-//          dbgs() << "A = " << *A << "\n";
-//          dbgs() << "p_{k-1} = " << *Pk_1 << "\n";
-//          dbgs() << "N_k = " << *Nk << "\n";
-//          dbgs() << "i_k = " << *Ik << "\n";
-//      });
-//      continue;
-//    }
+  //  for (auto *Load : Loads) {
+  //    Value *Row, *Col, *Val;
+  //    auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, LevelMap);
+  //    if (IsCSR) {
+  //      LLVM_DEBUG({
+  //        dbgs() << "detected CSR:\n";
+  //         dbgs() << "val = " << *Val << "\n";
+  //         dbgs() << "row = " << *Row << "\n";
+  //         if (Col)
+  //           dbgs() << "col = " << *Col << "\n";
+  //      });
+  //      continue;
+  //    }
+  //    Value *A, *Pk_1, *Nk, *Ik;
+  //    auto IsDense2D = detectDense2D(LI, SE, Load, &A, &Pk_1, &Nk, &Ik,
+  //    LevelMap); if (IsDense2D) {
+  //      LLVM_DEBUG({
+  //          dbgs() << "detected dense 2d\n";
+  //          dbgs() << "A = " << *A << "\n";
+  //          dbgs() << "p_{k-1} = " << *Pk_1 << "\n";
+  //          dbgs() << "N_k = " << *Nk << "\n";
+  //          dbgs() << "i_k = " << *Ik << "\n";
+  //      });
+  //      continue;
+  //    }
 
-//    const SCEV *AccessFn = SE->getSCEV(getPointerOperand(Load));
-//    const SCEV *BasePointer = dyn_cast<SCEVUnknown>(SE->getPointerBase(AccessFn));
-//    AccessFn = SE->getMinusSCEV(AccessFn, BasePointer);
-//    auto *TryCast = dyn_cast<SCEVAddRecExpr>(AccessFn);
-//    bool IsAffine = TryCast != nullptr && TryCast->isAffine();
-//    LLVM_DEBUG(dbgs() << *AccessFn << ", isAffine=" << IsAffine << "\n");
-//    if (!IsAffine) {
-//      // chase load
-//    } else {
-//      // lookup level access
-//    }
-//    if (SCEVExprContains(AccessFn, [](const SCEV *S) { return }))
-//    SmallVector<const SCEV*> Subscripts, Sizes;
-//    delinearize(*SE, AccessFn, Subscripts, Sizes, SE->getElementSize(Load));
-//    for (auto *S : Subscripts) {
-//      LLVM_DEBUG(dbgs() << *S << "\n");
-//    }
+  //    const SCEV *AccessFn = SE->getSCEV(getPointerOperand(Load));
+  //    const SCEV *BasePointer =
+  //    dyn_cast<SCEVUnknown>(SE->getPointerBase(AccessFn)); AccessFn =
+  //    SE->getMinusSCEV(AccessFn, BasePointer); auto *TryCast =
+  //    dyn_cast<SCEVAddRecExpr>(AccessFn); bool IsAffine = TryCast != nullptr
+  //    && TryCast->isAffine(); LLVM_DEBUG(dbgs() << *AccessFn << ", isAffine="
+  //    << IsAffine << "\n"); if (!IsAffine) {
+  //      // chase load
+  //    } else {
+  //      // lookup level access
+  //    }
+  //    if (SCEVExprContains(AccessFn, [](const SCEV *S) { return }))
+  //    SmallVector<const SCEV*> Subscripts, Sizes;
+  //    delinearize(*SE, AccessFn, Subscripts, Sizes, SE->getElementSize(Load));
+  //    for (auto *S : Subscripts) {
+  //      LLVM_DEBUG(dbgs() << *S << "\n");
+  //    }
 }
 
-void makeTopLevelInputs(Value *LiveOut, SmallVectorImpl<Value*> &Inputs) {
+void makeTopLevelInputs(Value *LiveOut, SmallPtrSetImpl<Value*> &Inputs) {
   if (auto *Store = dyn_cast<StoreInst>(LiveOut))
     LiveOut = Store->getValueOperand();
   auto *Inst = dyn_cast<Instruction>(LiveOut);
@@ -807,13 +906,14 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   } else {
     LoopNest LN(*LI.getTopLevelLoops()[0], SE);
     makeLevelBounds(&LN, &SE, Levels);
-    DenseMap<Value*, LevelBounds> LevelMap;
+    DenseMap<Value *, LevelBounds> LevelMap;
     for (auto &Level : Levels)
       LevelMap[Level.Iterator] = Level;
 
     // get all liveouts
-    DenseMap<Loop*, Value*> LiveOutMap;
-    SmallVector<Value*> TopLevelInputs;
+    DenseMap<Loop *, Value *> LiveOutMap;
+
+    DenseMap<Loop *, SmallPtrSet<Value *, 5>> Loop2Loads;
     for (auto *Loop : LN.getLoops()) {
       // collect live out (store or scalar live-out)
       Value *LiveOut = findLiveOut(Loop, &LI);
@@ -823,32 +923,37 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
       }
       LLVM_DEBUG(dbgs() << "live out = " << *LiveOut << "\n");
       LiveOutMap[Loop] = LiveOut;
+      SmallPtrSet<Value *, 5> TopLevelInputs;
       makeTopLevelInputs(LiveOut, TopLevelInputs);
+      Loop2Loads[Loop] = TopLevelInputs;
     }
 
-    SmallVector<LoadInst*> TopLevelLoads;
-    for (auto *Input : TopLevelInputs)
-      if (auto *Load = dyn_cast<LoadInst>(Input))
-        TopLevelLoads.push_back(Load);
+    SmallVector<LoadInst *> TopLevelLoads;
+    for (auto &E : Loop2Loads) {
+      for (auto *Input : E.second)
+        if (auto *Load = dyn_cast<LoadInst>(Input))
+          TopLevelLoads.push_back(Load);
+    }
 
     LLVM_DEBUG({
-        dbgs() << "Top level loads ------------\n";
-        for (auto *In : TopLevelLoads)
-          dbgs() << *In << "\n";
-        dbgs() << "----------------------------\n";
+      dbgs() << "Top level loads ------------\n";
+      for (auto *In : TopLevelLoads)
+        dbgs() << *In << "\n";
+      dbgs() << "----------------------------\n";
     });
 
-
-    SmallPtrSet<LoadInst*, 5> Leftover;
-    auto AllCovered = coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap, Leftover);
+    SmallPtrSet<LoadInst *, 5> Leftover;
+    DenseMap<Value *, Tensor> TensorMap;
+    auto AllCovered =
+        coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap, Leftover, TensorMap);
     LLVM_DEBUG({
-        if (AllCovered)
-          dbgs() << "all loads covered.\n";
-        else {
-          dbgs() << "remaining loads:\n";
-          for (auto *L : Leftover)
-            dbgs() << *L << "\n";
-        }
+      if (AllCovered)
+        dbgs() << "all loads covered.\n";
+      else {
+        dbgs() << "remaining loads:\n";
+        for (auto *L : Leftover)
+          dbgs() << *L << "\n";
+      }
     });
 
     AssumptionCache AC(F);
@@ -856,100 +961,106 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
 
     for (int Depth = LN.getNestDepth(); Depth > 0; Depth--) {
       for (auto *Loop : LN.getLoopsAtDepth(Depth)) {
-//        PredicatedScalarEvolution PSE(SE, *Loop);
+        //        PredicatedScalarEvolution PSE(SE, *Loop);
         // get liveout for loop
         Value *LiveOut = LiveOutMap[Loop];
-        // is it a reduction or recurrence?
-        for (auto &Phi : Loop->getHeader()->phis()) {
-          RecurrenceDescriptor RD;
-          if (!RecurrenceDescriptor::isReductionPHI(&Phi, Loop, RD, &DB, &AC, &DT, &SE))
-            continue;
-          // see if it's the liveout
-          if (RD.getReductionOpChain(&Phi, Loop).back() == LiveOut) {
-            LLVM_DEBUG(dbgs() << *LiveOut << " is a reduction.\n");
 
-          }
-        }
+        // is it a reduction or recurrence?
+        //        for (auto &Phi : Loop->getHeader()->phis()) {
+        //          RecurrenceDescriptor RD;
+        //          if (!RecurrenceDescriptor::isReductionPHI(&Phi, Loop, RD, &DB, &AC, &DT, &SE))
+        //            continue;
+        //          // see if it's the liveout
+        //          if (RD.getLoopExitInstr() == LiveOut) {
+        //            LLVM_DEBUG(dbgs() << *LiveOut << " is a reduction.\n");
+        //
+        //          }
+        //        }
       }
     }
 
-//    for (int Depth = LN.getNestDepth(); Depth > 0; Depth--) {
-//      for (auto *Loop : LN.getLoopsAtDepth(Depth)) {
-//        LLVM_DEBUG(dbgs() << "-----------------------\n");
-//        LLVM_DEBUG(dbgs() << "Loop at depth " << Depth << ":\n");
-//        // collect all inputs (loads only) in the current scope
-//        SmallPtrSet<LoadInst*, 4> Loads;
-//        allLoadsInCurrentScope(Loop, Loads);
-//
-//        // collect live out (store or scalar live-out)
-//        Value *LiveOut = findLiveOut(Loop, &LI);
-//        if (LiveOut == nullptr) {
-//          LLVM_DEBUG(dbgs() << "no liveouts.\n");
-//          continue;
-//        }
-//        LLVM_DEBUG(dbgs() << "live out = " << *LiveOut << "\n");
-//
-//        // make top-level dependences (value arrays + scalar inputs)
-//        SmallVector<Value*> TopLevelInputs;
-//        LLVM_DEBUG(dbgs() << "Inputs ------------\n");
-//        makeTopLevelInputs(LiveOut, TopLevelInputs);
-//        LLVM_DEBUG(dbgs() << "-------------------\n");
-//        SmallVector<LoadInst*> InputLoads;
-//        for (auto *V : TopLevelInputs)
-//          if (auto *Load = dyn_cast<LoadInst>(V))
-//            InputLoads.push_back(Load);
-//
-////        for (auto *Load : Loads)
-////          LLVM_DEBUG(dbgs() << *Load << "\n");
-//        coverAllLoads(&LI, Loop, &SE, InputLoads, LevelMap);
-//        LLVM_DEBUG(dbgs() << "-----------------------\n");
-//      }
-//    }
+    //    for (int Depth = LN.getNestDepth(); Depth > 0; Depth--) {
+    //      for (auto *Loop : LN.getLoopsAtDepth(Depth)) {
+    //        LLVM_DEBUG(dbgs() << "-----------------------\n");
+    //        LLVM_DEBUG(dbgs() << "Loop at depth " << Depth << ":\n");
+    //        // collect all inputs (loads only) in the current scope
+    //        SmallPtrSet<LoadInst*, 4> Loads;
+    //        allLoadsInCurrentScope(Loop, Loads);
+    //
+    //        // collect live out (store or scalar live-out)
+    //        Value *LiveOut = findLiveOut(Loop, &LI);
+    //        if (LiveOut == nullptr) {
+    //          LLVM_DEBUG(dbgs() << "no liveouts.\n");
+    //          continue;
+    //        }
+    //        LLVM_DEBUG(dbgs() << "live out = " << *LiveOut << "\n");
+    //
+    //        // make top-level dependences (value arrays + scalar inputs)
+    //        SmallVector<Value*> TopLevelInputs;
+    //        LLVM_DEBUG(dbgs() << "Inputs ------------\n");
+    //        makeTopLevelInputs(LiveOut, TopLevelInputs);
+    //        LLVM_DEBUG(dbgs() << "-------------------\n");
+    //        SmallVector<LoadInst*> InputLoads;
+    //        for (auto *V : TopLevelInputs)
+    //          if (auto *Load = dyn_cast<LoadInst>(V))
+    //            InputLoads.push_back(Load);
+    //
+    ////        for (auto *Load : Loads)
+    ////          LLVM_DEBUG(dbgs() << *Load << "\n");
+    //        coverAllLoads(&LI, Loop, &SE, InputLoads, LevelMap);
+    //        LLVM_DEBUG(dbgs() << "-----------------------\n");
+    //      }
+    //    }
 
-
-//    bool IsCSR = detectCSR(Levels, &CSR);
-//    LLVM_DEBUG(dbgs() << "iscsr = " << IsCSR << "\n");
+    //    bool IsCSR = detectCSR(Levels, &CSR);
+    //    LLVM_DEBUG(dbgs() << "iscsr = " << IsCSR << "\n");
 
     SmallPtrSet<Value *, 4> LiveOuts;
     GetLiveOuts(&LN.getOutermostLoop(), LiveOuts);
 
     Instruction *LiveOut = dyn_cast<Instruction>(*LiveOuts.begin());
     LO = new Node(LiveOut);
-  }
 
-  std::error_code EC;
-  raw_fd_ostream OutputFile(AnalysisOutputPath + ".yaml", EC);
-  Output Yout(OutputFile);
+    std::error_code EC;
+    raw_fd_ostream OutputFile(AnalysisOutputPath + ".yaml", EC);
+    Output Yout(OutputFile);
 
-  SmallPtrSet<Value *, 4> LiveIns;
-  GetLiveIns(&F, LiveIns);
-  std::vector<Atom> LiveInList;
-  for (auto *LiveIn : LiveIns)
-    LiveInList.push_back({getNameOrAsOperand(LiveIn), Type2String(LiveIn), ""});
+    SmallPtrSet<Value *, 4> LiveIns;
+    GetLiveIns(&F, LiveIns);
+    std::vector<Atom> LiveInList;
+    for (auto *LiveIn : LiveIns)
+      LiveInList.push_back(
+          {getNameOrAsOperand(LiveIn), Type2String(LiveIn), ""});
 
-//  std::vector<Value *> WorkList;
-//  WorkList.insert(WorkList.begin(), LiveIns.begin(), LiveIns.end());
-//  SmallPtrSet<Value *, 4> Dense;
-//  while(!WorkList.empty()) {
-//    Value *Head = WorkList.back();
-//    if (Head == CSR.I.UpperBound ||
-//        Head == CSR.Crd ||
-//        Head == CSR.Pos) {
-//      WorkList.pop_back();
-//    }
-//  }
+    //  std::vector<Value *> WorkList;
+    //  WorkList.insert(WorkList.begin(), LiveIns.begin(), LiveIns.end());
+    //  SmallPtrSet<Value *, 4> Dense;
+    //  while(!WorkList.empty()) {
+    //    Value *Head = WorkList.back();
+    //    if (Head == CSR.I.UpperBound ||
+    //        Head == CSR.Crd ||
+    //        Head == CSR.Pos) {
+    //      WorkList.pop_back();
+    //    }
+    //  }
 
-  std::vector<BBNode> AllBBs;
-  for (auto &BB : F) {
-    BBNode BN;
-    BN.Name = BB.getName();
-    for (auto &I : BB) {
-      BN.Nodes.push_back(Node(&I));
+    std::vector<Tensor> AllTensors;
+    for (auto &E : TensorMap)
+      AllTensors.push_back(E.second);
+
+    std::vector<BBNode> AllBBs;
+    for (auto &BB : F) {
+      BBNode BN;
+      BN.Name = BB.getName();
+      for (auto &I : BB) {
+        BN.Nodes.push_back(Node(&I));
+      }
+      AllBBs.push_back(BN);
     }
-   AllBBs.push_back(BN);
+    Yout << AllBBs;
+    Yout << *LO;
+    Yout << LiveInList;
+    Yout << AllTensors;
   }
-  Yout << AllBBs;
-  Yout << *LO;
-  Yout << LiveInList;
   return PreservedAnalyses::all();
 }
