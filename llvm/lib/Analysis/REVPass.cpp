@@ -578,6 +578,42 @@ std::pair<bool, bool> detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst 
   }
   return std::make_pair(false, false);
 
+  // match the mul
+  // TODO handle associativity
+  //  if (auto *Add = dyn_cast<AddOperator>(Next)) {
+  //    J = dyn_cast<Instruction>(skipCasts(Add->getOperand(1)));
+  //    if (J != nullptr && LevelMap.contains(J) && LevelMap[J].LevelType == DENSE) {
+  //        *Ik = J;
+  //	Next = skipCasts(Add->getOperand(0));
+  //    } else {
+  //        J = dyn_cast<Instruction>(skipCasts(Add->getOperand(0)));
+  //        if (J != nullptr && LevelMap.contains(J) && LevelMap[J].LevelType == DENSE) {
+  //            *Ik = J;
+  //        } else {
+  //            return false;
+  //	}
+  //        Next = skipCasts(Add->getOperand(1));
+  //    }
+  //  } else {
+  //    return false;
+  //  }
+  //
+  //  if (auto *Mul = dyn_cast<MulOperator>(Next)) {
+  //    // Nk can't ever change and should be the close level upper bound
+  //    *Nk = skipCasts(Mul->getOperand(1));
+  ////    if (LevelMap[J].UpperBound != *Nk)
+  ////      return false;
+  //    if (!LI->getLoopFor(LevelMap[J].Iterator->getParent())->isLoopInvariant(*Nk))
+  //      return false;
+  //    Next = skipCasts(Mul->getOperand(0));
+  //  }
+  //
+  //  if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
+  //    *Pk_1 = dyn_cast<Instruction>(Next);
+  //  } else {
+  //    return false;
+  //  }
+
 
 //  const SCEV *AccessFn = SE->getSCEVAtScope(getPointerOperand(Root), LI->getLoopFor(Root->getParent()));
 //  const SCEV *BasePointer = dyn_cast<SCEVUnknown>(SE->getPointerBase(AccessFn));
