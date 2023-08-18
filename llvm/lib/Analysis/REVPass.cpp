@@ -523,7 +523,8 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
   return true;
 }
 
-bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A, Value **Pk_1, Value **Nk, Value **Ik, DenseMap<Value*, LevelBounds> &LevelMap) {
+std::pair<bool, bool> detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A, Value **Pk_1,
+                                    Value **Nk, Value **Ik, DenseMap<Value*, LevelBounds> &LevelMap) {
   Instruction *I, *J;
   *A = *Pk_1 = *Nk = *Ik = nullptr;
 
@@ -531,15 +532,15 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
   if (auto *Load = dyn_cast<LoadInst>(Root))
     Next = skipCasts(Load->getPointerOperand());
   else
-    return false;
+    return std::make_pair(false, false);
 
   if (auto *GEP = dyn_cast<GEPOperator>(Next)) {
     if (GEP->getNumIndices() != 1)
-      return false;
+      return std::make_pair(false, false);
     *A = GEP->getPointerOperand();
     Next = skipCasts(GEP->getOperand(1));
   } else {
-    return false;
+    return std::make_pair(false, false);
   }
 
   if (auto *AddRecExpr = dyn_cast<SCEVAddRecExpr>(SE->getSCEV(Next))) {
@@ -547,70 +548,36 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
 
     auto *StartRec = dyn_cast<SCEVAddRecExpr>(AddRecExpr->getStart());
     if (StartRec == nullptr)
-      return false;
+      return std::make_pair(false, false);
 
     J = dyn_cast<Instruction>(StartRec->getLoop()->getInductionVariable(*SE));
     if (J == nullptr || !LevelMap.contains(J) || LevelMap[J].LevelType != DENSE)
-      return false;
+      return std::make_pair(false, false);
 
+    bool IsRowMaj = false;
     auto *StepRec = dyn_cast<SCEVUnknown>(AddRecExpr->getStepRecurrence(*SE));
-    if (StepRec == nullptr)
+    if (StepRec == nullptr) {
+      IsRowMaj = true;
       StepRec = dyn_cast<SCEVUnknown>(StartRec->getStepRecurrence(*SE));
       if (StepRec == nullptr)
-        return false;
+        return std::make_pair(false, false);
+    }
 
     auto *StepRecValue = skipCasts(StepRec->getValue());
     if (!LI->getLoopFor(LevelMap[J].Iterator->getParent())->isLoopInvariant(StepRecValue))
-      return false;
+      return std::make_pair(false, false);
 
     I = dyn_cast<Instruction>(AddRecExpr->getLoop()->getInductionVariable(*SE));
     if (I == nullptr || !LevelMap.contains(I) || LevelMap[I].LevelType != DENSE)
-      return false;
+      return std::make_pair(false, false);
 
     *Ik = J;
     *Pk_1 = I;
     *Nk = StepRecValue;
-  } else {
-    return false;
+    return std::make_pair(true, IsRowMaj);
   }
+  return std::make_pair(false, false);
 
-  // match the mul
-  // TODO handle associativity
-//  if (auto *Add = dyn_cast<AddOperator>(Next)) {
-//    J = dyn_cast<Instruction>(skipCasts(Add->getOperand(1)));
-//    if (J != nullptr && LevelMap.contains(J) && LevelMap[J].LevelType == DENSE) {
-//        *Ik = J;
-//	Next = skipCasts(Add->getOperand(0));
-//    } else {
-//        J = dyn_cast<Instruction>(skipCasts(Add->getOperand(0)));
-//        if (J != nullptr && LevelMap.contains(J) && LevelMap[J].LevelType == DENSE) {
-//            *Ik = J;
-//        } else {
-//            return false;
-//	}
-//        Next = skipCasts(Add->getOperand(1));
-//    }
-//  } else {
-//    return false;
-//  }
-//
-//  if (auto *Mul = dyn_cast<MulOperator>(Next)) {
-//    // Nk can't ever change and should be the close level upper bound
-//    *Nk = skipCasts(Mul->getOperand(1));
-////    if (LevelMap[J].UpperBound != *Nk)
-////      return false;
-//    if (!LI->getLoopFor(LevelMap[J].Iterator->getParent())->isLoopInvariant(*Nk))
-//      return false;
-//    Next = skipCasts(Mul->getOperand(0));
-//  }
-//
-//  if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
-//    *Pk_1 = dyn_cast<Instruction>(Next);
-//  } else {
-//    return false;
-//  }
-
-  return true;
 
 //  const SCEV *AccessFn = SE->getSCEVAtScope(getPointerOperand(Root), LI->getLoopFor(Root->getParent()));
 //  const SCEV *BasePointer = dyn_cast<SCEVUnknown>(SE->getPointerBase(AccessFn));
@@ -626,7 +593,7 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
 //        dbgs() << *S << "\n";
 //  });
 
-  return false;
+//  return false;
 }
 
 bool detectDense1D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **x, Value **Ik, DenseMap<Value*, LevelBounds> &LevelMap) {
@@ -695,7 +662,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE, SmallVector<LoadInst*> &Lo
 //        continue;
 //      }
       Value *A, *Pk_1, *Nk, *Ik;
-      auto IsDense2D =
+      auto [IsDense2D, isRowMajor] =
           detectDense2D(LI, SE, Load, &A, &Pk_1, &Nk, &Ik, LevelMap);
       if (IsDense2D) {
         LLVM_DEBUG({
@@ -704,6 +671,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE, SmallVector<LoadInst*> &Lo
           dbgs() << "p_{k-1} = " << *Pk_1 << "\n";
           dbgs() << "N_k = " << *Nk << "\n";
           dbgs() << "i_k = " << *Ik << "\n";
+          dbgs() << "row major = " << (isRowMajor ? "true" : "false") << "\n";
         });
         ToRemove.push_back(Load);
         Change = true;
