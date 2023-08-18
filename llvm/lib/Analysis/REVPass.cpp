@@ -22,6 +22,7 @@
 #include "llvm/Analysis/DemandedBits.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/Support/Casting.h"
 //#include <ostream>
 #include <queue>
 
@@ -67,35 +68,21 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
 std::string getNameOrAsOperand(Value *V) {
   //  if (!V->getName().empty())
   //    return std::string(V->getName());
-
   std::string BBName;
   raw_string_ostream OS(BBName);
   V->printAsOperand(OS, false);
   return OS.str();
 }
 
-enum Storage {
-  CONTIGUOUS, CSR, CSC
-};
-
-std::string Format2String(Storage F) {
-  switch (F) {
-  default:
-    llvm_unreachable("unknown format.");
-  case Storage::CONTIGUOUS:
-    return "Dense";
-  case Storage::CSR:
-    return "CSR";
-  case Storage::CSC:
-    return "CSC";
-  }
-}
 
 // TODO use templating
 class Tensor {
 public:
-  Tensor(std::vector<Value *> Shape, Value *Root, Storage Format)
-      : Shape(Shape), Root(Root), ElemType(Root->getType()), Format(Format) {
+  enum StorageKind {
+    CONTIGUOUS, CSR, CSC
+  };
+  Tensor(std::vector<Value *> Shape, Value *Root, StorageKind Kind)
+      : Shape(Shape), Root(Root), ElemType(Root->getType()), Kind(Kind) {
     // row-major by default
     for (size_t i = 0; i < Shape.size(); ++i)
       DimOrder.push_back(i);
@@ -103,36 +90,63 @@ public:
   std::vector<Value *> Shape;
   Value *Root;
   Type *ElemType;
-  Storage Format;
+  const StorageKind Kind;
   std::vector<unsigned> DimOrder;
-  friend raw_ostream& operator<<(raw_ostream& os, Tensor const& t) {
-    std::string output = Format2String(t.Format) + "(<";
-    for (size_t i=0; i < t.Shape.size(); ++i) {
-      if (i > 0)
-        output += "x";
-      if (t.Shape[i] == nullptr)
-        output += "?";
-      else {
-        output += getNameOrAsOperand(t.Shape[i]);
-        //        std::string type;
-        //        raw_string_ostream rs(type);
-        //        t.Shape[i]->getType()->print(rs);
-        //        output += type;
-      }
+
+  StorageKind getKind() const { return Kind; }
+};
+
+std::string Format2String(Tensor::StorageKind F) {
+  switch (F) {
+  default:
+    llvm_unreachable("unknown format.");
+  case Tensor::StorageKind::CONTIGUOUS:
+    return "Dense";
+  case Tensor::StorageKind::CSR:
+    return "CSR";
+  case Tensor::StorageKind::CSC:
+    return "CSC";
+  }
+}
+
+raw_ostream& operator<<(raw_ostream& os, Tensor const& t) {
+  std::string output = Format2String(t.Kind) + "(<";
+  for (size_t i=0; i < t.Shape.size(); ++i) {
+    if (i > 0)
+      output += "x";
+    if (t.Shape[i] == nullptr)
+      output += "?";
+    else {
+      output += getNameOrAsOperand(t.Shape[i]);
+      //        std::string type;
+      //        raw_string_ostream rs(type);
+      //        t.Shape[i]->getType()->print(rs);
+      //        output += type;
     }
-    output += ">)";
-    return os << output;
+  }
+  output += ">)";
+  return os << output;
+}
+
+class Vector : public Tensor {
+public:
+  Vector(std::vector<Value *> Shape, Value *Root)
+      : Tensor(Shape, Root, StorageKind::CONTIGUOUS) {}
+  static bool classof(const Tensor *T) {
+    return T->getKind() == StorageKind::CONTIGUOUS;
   }
 };
 
-class CSR : Tensor {
+class CSR : public Tensor {
 public:
-  CSR(std::vector<Value *> Shape, Value *Root, Storage Format, Value *Row,
-      Value *Col, Value *Val)
-      : Tensor(Shape, Root, Format), Row(Row), Col(Col), Val(Val) {}
+  CSR(std::vector<Value *> Shape, Value *Root, Value *Row,
+      Value *Col)
+      : Tensor(Shape, Root, StorageKind::CSR), Row(Row), Col(Col) {}
   Value *Row = nullptr;
   Value *Col = nullptr;
-  Value *Val = nullptr;
+  static bool classof(const Tensor *T) {
+    return T->getKind() == StorageKind::CSR;
+  }
 };
 
 
@@ -398,20 +412,30 @@ template <> struct MappingTraits<BBNode> {
   }
 };
 
-template <> struct MappingTraits<Tensor> {
-  static void mapping(IO &io, Tensor &T) {
-    std::string RootName = getNameOrAsOperand(T.Root);
-    std::string Format = Format2String(T.Format);
+template <> struct MappingTraits<Tensor*> {
+  static void mapping(IO &io, Tensor* &T) {
+    std::string RootName = getNameOrAsOperand(T->Root);
+    std::string Format = Format2String(T->Kind);
     io.mapRequired("root", RootName);
     io.mapRequired("format", Format);
+    if (auto *CSRTensor = dyn_cast<CSR>(T)) {
+      std::string Row = getNameOrAsOperand(CSRTensor->Row);
+      std::string Col = getNameOrAsOperand(CSRTensor->Col);
+      io.mapRequired("row", Row);
+      io.mapRequired("col", Col);
+    } else if (auto *V = dyn_cast<Vector>(T)) {
+      // do nothing
+    } else {
+      llvm_unreachable("unknown format.");
+    }
   }
 };
 template <>
-struct SequenceTraits<std::vector<Tensor>> {
-  static size_t size(IO &io, std::vector<Tensor> &list) {
+struct SequenceTraits<std::vector<Tensor*>> {
+  static size_t size(IO &io, std::vector<Tensor*> &list) {
     return list.size();
   }
-  static Tensor &element(IO &io, std::vector<Tensor> &list, size_t index) {
+  static Tensor* &element(IO &io, std::vector<Tensor*> &list, size_t index) {
     return list[index];
   }
 };
@@ -704,7 +728,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
                    SmallVector<LoadInst *> &Loads,
                    DenseMap<Value *, LevelBounds> &LevelMap,
                    SmallPtrSetImpl<LoadInst *> &Leftover,
-                   DenseMap<Value*, Tensor> &TensorMap) {
+                   DenseMap<Value*, Tensor*> &TensorMap) {
   // 1. how the load is indexed? eg by dense or compressed level iterator
   // 2. how the load is used? eg as ptr (to index other array) or in
   // computation?
@@ -720,15 +744,16 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       Value *Row, *Col, *Val, *Rows;
       auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, &Rows, LevelMap);
       if (IsCSR) {
-        Tensor CSR({Rows, nullptr}, Val, Storage::CSR);
-        TensorMap.insert({Load, CSR});
+        auto *TensorCSR = new CSR({Rows, nullptr}, Val, Row, Col);
+//        CSR TensorCSR({Rows, nullptr}, Val, Row, Col);
+        TensorMap[Load] = TensorCSR;
         LLVM_DEBUG({
           dbgs() << "detected CSR:\n";
           dbgs() << "val = " << *Val << "\n";
           dbgs() << "row = " << *Row << "\n";
           if (Col)
             dbgs() << "col = " << *Col << "\n";
-          dbgs() << CSR << "\n";
+          dbgs() << TensorCSR << "\n";
         });
         ToRemove.push_back(Load);
         Change = true;
@@ -753,8 +778,9 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       if (IsDense2D) {
         auto *D1 = LevelMap[Pk_1].UpperBound;
         auto *D2 = LevelMap[Ik].UpperBound;
-        Tensor Dense2D({D1, D2}, A, Storage::CONTIGUOUS);
-        TensorMap.insert({Load, Dense2D});
+        auto *Dense2D = new Vector({D1, D2}, A);
+//        Vector Dense2D({D1, D2}, A);
+        TensorMap[Load] = Dense2D;
         LLVM_DEBUG({
           dbgs() << "detected dense 2d\n";
           dbgs() << "A = " << *A << "\n";
@@ -771,8 +797,9 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       auto IsDense1D = detectDense1D(LI, SE, Load, &x, &Ik, LevelMap);
       if (IsDense1D) {
         auto *D1 = LevelMap[Ik].UpperBound;
-        Tensor Dense1D({D1}, x, Storage::CONTIGUOUS);
-        TensorMap.insert({Load, Dense1D});
+        auto *Dense1D = new Vector({D1}, x);
+//        Vector Dense1D({D1}, x);
+        TensorMap[Load] = Dense1D;
         LLVM_DEBUG({
           dbgs() << "detected dense 1d\n";
           dbgs() << "x = " << *x << "\n";
@@ -943,7 +970,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     });
 
     SmallPtrSet<LoadInst *, 5> Leftover;
-    DenseMap<Value *, Tensor> TensorMap;
+    DenseMap<Value *, Tensor*> TensorMap;
     auto AllCovered =
         coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap, Leftover, TensorMap);
     LLVM_DEBUG({
@@ -1044,7 +1071,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     //    }
     //  }
 
-    std::vector<Tensor> AllTensors;
+    std::vector<Tensor*> AllTensors;
     for (auto &E : TensorMap)
       AllTensors.push_back(E.second);
 
@@ -1061,6 +1088,10 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     Yout << *LO;
     Yout << LiveInList;
     Yout << AllTensors;
+
+    for (auto &E : TensorMap) {
+      delete E.second; // TODO use smart pointers
+    }
   }
   return PreservedAnalyses::all();
 }
