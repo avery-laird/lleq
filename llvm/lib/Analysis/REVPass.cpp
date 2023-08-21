@@ -156,6 +156,18 @@ enum LevelTypeEnum {
   UNKNOWN
 };
 
+std::string printLevelType(LevelTypeEnum &LT) {
+  switch (LT) {
+  default:
+    llvm_unreachable("unknown level type.");
+  case COMPRESSED:
+    return "COMPRESSED";
+  case DENSE:
+    return "DENSE";
+  case UNKNOWN:
+    return "UNKNOWN";
+  }
+}
 
 struct LevelBounds {
   LevelTypeEnum LevelType;
@@ -439,6 +451,15 @@ struct SequenceTraits<std::vector<Tensor*>> {
     return list[index];
   }
 };
+
+//template <> struct MappingTraits<LevelBounds> {
+//  static void mapping(IO &io, LevelBounds &LB) {
+//    std::string IndVar = getNameOrAsOperand(LB.Iterator);
+//    std::string LevelType = printLevelType(LB.LevelType);
+//    io.mapRequired("indvar", LB.);
+//    io.mapRequired("nodes", BN.Nodes);
+//  }
+//};
 } // namespace llvm::yaml
 
 
@@ -450,6 +471,43 @@ void allLoadsInCurrentScope(Loop *L, SmallPtrSet<LoadInst*, 4> &Loads) {
       }
     }
   }
+}
+
+std::string buildExpression(Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD, DenseMap<Value*, LevelBounds> &LevelMap, DenseMap<Value*, Tensor*> &TensorMap) {
+  if (RD.getRecurrenceKind() == RecurKind::FMulAdd) {
+    auto *I = dyn_cast<Instruction>(LiveOut);
+    Tensor *A = TensorMap[I->getOperand(0)];
+    Tensor *B = TensorMap[I->getOperand(1)];
+    // TODO fix this up
+    PHINode *FirstDim = nullptr;
+    if (LevelMap[Iterator].LevelType == COMPRESSED) {
+      auto *Idx = LevelMap[Iterator].IndexExpr;
+      if (LevelMap.contains(Idx))
+        FirstDim = LevelMap[Idx].Iterator;
+    } else {
+      FirstDim = Iterator;
+    }
+//    A.
+    return getNameOrAsOperand(A->Root) + "(";
+  } else {
+    llvm_unreachable("unknown recurrence kind.");
+  }
+}
+
+void emitFold(Value *LiveOut, PHINode *Iterator,
+              RecurrenceDescriptor &RD,
+              DenseMap<Value *, LevelBounds> &LevelMap,
+              DenseMap<Value *, Tensor *> &TensorMap) {
+  Value *Init;
+  std::string End;
+  if (LevelMap[Iterator].LevelType == COMPRESSED)
+    End = getNameOrAsOperand(Iterator) + ".end";
+  else
+    End = getNameOrAsOperand(LevelMap[Iterator].UpperBound);
+  LLVM_DEBUG({
+    dbgs() << "fold 0 " << End << " " << buildExpression(LiveOut, Iterator, RD, LevelMap, TensorMap)
+           << "\n";
+  });
 }
 
 enum Property {
@@ -753,7 +811,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
           dbgs() << "row = " << *Row << "\n";
           if (Col)
             dbgs() << "col = " << *Col << "\n";
-          dbgs() << TensorCSR << "\n";
+          dbgs() << *TensorCSR << "\n";
         });
         ToRemove.push_back(Load);
         Change = true;
@@ -787,7 +845,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
           dbgs() << "p_{k-1} = " << *Pk_1 << "\n";
           dbgs() << "N_k = " << *Nk << "\n";
           dbgs() << "i_k = " << *Ik << "\n";
-          dbgs() << Dense2D << "\n";
+          dbgs() << *Dense2D << "\n";
         });
         ToRemove.push_back(Load);
         Change = true;
@@ -804,7 +862,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
           dbgs() << "detected dense 1d\n";
           dbgs() << "x = " << *x << "\n";
           dbgs() << "i_k = " << *Ik << "\n";
-          dbgs() << Dense1D << "\n";
+          dbgs() << *Dense1D << "\n";
         });
         ToRemove.push_back(Load);
         Change = true;
@@ -988,21 +1046,40 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
 
     for (int Depth = LN.getNestDepth(); Depth > 0; Depth--) {
       for (auto *Loop : LN.getLoopsAtDepth(Depth)) {
-        //        PredicatedScalarEvolution PSE(SE, *Loop);
         // get liveout for loop
         Value *LiveOut = LiveOutMap[Loop];
+        if (LiveOut == nullptr)
+          continue;
 
-        // is it a reduction or recurrence?
-        //        for (auto &Phi : Loop->getHeader()->phis()) {
-        //          RecurrenceDescriptor RD;
-        //          if (!RecurrenceDescriptor::isReductionPHI(&Phi, Loop, RD, &DB, &AC, &DT, &SE))
-        //            continue;
-        //          // see if it's the liveout
-        //          if (RD.getLoopExitInstr() == LiveOut) {
-        //            LLVM_DEBUG(dbgs() << *LiveOut << " is a reduction.\n");
-        //
-        //          }
-        //        }
+        RecurrenceDescriptor RD;
+        if (any_of(Loop->getHeader()->phis(), [&](PHINode &Phi) {
+              return RecurrenceDescriptor::isReductionPHI(&Phi, Loop, RD, &DB,
+                                                          &AC, &DT, &SE) &&
+                     RD.getLoopExitInstr() == LiveOut;
+            })) {
+          LLVM_DEBUG(dbgs() << *LiveOut << " is a reduction.\n");
+          // candidate for fold
+          emitFold(LiveOut, Loop->getInductionVariable(SE), RD, LevelMap, TensorMap);
+          continue;
+        }
+        // is it a reduction?
+//        for (auto &Phi : Loop->getHeader()->phis()) {
+//          RecurrenceDescriptor RD;
+//          if (!RecurrenceDescriptor::isReductionPHI(&Phi, Loop, RD, &DB, &AC, &DT, &SE))
+//            continue;
+//          // see if it's the liveout
+//          if (RD.getLoopExitInstr() == LiveOut) {
+//            LLVM_DEBUG(dbgs() << *LiveOut << " is a reduction.\n");
+//            // candidate for fold
+//            emitFold(LiveOut, Loop->getInductionVariable(SE), LevelMap);
+//            continue;
+//          }
+//        }
+        // is it a map?
+        if (auto *Store = dyn_cast<StoreInst>(LiveOut)) {
+          // can be
+        }
+
       }
     }
 
