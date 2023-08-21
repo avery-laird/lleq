@@ -541,8 +541,7 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
   } else {
     return false;
   }
-  // match the mul
-  // TODO handle associativity
+
   if (auto *Add = dyn_cast<AddOperator>(Next)) {
     J = dyn_cast<Instruction>(skipCasts(Add->getOperand(1)));
     if (J != nullptr && LevelMap.contains(J) && LevelMap[J].LevelType == DENSE) {
@@ -564,11 +563,16 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
   if (auto *Mul = dyn_cast<MulOperator>(Next)) {
     // Nk can't ever change and should be the close level upper bound
     *Nk = skipCasts(Mul->getOperand(1));
-//    if (LevelMap[J].UpperBound != *Nk)
-//      return false;
-    if (!LI->getLoopFor(LevelMap[J].Iterator->getParent())->isLoopInvariant(*Nk))
-      return false;
-    Next = skipCasts(Mul->getOperand(0));
+    if (!LI->getLoopFor(LevelMap[J].Iterator->getParent())->isLoopInvariant(*Nk)) {
+      *Nk = skipCasts(Mul->getOperand(0));
+      if (!LI->getLoopFor(LevelMap[J].Iterator->getParent())->isLoopInvariant(*Nk)) {
+        return false;
+      } else {
+        Next = skipCasts(Mul->getOperand(1));
+      }
+    } else {
+      Next = skipCasts(Mul->getOperand(0));
+    }
   }
 
   if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
