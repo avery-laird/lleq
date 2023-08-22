@@ -94,6 +94,17 @@ public:
   std::vector<unsigned> DimOrder;
 
   StorageKind getKind() const { return Kind; }
+
+  std::string toString() {
+    std::string Str = getNameOrAsOperand(Root) + "(";
+    for (size_t i = 0; i < Shape.size(); ++i) {
+      Str += getNameOrAsOperand(Shape[i]);
+      if (i < Shape.size() - 1)
+        Str += ", ";
+    }
+    Str += ")";
+    return Str;
+  }
 };
 
 std::string Format2String(Tensor::StorageKind F) {
@@ -478,17 +489,9 @@ std::string buildExpression(Value *LiveOut, PHINode *Iterator, RecurrenceDescrip
     auto *I = dyn_cast<Instruction>(LiveOut);
     Tensor *A = TensorMap[I->getOperand(0)];
     Tensor *B = TensorMap[I->getOperand(1)];
-    // TODO fix this up
-    PHINode *FirstDim = nullptr;
-    if (LevelMap[Iterator].LevelType == COMPRESSED) {
-      auto *Idx = LevelMap[Iterator].IndexExpr;
-      if (LevelMap.contains(Idx))
-        FirstDim = LevelMap[Idx].Iterator;
-    } else {
-      FirstDim = Iterator;
-    }
-//    A.
-    return getNameOrAsOperand(A->Root) + "(";
+    std::string Astr = A->toString();
+    std::string Bstr = B->toString();
+    return "(+ " + Astr + " * " + Bstr + ")";
   } else {
     llvm_unreachable("unknown recurrence kind.");
   }
@@ -615,10 +618,10 @@ bool detectCSC(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
   return true;
 }
 
-bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val, Value **Rows, DenseMap<Value*, LevelBounds> &LevelMap) {
+bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val, Value **I, Value**J, DenseMap<Value*, LevelBounds> &LevelMap) {
   // Col is optional
-  Instruction *I, *J;
-  *Row = *Col = *Val = I = J = nullptr;
+//  Instruction *I, *J;
+  *Row = *Col = *Val = *I = *J = nullptr;
   // match 1st gep
   Value *Next = nullptr;
   if (auto *Load = dyn_cast<LoadInst>(Root))
@@ -636,7 +639,7 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
   }
 
   if (LevelMap.contains(Next) && LevelMap[Next].LevelType == COMPRESSED) {
-    J = dyn_cast<Instruction>(Next);
+    *J = dyn_cast<Instruction>(Next);
     auto *Phi = dyn_cast<PHINode>(Next);
     if (!Phi)
       return false;
@@ -671,15 +674,15 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
   }
 
   if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
-    I = dyn_cast<Instruction>(Next);
-    *Rows = LevelMap[Next].UpperBound;
+    *I = dyn_cast<Instruction>(Next);
+//    *Rows = LevelMap[Next].UpperBound;
   } else {
     return false;
   }
 
   // try for Col also
-  if (findCrd(J, Col)) {
-    auto JBounds = LevelMap[J];
+  if (findCrd(*J, Col)) {
+    auto JBounds = LevelMap[*J];
     JBounds.LevelType = DENSE;
     LevelMap[*Col] = JBounds;
   }
@@ -731,7 +734,7 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
   }
 
   if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
-    *Pk_1 = dyn_cast<Instruction>(Next);
+    *Pk_1 = LevelMap[Next].Iterator;
   } else {
     return false;
   }
@@ -774,7 +777,7 @@ bool detectDense1D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **x,
   }
 
   if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
-    *Ik = Next;
+    *Ik = LevelMap[Next].Iterator;
   } else {
     return false;
   }
@@ -799,10 +802,10 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
     SmallVector<LoadInst *> ToRemove;
     for (auto *Load :
          WorkList) { // TODO figure out how to undo LevelMap mutations
-      Value *Row, *Col, *Val, *Rows;
-      auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, &Rows, LevelMap);
+      Value *Row, *Col, *Val, *I, *J;
+      auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, &I, &J, LevelMap);
       if (IsCSR) {
-        auto *TensorCSR = new CSR({Rows, nullptr}, Val, Row, Col);
+        auto *TensorCSR = new CSR({I, J}, Val, Row, Col);
 //        CSR TensorCSR({Rows, nullptr}, Val, Row, Col);
         TensorMap[Load] = TensorCSR;
         LLVM_DEBUG({
@@ -836,7 +839,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       if (IsDense2D) {
         auto *D1 = LevelMap[Pk_1].UpperBound;
         auto *D2 = LevelMap[Ik].UpperBound;
-        auto *Dense2D = new Vector({D1, D2}, A);
+        auto *Dense2D = new Vector({Pk_1, Ik}, A);
 //        Vector Dense2D({D1, D2}, A);
         TensorMap[Load] = Dense2D;
         LLVM_DEBUG({
@@ -855,7 +858,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       auto IsDense1D = detectDense1D(LI, SE, Load, &x, &Ik, LevelMap);
       if (IsDense1D) {
         auto *D1 = LevelMap[Ik].UpperBound;
-        auto *Dense1D = new Vector({D1}, x);
+        auto *Dense1D = new Vector({Ik}, x);
 //        Vector Dense1D({D1}, x);
         TensorMap[Load] = Dense1D;
         LLVM_DEBUG({
