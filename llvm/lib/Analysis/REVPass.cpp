@@ -491,7 +491,7 @@ std::string buildExpression(Value *LiveOut, PHINode *Iterator, RecurrenceDescrip
     Tensor *B = TensorMap[I->getOperand(1)];
     std::string Astr = A->toString();
     std::string Bstr = B->toString();
-    return "(+ " + Astr + " * " + Bstr + ")";
+    return "(+ (* " + Astr + " " + Bstr + "))";
   } else {
     llvm_unreachable("unknown recurrence kind.");
   }
@@ -508,8 +508,23 @@ void emitFold(Value *LiveOut, PHINode *Iterator,
   else
     End = getNameOrAsOperand(LevelMap[Iterator].UpperBound);
   LLVM_DEBUG({
-    dbgs() << "fold 0 " << End << " " << buildExpression(LiveOut, Iterator, RD, LevelMap, TensorMap)
-           << "\n";
+    dbgs() << "(fold 0 " << End << " " << buildExpression(LiveOut, Iterator, RD, LevelMap, TensorMap)
+           << ")\n";
+  });
+}
+
+void emitMap(Value *LiveOut, PHINode *Iterator,
+             RecurrenceDescriptor &RD,
+             DenseMap<Value *, LevelBounds> &LevelMap,
+             DenseMap<Value *, Tensor *> &TensorMap) {
+  Value *Init;
+  std::string End;
+  if (LevelMap[Iterator].LevelType == COMPRESSED)
+    End = getNameOrAsOperand(Iterator) + ".end";
+  else
+    End = getNameOrAsOperand(LevelMap[Iterator].UpperBound);
+  LLVM_DEBUG({
+     dbgs() << "map 0 " << End << "\n";
   });
 }
 
@@ -1080,7 +1095,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
 //        }
         // is it a map?
         if (auto *Store = dyn_cast<StoreInst>(LiveOut)) {
-          // can be
+          emitMap(LiveOut, Loop->getInductionVariable(SE), RD, LevelMap, TensorMap);
         }
 
       }
