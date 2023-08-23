@@ -802,6 +802,8 @@ bool detectDense1D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **x,
 
 bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
                    SmallVector<LoadInst *> &Loads,
+                   DenseMap<Value *, Loop *> &Loads2Loop,
+                   DenseMap<Loop *, Value *> &LiveOutMap,
                    DenseMap<Value *, LevelBounds> &LevelMap,
                    SmallPtrSetImpl<LoadInst *> &Leftover,
                    DenseMap<Value*, Tensor*> &TensorMap) {
@@ -820,6 +822,83 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       Value *Row, *Col, *Val, *I, *J;
       auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, &I, &J, LevelMap);
       if (IsCSR) {
+        bool isRowMajor = false;
+        if (Loop *Loop = Loads2Loop[Load]) {
+          if (Value *LiveOut = LiveOutMap[Loop]) {
+            if (auto *Store = dyn_cast<StoreInst>(LiveOut)) {
+              LiveOut = Store->getPointerOperand();
+              LLVM_DEBUG({
+                dbgs() << "LiveOut Ptr = " << *LiveOut << "\n";
+              });
+              if (auto *GEP = dyn_cast<GEPOperator>(LiveOut)) {
+                if (GEP->getNumIndices() != 1) {
+                  LLVM_DEBUG({
+                    dbgs() << "GEP has >1 index\n";
+                  });
+                } else {
+                  Value *Next = skipCasts(GEP->getOperand(1));
+                  if (auto *Load = dyn_cast<LoadInst>(Next)) {
+                    Next = skipCasts(Load->getPointerOperand());
+                    if (GEP = dyn_cast<GEPOperator>(Next)) {
+                      if (GEP->getNumIndices() != 1) {
+                        LLVM_DEBUG({
+                          dbgs() << "GEP has >1 index\n";
+                        });
+                      } else {
+                        Next = skipCasts(GEP->getOperand(1));
+                        if (auto *Phi = dyn_cast<PHINode>(Next)) {
+                          for (size_t i = 0; i < Phi->getNumIncomingValues(); ++i) {
+                            if (LI->getLoopFor(Phi->getParent())->contains(Phi->getIncomingBlock(i))) { // back edge
+                              Next = Phi->getIncomingValue(i);
+                              if (auto *Add = dyn_cast<AddOperator>(Next)) {
+                                for (int j = 0; j < Add->getNumOperands(); j++) {
+                                  auto *Operand = Add->getOperand(j);
+                                  if (auto *constant = dyn_cast<Constant>(Operand)) {
+                                    if (isa<Constant>(constant)) {
+                                      isRowMajor = true;
+                                      LLVM_DEBUG({
+                                        dbgs() << "Row major (1)\n";
+                                      });
+                                      break;
+                                    }
+                                  }
+                                }
+                              } else {
+                                continue;
+                              }
+                            } else {
+                              continue;
+                            }
+                          }
+                        } else if (auto *Add = dyn_cast<AddOperator>(Next)) {
+                          for (int j = 0; j < Add->getNumOperands(); j++) {
+                            auto *Operand = Add->getOperand(j);
+                            if (auto *constant = dyn_cast<Constant>(Operand)) {
+                              if (isa<Constant>(constant)) {
+                                isRowMajor = true;
+                                LLVM_DEBUG({
+                                  dbgs() << "Row major (2)\n";
+                                });
+                                break;
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        LLVM_DEBUG({
+          if (isRowMajor) {
+            dbgs() << "detected row-major CSR\n";
+          } else {
+            dbgs() << "detected column-major CSR\n";
+          }
+        });
         auto *TensorCSR = new CSR({I, J}, Val, Row, Col);
 //        CSR TensorCSR({Rows, nullptr}, Val, Row, Col);
         TensorMap[Load] = TensorCSR;
@@ -1017,6 +1096,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     DenseMap<Loop *, Value *> LiveOutMap;
 
     DenseMap<Loop *, SmallPtrSet<Value *, 5>> Loop2Loads;
+    DenseMap<Value *, Loop *> Loads2Loop;
     for (auto *Loop : LN.getLoops()) {
       // collect live out (store or scalar live-out)
       Value *LiveOut = findLiveOut(Loop, &LI);
@@ -1029,6 +1109,10 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
       SmallPtrSet<Value *, 5> TopLevelInputs;
       makeTopLevelInputs(LiveOut, TopLevelInputs);
       Loop2Loads[Loop] = TopLevelInputs;
+
+      for (auto *Input : TopLevelInputs)
+        if (auto *Load = dyn_cast<LoadInst>(Input))
+          Loads2Loop[Load] = Loop;
     }
 
     SmallVector<LoadInst *> TopLevelLoads;
@@ -1048,7 +1132,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     SmallPtrSet<LoadInst *, 5> Leftover;
     DenseMap<Value *, Tensor*> TensorMap;
     auto AllCovered =
-        coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap, Leftover, TensorMap);
+        coverAllLoads(&LI, &SE, TopLevelLoads, Loads2Loop, LiveOutMap, LevelMap, Leftover, TensorMap);
     LLVM_DEBUG({
       if (AllCovered)
         dbgs() << "all loads covered.\n";
