@@ -800,8 +800,37 @@ bool detectDense1D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **x,
   return true;
 }
 
+void findLowestAdd(Value *Operand, Value **Add) {
+  *Add = nullptr;
+  std::queue<Value*> Queue;
+  SmallPtrSet<Value*, 5> Visited;
+  Queue.push(Operand);
+  while (!Queue.empty()) {
+    auto *ToVisit = Queue.front();
+    Queue.pop();
+    if (isa<AddOperator>(ToVisit) /*|| isa<PHINode>(ToVisit)*/) {
+      *Add = ToVisit;
+      LLVM_DEBUG({
+        dbgs() << "Lowest Add = " << *ToVisit << "\n";
+      });
+      return;
+    }
+    if (auto *I = dyn_cast<Instruction>(ToVisit)) {
+      for (auto &Op : I->operands()) {
+        if (!Visited.contains(Op)) {
+          Visited.insert(Op);
+          Queue.push(Op);
+        }
+      }
+    }
+  }
+  return;
+}
+
 bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
                    SmallVector<LoadInst *> &Loads,
+                   DenseMap<Value *, Loop *> &Loads2Loop,
+                   DenseMap<Loop *, Value *> &LiveOutMap,
                    DenseMap<Value *, LevelBounds> &LevelMap,
                    SmallPtrSetImpl<LoadInst *> &Leftover,
                    DenseMap<Value*, Tensor*> &TensorMap) {
@@ -820,6 +849,37 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       Value *Row, *Col, *Val, *I, *J;
       auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, &I, &J, LevelMap);
       if (IsCSR) {
+        bool isRowMajor = false;
+        bool isColMajor = false;
+        if (Loop *Loop = Loads2Loop[Load]) {
+          if (Value *LiveOut = LiveOutMap[Loop]) {
+            if (auto *Store = dyn_cast<StoreInst>(LiveOut)) {
+              LiveOut = Store->getPointerOperand();
+              LLVM_DEBUG({
+                dbgs() << "LiveOut Ptr = " << *LiveOut << "\n";
+              });
+
+              Value *LowestAdd;
+              findLowestAdd(LiveOut, &LowestAdd);
+              if (auto *Add = dyn_cast<AddOperator>(LowestAdd)) {
+                if (isa<ConstantInt>(Add->getOperand(0)) || isa<ConstantInt>(Add->getOperand(1))) {
+                  isRowMajor = true;
+                } else {
+                  isColMajor = true;
+                }
+              }
+            }
+          }
+        }
+        LLVM_DEBUG({
+          if (isRowMajor && isColMajor) {
+            dbgs() << "Unknown whether CSR or CSC\n";
+          } else if (isRowMajor) {
+            dbgs() << "detected row-major CSR\n";
+          } else {
+            dbgs() << "detected column-major CSR\n";
+          }
+        });
         auto *TensorCSR = new CSR({I, J}, Val, Row, Col);
 //        CSR TensorCSR({Rows, nullptr}, Val, Row, Col);
         TensorMap[Load] = TensorCSR;
@@ -1017,6 +1077,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     DenseMap<Loop *, Value *> LiveOutMap;
 
     DenseMap<Loop *, SmallPtrSet<Value *, 5>> Loop2Loads;
+    DenseMap<Value *, Loop *> Loads2Loop;
     for (auto *Loop : LN.getLoops()) {
       // collect live out (store or scalar live-out)
       Value *LiveOut = findLiveOut(Loop, &LI);
@@ -1029,6 +1090,10 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
       SmallPtrSet<Value *, 5> TopLevelInputs;
       makeTopLevelInputs(LiveOut, TopLevelInputs);
       Loop2Loads[Loop] = TopLevelInputs;
+
+      for (auto *Input : TopLevelInputs)
+        if (auto *Load = dyn_cast<LoadInst>(Input))
+          Loads2Loop[Load] = Loop;
     }
 
     SmallVector<LoadInst *> TopLevelLoads;
@@ -1048,7 +1113,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     SmallPtrSet<LoadInst *, 5> Leftover;
     DenseMap<Value *, Tensor*> TensorMap;
     auto AllCovered =
-        coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap, Leftover, TensorMap);
+        coverAllLoads(&LI, &SE, TopLevelLoads, Loads2Loop, LiveOutMap, LevelMap, Leftover, TensorMap);
     LLVM_DEBUG({
       if (AllCovered)
         dbgs() << "all loads covered.\n";
