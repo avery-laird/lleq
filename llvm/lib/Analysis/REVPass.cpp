@@ -61,6 +61,7 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
     }
 }
 
+
 //void denseLocateFunctions() {
 //
 //}
@@ -74,6 +75,18 @@ std::string getNameOrAsOperand(Value *V) {
   return OS.str();
 }
 
+std::string Type2String(Type *T) {
+  if (T->getTypeID() == Type::IntegerTyID)
+    return "int";
+  if (T->getTypeID() == Type::DoubleTyID)
+    return "double";
+  llvm_unreachable("unknown type.");
+}
+
+std::string Val2Sexp(Value *V) {
+  auto T = Type2String(V->getType());
+  return "(" + T + " " + getNameOrAsOperand(V) + ")";
+}
 
 // TODO use templating
 class Tensor {
@@ -105,6 +118,49 @@ public:
     Str += ")";
     return Str;
   }
+
+  std::string toStringSparse() {
+    std::string Str = "(tensor dense " + Type2String(ElemType);
+    Str += " " + getNameOrAsOperand(Root);
+  }
+};
+
+class Executor : public InstVisitor<Executor, std::string> {
+public:
+//  Loop *L;
+//  Executor(Loop *L) : L(L) {}
+
+  std::string visitLoadInst(LoadInst &I) {
+    // try to construct tensors optimistically
+    auto *GEP = dyn_cast<GetElementPtrInst>(I.getPointerOperand());
+    assert(GEP->getNumIndices() == 1);
+    std::string Ptr = visit(GEP);
+    std::string Idx;
+    if (auto *Index = dyn_cast<Instruction>(GEP->getOperand(1)))
+      Idx = visit(Index);
+    else
+      Idx = getNameOrAsOperand(GEP->getOperand(1));
+    auto LoadType = Type2String(I.getType());
+    return "(tensor dense " + LoadType + " " + Ptr + " " + Idx + ")";
+  }
+  std::string visitGetElementPtrInst(GetElementPtrInst &I) {
+    if (auto *Ptr = dyn_cast<Argument>(I.getPointerOperand()))
+      return getNameOrAsOperand(Ptr);
+    auto *Inst = dyn_cast<Instruction>(I.getPointerOperand());
+    return visit(Inst);
+  }
+  std::string visitPHINode(PHINode &I) {
+    auto PhiType = Type2String(I.getType());
+    return "(" + PhiType + " " + getNameOrAsOperand(&I) + ")";
+  }
+  std::string visitCastInst(CastInst &I) {
+    if (auto *Inst = dyn_cast<Instruction>(I.getOperand(0)))
+      return visit(Inst);
+    auto CastType = Type2String(I.getType());
+    return "(" + CastType + " " + getNameOrAsOperand(&I) + ")";
+  }
+
+  std::string visitInstruction(Instruction &I) { return visit(I); }
 };
 
 std::string Format2String(Tensor::StorageKind F) {
@@ -487,10 +543,13 @@ void allLoadsInCurrentScope(Loop *L, SmallPtrSet<LoadInst*, 4> &Loads) {
 std::string buildExpression(Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD, DenseMap<Value*, LevelBounds> &LevelMap, DenseMap<Value*, Tensor*> &TensorMap) {
   if (RD.getRecurrenceKind() == RecurKind::FMulAdd) {
     auto *I = dyn_cast<Instruction>(LiveOut);
-    Tensor *A = TensorMap[I->getOperand(0)];
-    Tensor *B = TensorMap[I->getOperand(1)];
-    std::string Astr = A->toString();
-    std::string Bstr = B->toString();
+    Executor E;
+    std::string Astr = E.visit(cast<Instruction>(I->getOperand(0)));
+    std::string Bstr = E.visit(cast<Instruction>(I->getOperand(1)));
+//    Tensor *A = TensorMap[I->getOperand(0)];
+//    Tensor *B = TensorMap[I->getOperand(1)];
+//    std::string Astr = A->toString();
+//    std::string Bstr = B->toString();
     return "(+ (* " + Astr + " " + Bstr + "))";
   } else {
     llvm_unreachable("unknown recurrence kind.");
@@ -501,15 +560,30 @@ void emitFold(Value *LiveOut, PHINode *Iterator,
               RecurrenceDescriptor &RD,
               DenseMap<Value *, LevelBounds> &LevelMap,
               DenseMap<Value *, Tensor *> &TensorMap) {
-  Value *Init;
+//  Value *Init;
+  std::string Expr = "(fold ";
   std::string End;
+  auto *StartVal = RD.getRecurrenceStartValue().getValPtr();
+//  auto Bounds = L->getBounds(*SE);
+  LevelBounds &Bounds = LevelMap[Iterator];
+  auto *LowerBound = Bounds.LowerBound;
+  auto *IndVar = Iterator;
+  auto *UpperBound = Bounds.UpperBound;
+//  auto &LowerBound = Bounds->getInitialIVValue();
+//  auto *IndVar = L->getInductionVariable(*SE);
+//  auto &UpperBound = Bounds->getFinalIVValue();
   if (LevelMap[Iterator].LevelType == COMPRESSED)
     End = getNameOrAsOperand(Iterator) + ".end";
   else
     End = getNameOrAsOperand(LevelMap[Iterator].UpperBound);
+  Expr += Val2Sexp(StartVal) + " ";
+  Expr += Val2Sexp(LowerBound) + " ";
+  Expr += Val2Sexp(IndVar) + " ";
+  Expr += Val2Sexp(UpperBound) + " ";
+  Expr += buildExpression(LiveOut, Iterator, RD, LevelMap, TensorMap);
+  Expr += ")";
   LLVM_DEBUG({
-    dbgs() << "(fold 0 " << End << " " << buildExpression(LiveOut, Iterator, RD, LevelMap, TensorMap)
-           << ")\n";
+    dbgs() << Expr << "\n";
   });
 }
 
