@@ -83,9 +83,9 @@ std::string Type2String(Type *T) {
   llvm_unreachable("unknown type.");
 }
 
-std::string Val2Sexp(Value *V) {
+std::string Val2Sexp(Value *V, std::string Sfx = "") {
   auto T = Type2String(V->getType());
-  return "(" + T + " " + getNameOrAsOperand(V) + ")";
+  return "(" + T + " " + getNameOrAsOperand(V) + Sfx + ")";
 }
 
 // TODO use templating
@@ -94,8 +94,8 @@ public:
   enum StorageKind {
     CONTIGUOUS, CSR, CSC
   };
-  Tensor(std::vector<Value *> Shape, Value *Root, StorageKind Kind)
-      : Shape(Shape), Root(Root), ElemType(Root->getType()), Kind(Kind) {
+  Tensor(std::vector<Value *> Shape, Value *Root, Type *T, StorageKind Kind)
+      : Shape(Shape), Root(Root), ElemType(T), Kind(Kind) {
     // row-major by default
     for (size_t i = 0; i < Shape.size(); ++i)
       DimOrder.push_back(i);
@@ -109,11 +109,13 @@ public:
   StorageKind getKind() const { return Kind; }
 
   std::string toString() {
-    std::string Str = getNameOrAsOperand(Root) + "(";
-    for (size_t i = 0; i < Shape.size(); ++i) {
-      Str += getNameOrAsOperand(Shape[i]);
-      if (i < Shape.size() - 1)
-        Str += ", ";
+    std::string Comp = (Kind == CSR || Kind == CSC) ? "sparse " : "dense ";
+    std::string TType = Type2String(ElemType) + " ";
+    std::string Str = "(tensor " + Comp + TType + getNameOrAsOperand(Root) + ".Dense ";
+    for (auto It = Shape.begin(); It != Shape.end(); ++It) {
+      Str += "(int " + getNameOrAsOperand(*It) + ")";
+      if (It != Shape.end()-1)
+        Str += " ";
     }
     Str += ")";
     return Str;
@@ -197,8 +199,8 @@ raw_ostream& operator<<(raw_ostream& os, Tensor const& t) {
 
 class Vector : public Tensor {
 public:
-  Vector(std::vector<Value *> Shape, Value *Root)
-      : Tensor(Shape, Root, StorageKind::CONTIGUOUS) {}
+  Vector(std::vector<Value *> Shape, Type *T, Value *Root)
+      : Tensor(Shape, Root, T, StorageKind::CONTIGUOUS) {}
   static bool classof(const Tensor *T) {
     return T->getKind() == StorageKind::CONTIGUOUS;
   }
@@ -206,9 +208,9 @@ public:
 
 class CSR : public Tensor {
 public:
-  CSR(std::vector<Value *> Shape, Value *Root, Value *Row,
+  CSR(std::vector<Value *> Shape, Type *T, Value *Root, Value *Row,
       Value *Col)
-      : Tensor(Shape, Root, StorageKind::CSR), Row(Row), Col(Col) {}
+      : Tensor(Shape, Root, T, StorageKind::CSR), Row(Row), Col(Col) {}
   Value *Row = nullptr;
   Value *Col = nullptr;
   static bool classof(const Tensor *T) {
@@ -546,10 +548,19 @@ std::string buildExpression(Value *LiveOut, PHINode *Iterator, RecurrenceDescrip
     Executor E;
     std::string Astr = E.visit(cast<Instruction>(I->getOperand(0)));
     std::string Bstr = E.visit(cast<Instruction>(I->getOperand(1)));
-//    Tensor *A = TensorMap[I->getOperand(0)];
-//    Tensor *B = TensorMap[I->getOperand(1)];
-//    std::string Astr = A->toString();
-//    std::string Bstr = B->toString();
+    return "(+ (* " + Astr + " " + Bstr + "))";
+  } else {
+    llvm_unreachable("unknown recurrence kind.");
+  }
+}
+
+std::string buildDenseExpression(Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD, DenseMap<Value*, LevelBounds> &LevelMap, DenseMap<Value*, Tensor*> &TensorMap) {
+  if (RD.getRecurrenceKind() == RecurKind::FMulAdd) {
+    auto *I = dyn_cast<Instruction>(LiveOut);
+    Tensor *A = TensorMap[I->getOperand(0)];
+    Tensor *B = TensorMap[I->getOperand(1)];
+    std::string Astr = A->toString();
+    std::string Bstr = B->toString();
     return "(+ (* " + Astr + " " + Bstr + "))";
   } else {
     llvm_unreachable("unknown recurrence kind.");
@@ -564,18 +575,10 @@ void emitFold(Value *LiveOut, PHINode *Iterator,
   std::string Expr = "(fold ";
   std::string End;
   auto *StartVal = RD.getRecurrenceStartValue().getValPtr();
-//  auto Bounds = L->getBounds(*SE);
   LevelBounds &Bounds = LevelMap[Iterator];
   auto *LowerBound = Bounds.LowerBound;
   auto *IndVar = Iterator;
   auto *UpperBound = Bounds.UpperBound;
-//  auto &LowerBound = Bounds->getInitialIVValue();
-//  auto *IndVar = L->getInductionVariable(*SE);
-//  auto &UpperBound = Bounds->getFinalIVValue();
-  if (LevelMap[Iterator].LevelType == COMPRESSED)
-    End = getNameOrAsOperand(Iterator) + ".end";
-  else
-    End = getNameOrAsOperand(LevelMap[Iterator].UpperBound);
   Expr += Val2Sexp(StartVal) + " ";
   Expr += Val2Sexp(LowerBound) + " ";
   Expr += Val2Sexp(IndVar) + " ";
@@ -584,6 +587,25 @@ void emitFold(Value *LiveOut, PHINode *Iterator,
   Expr += ")";
   LLVM_DEBUG({
     dbgs() << Expr << "\n";
+  });
+  // now the dense version
+  std::string DenseExpr = "(fold ";
+  std::string DenseLowerBound, DenseUpperBound;
+  if (LevelMap[Iterator].LevelType == COMPRESSED) {
+    DenseLowerBound = "(int 0)";
+    DenseUpperBound = "(int " + getNameOrAsOperand(Iterator) + ".end)";
+  } else {
+    DenseLowerBound = "(int " + getNameOrAsOperand(LevelMap[Iterator].LowerBound) + ")";
+    DenseUpperBound = "(int " + getNameOrAsOperand(LevelMap[Iterator].UpperBound) + ")";
+  }
+  DenseExpr += Val2Sexp(StartVal) + " ";
+  DenseExpr += DenseLowerBound + " ";
+  DenseExpr += Val2Sexp(IndVar) + " ";
+  DenseExpr += DenseUpperBound + " ";
+  DenseExpr += buildDenseExpression(LiveOut, Iterator, RD, LevelMap, TensorMap);
+  DenseExpr += ")";
+  LLVM_DEBUG({
+    dbgs() << DenseExpr << "\n";
   });
 }
 
@@ -894,7 +916,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       Value *Row, *Col, *Val, *I, *J;
       auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, &I, &J, LevelMap);
       if (IsCSR) {
-        auto *TensorCSR = new CSR({I, J}, Val, Row, Col);
+        auto *TensorCSR = new CSR({I, J}, Load->getType(), Val, Row, Col);
 //        CSR TensorCSR({Rows, nullptr}, Val, Row, Col);
         TensorMap[Load] = TensorCSR;
         LLVM_DEBUG({
@@ -928,7 +950,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       if (IsDense2D) {
         auto *D1 = LevelMap[Pk_1].UpperBound;
         auto *D2 = LevelMap[Ik].UpperBound;
-        auto *Dense2D = new Vector({Pk_1, Ik}, A);
+        auto *Dense2D = new Vector({Pk_1, Ik}, Load->getType(), A);
 //        Vector Dense2D({D1, D2}, A);
         TensorMap[Load] = Dense2D;
         LLVM_DEBUG({
@@ -947,7 +969,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       auto IsDense1D = detectDense1D(LI, SE, Load, &x, &Ik, LevelMap);
       if (IsDense1D) {
         auto *D1 = LevelMap[Ik].UpperBound;
-        auto *Dense1D = new Vector({Ik}, x);
+        auto *Dense1D = new Vector({Ik}, Load->getType(), x);
 //        Vector Dense1D({D1}, x);
         TensorMap[Load] = Dense1D;
         LLVM_DEBUG({
