@@ -586,23 +586,32 @@ std::string buildDenseExpression(Value *LiveOut, PHINode *Iterator,
   }
 }
 
+std::string makeDense(LevelBounds &LB) {
+  std::string Map = "(table ";
+  Executor E;
+  for (auto *Crd : LB.CoordArrays) {
+    std::string Left = E.SExpr(Crd);
+    std::string Right = E.SExpr(LB.Iterator);
+    Map += "(" + Left + " " + Right + ")";
+  }
+  return Map + ")";
+}
+
 void emitFold(Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
               DenseMap<Value *, LevelBounds> &LevelMap,
               DenseMap<Value *, Tensor *> &TensorMap) {
-  //  Value *Init;
+  // Name map
+  std::string Names = "(table (" + Val2Sexp(Iterator) + " " + Val2Sexp(Iterator, ".d") + "))";
+  LLVM_DEBUG(dbgs() << Names << "\n");
   std::string Expr = "(fold ";
-  std::string End;
-  auto *StartVal = RD.getRecurrenceStartValue().getValPtr();
-  LevelBounds &Bounds = LevelMap[Iterator];
-  // emit sync
-  std::string Sync = "(and ";
+  // Coordinate map
+  std::string CrdMap = makeDense(LevelMap[Iterator]);
+  LLVM_DEBUG(dbgs() << CrdMap << "\n");
+  // Val map
+  // 1. find all the sparse inputs
+  // 2. map to a dense version
+  std::string ValMap = "(table ";
   Executor E;
-  for (auto *Crd : Bounds.CoordArrays) {
-    std::string Left = E.SExpr(Crd);
-    std::string Right = E.SExpr(Bounds.Iterator);
-    Sync += "(= " + Left + " " + Right + ")";
-  }
-  Sync += " ";
   SmallPtrSet<Value*, 4> Loads;
   makeTopLevelInputs(LiveOut, Loads);
   for (auto *V : Loads) {
@@ -610,12 +619,35 @@ void emitFold(Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
     if (T != nullptr && isa<CSR>(T)) {
       std::string Left = E.SExpr(V);
       std::string Right = T->toString();
-      Sync += "(= " + Left + " " + Right + ")";
+      ValMap += "(" + Left + " " + Right + ")";
     }
   }
-  Sync += ")";
+  ValMap += ")";
+  LLVM_DEBUG(dbgs() << ValMap << "\n");
 
-  LLVM_DEBUG(dbgs() << Sync << "\n");
+  std::string End;
+  auto *StartVal = RD.getRecurrenceStartValue().getValPtr();
+  LevelBounds &Bounds = LevelMap[Iterator];
+  // emit sync
+//  std::string Sync = "(and ";
+//  for (auto *Crd : Bounds.CoordArrays) {
+//    std::string Left = E.SExpr(Crd);
+//    std::string Right = E.SExpr(Bounds.Iterator);
+//    Sync += "(= " + Left + " " + Right + ")";
+//  }
+//  Sync += " ";
+//  SmallPtrSet<Value*, 4> Loads;
+//  makeTopLevelInputs(LiveOut, Loads);
+//  for (auto *V : Loads) {
+//    auto *T = TensorMap[V];
+//    if (T != nullptr && isa<CSR>(T)) {
+//      std::string Left = E.SExpr(V);
+//      std::string Right = T->toString();
+//      Sync += "(= " + Left + " " + Right + ")";
+//    }
+//  }
+//  Sync += ")";
+//  LLVM_DEBUG(dbgs() << Sync << "\n");
   auto *LowerBound = Bounds.LowerBound;
   auto *IndVar = Iterator;
   auto *UpperBound = Bounds.UpperBound;
