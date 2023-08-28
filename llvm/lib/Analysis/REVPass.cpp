@@ -34,6 +34,9 @@ using llvm::yaml::IO;
 using llvm::yaml::MappingTraits;
 using llvm::yaml::Output;
 
+
+void makeTopLevelInputs(Value *LiveOut, SmallPtrSetImpl<Value *> &Inputs);
+
 static cl::opt<std::string>
     AnalysisOutputPath("revpass-output", cl::Hidden,
                        cl::desc("The output path for revpass."));
@@ -129,6 +132,14 @@ class Executor : public InstVisitor<Executor, std::string> {
 public:
   //  Loop *L;
   //  Executor(Loop *L) : L(L) {}
+
+  std::string SExpr(Value *V) {
+    if (auto *I = dyn_cast<Instruction>(V))
+      return visit(I);
+    return Val2Sexp(V);
+  }
+
+  std::string SExpr(Value &V) { return SExpr(&V); }
 
   std::string visitLoadInst(LoadInst &I) {
     // try to construct tensors optimistically
@@ -237,6 +248,7 @@ struct LevelBounds {
   Value *UpperBound = nullptr;
   Value *IndexExpr = nullptr;
   Value *BasePtr = nullptr;
+  std::vector<Value*> CoordArrays;
 };
 
 bool findCrd(Value *Inst, Value **Crd) {
@@ -582,6 +594,28 @@ void emitFold(Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
   std::string End;
   auto *StartVal = RD.getRecurrenceStartValue().getValPtr();
   LevelBounds &Bounds = LevelMap[Iterator];
+  // emit sync
+  std::string Sync = "(and ";
+  Executor E;
+  for (auto *Crd : Bounds.CoordArrays) {
+    std::string Left = E.SExpr(Crd);
+    std::string Right = E.SExpr(Bounds.Iterator);
+    Sync += "(= " + Left + " " + Right + ")";
+  }
+  Sync += " ";
+  SmallPtrSet<Value*, 4> Loads;
+  makeTopLevelInputs(LiveOut, Loads);
+  for (auto *V : Loads) {
+    auto *T = TensorMap[V];
+    if (T != nullptr && isa<CSR>(T)) {
+      std::string Left = E.SExpr(V);
+      std::string Right = T->toString();
+      Sync += "(= " + Left + " " + Right + ")";
+    }
+  }
+  Sync += ")";
+
+  LLVM_DEBUG(dbgs() << Sync << "\n");
   auto *LowerBound = Bounds.LowerBound;
   auto *IndVar = Iterator;
   auto *UpperBound = Bounds.UpperBound;
@@ -798,6 +832,7 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
 
   // try for Col also
   if (findCrd(*J, Col)) {
+    LevelMap[*J].CoordArrays.push_back(*Col); // TODO dangerous! fix
     auto JBounds = LevelMap[*J];
     JBounds.LevelType = DENSE;
     LevelMap[*Col] = JBounds;
