@@ -112,7 +112,10 @@ public:
     std::string Comp = (Kind == CSR || Kind == CSC) ? "sparse " : "dense ";
     std::string TType = Type2String(ElemType) + " ";
     std::string Str =
-        "(tensor " + Comp + TType + getNameOrAsOperand(Root) + ".Dense ";
+        "(tensor " + Comp + TType + getNameOrAsOperand(Root);
+    if (Comp == "sparse ")
+      Str += ".Dense";
+    Str += " ";
     for (auto It = Shape.begin(); It != Shape.end(); ++It) {
       Str += "(int " + getNameOrAsOperand(*It) + ")";
       if (It != Shape.end() - 1)
@@ -597,16 +600,19 @@ std::string makeDense(LevelBounds &LB) {
   return Map + ")";
 }
 
-void emitFold(Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
+void emitFold(raw_fd_ostream &FS, Loop *L, Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
               DenseMap<Value *, LevelBounds> &LevelMap,
               DenseMap<Value *, Tensor *> &TensorMap) {
+  std::string Total;
+  Total += "(loop \"" + L->getHeader()->getName().str() + "\"\n\t";
   // Name map
   std::string Names = "(table (" + Val2Sexp(Iterator) + " " + Val2Sexp(Iterator, ".d") + "))";
-  LLVM_DEBUG(dbgs() << Names << "\n");
-  std::string Expr = "(fold ";
+//  LLVM_DEBUG(dbgs() << Names << "\n");
+  Total += "(namemap \n\t\t" + Names + ")\n\t";
   // Coordinate map
   std::string CrdMap = makeDense(LevelMap[Iterator]);
-  LLVM_DEBUG(dbgs() << CrdMap << "\n");
+//  LLVM_DEBUG(dbgs() << CrdMap << "\n");
+  Total += "(crdmap \n\t\t" + CrdMap + ")\n\t";
   // Val map
   // 1. find all the sparse inputs
   // 2. map to a dense version
@@ -623,8 +629,8 @@ void emitFold(Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
     }
   }
   ValMap += ")";
-  LLVM_DEBUG(dbgs() << ValMap << "\n");
-
+//  LLVM_DEBUG(dbgs() << ValMap << "\n");
+  Total += "(valmap \n\t\t" + ValMap + ")\n\t";
   std::string End;
   auto *StartVal = RD.getRecurrenceStartValue().getValPtr();
   LevelBounds &Bounds = LevelMap[Iterator];
@@ -651,13 +657,15 @@ void emitFold(Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
   auto *LowerBound = Bounds.LowerBound;
   auto *IndVar = Iterator;
   auto *UpperBound = Bounds.UpperBound;
+  std::string Expr = "(fold ";
   Expr += Val2Sexp(StartVal) + " ";
   Expr += Val2Sexp(LowerBound) + " ";
   Expr += Val2Sexp(IndVar) + " ";
   Expr += Val2Sexp(UpperBound) + " ";
   Expr += buildExpression(LiveOut, Iterator, RD, LevelMap, TensorMap);
   Expr += ")";
-  LLVM_DEBUG({ dbgs() << Expr << "\n"; });
+//  LLVM_DEBUG({ dbgs() << Expr << "\n"; });
+  Total += "(src \n\t\t" + Expr + ")\n\t";
   // now the dense version
   std::string DenseExpr = "(fold ";
   std::string DenseLowerBound, DenseUpperBound;
@@ -677,10 +685,12 @@ void emitFold(Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
   std::string Inputs;
   DenseExpr += buildDenseExpression(LiveOut, Iterator, RD, LevelMap, TensorMap, Inputs);
   DenseExpr += ")";
-  LLVM_DEBUG({ dbgs() << DenseExpr << "\n"; });
+//  LLVM_DEBUG({ dbgs() << DenseExpr << "\n"; });
+  Total += "(target \n\t\t" + DenseExpr + "))\n";
   LLVM_DEBUG({
-      dbgs() << Inputs << "\n";
+      dbgs() << Total << "\n";
   });
+  FS << Total;
 }
 
 void emitMap(Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
@@ -1235,6 +1245,8 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     AssumptionCache AC(F);
     DemandedBits DB(F, AC, DT);
 
+    std::error_code EC;
+    raw_fd_ostream SExpOut(AnalysisOutputPath + ".sexp", EC);
     for (int Depth = LN.getNestDepth(); Depth > 0; Depth--) {
       for (auto *Loop : LN.getLoopsAtDepth(Depth)) {
         // get liveout for loop
@@ -1250,7 +1262,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
             })) {
           LLVM_DEBUG(dbgs() << *LiveOut << " is a reduction.\n");
           // candidate for fold
-          emitFold(LiveOut, Loop->getInductionVariable(SE), RD, LevelMap,
+          emitFold(SExpOut, Loop, LiveOut, Loop->getInductionVariable(SE), RD, LevelMap,
                    TensorMap);
           continue;
         }
@@ -1318,7 +1330,6 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     Instruction *LiveOut = dyn_cast<Instruction>(*LiveOuts.begin());
     LO = new Node(LiveOut);
 
-    std::error_code EC;
     raw_fd_ostream OutputFile(AnalysisOutputPath + ".yaml", EC);
     Output Yout(OutputFile);
 
