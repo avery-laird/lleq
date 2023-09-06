@@ -157,6 +157,8 @@ public:
     auto LoadType = Type2String(I.getType());
     return "(tensor dense " + LoadType + " " + Ptr + " " + Idx + ")";
   }
+
+
   std::string visitGetElementPtrInst(GetElementPtrInst &I) {
     if (auto *Ptr = dyn_cast<Argument>(I.getPointerOperand()))
       return getNameOrAsOperand(Ptr);
@@ -174,7 +176,47 @@ public:
     return "(" + CastType + " " + getNameOrAsOperand(&I) + ")";
   }
 
+  std::string instToOp(Instruction &Op) {
+    switch(Op.getOpcode()) {
+    default:
+      llvm_unreachable("unknown opcode.");
+    case Instruction::Add:
+    case Instruction::FAdd:
+      return "+";
+    }
+  }
+
+  std::string visitBinaryOperator(BinaryOperator &I) {
+    auto Left = SExpr(I.getOperand(0));
+    auto Right = SExpr(I.getOperand(1));
+    auto Op = instToOp(I);
+    return "(" + Op + " " + Left + " " + Right + ")";
+  }
+
   std::string visitInstruction(Instruction &I) { return visit(I); }
+};
+
+class ExecutorDense : public Executor {
+public:
+  DenseMap<Value *, Tensor *> &TensorMap;
+  ExecutorDense(DenseMap<Value *, Tensor *> &TensorMap) : TensorMap(TensorMap) {}
+
+  std::string visitLoadInst(LoadInst &I) {
+    Tensor *T = TensorMap[&I];
+    assert(T != nullptr && "all loads must be covered.");
+    return T->toString();
+//    // try to construct tensors optimistically
+//    auto *GEP = dyn_cast<GetElementPtrInst>(I.getPointerOperand());
+//    assert(GEP->getNumIndices() == 1);
+//    std::string Ptr = visit(GEP);
+//    std::string Idx;
+//    if (auto *Index = dyn_cast<Instruction>(GEP->getOperand(1)))
+//      Idx = visit(Index);
+//    else
+//      Idx = getNameOrAsOperand(GEP->getOperand(1));
+//    auto LoadType = Type2String(I.getType());
+//    return "(tensor dense " + LoadType + " " + Ptr + " " + Idx + ")";
+  }
 };
 
 std::string Format2String(Tensor::StorageKind F) {
@@ -546,7 +588,10 @@ std::string buildExpression(Value *LiveOut, PHINode *Iterator,
                             RecurrenceDescriptor &RD,
                             DenseMap<Value *, LevelBounds> &LevelMap,
                             DenseMap<Value *, Tensor *> &TensorMap) {
-  if (RD.getRecurrenceKind() == RecurKind::FMulAdd) {
+  if (RD.getRecurrenceKind() == RecurKind::None) {
+    Executor E;
+    return E.SExpr(LiveOut);
+  } else if (RD.getRecurrenceKind() == RecurKind::FMulAdd) {
     auto *I = dyn_cast<Instruction>(LiveOut);
     Executor E;
     std::string Astr = E.visit(cast<Instruction>(I->getOperand(0)));
@@ -562,7 +607,10 @@ std::string buildDenseExpression(Value *LiveOut, PHINode *Iterator,
                                  DenseMap<Value *, LevelBounds> &LevelMap,
                                  DenseMap<Value *, Tensor *> &TensorMap,
                                  std::string &Inputs) {
-  if (RD.getRecurrenceKind() == RecurKind::FMulAdd) {
+  if (RD.getRecurrenceKind() == RecurKind::None) {
+    ExecutorDense E(TensorMap);
+    return E.SExpr(LiveOut);
+  } else if (RD.getRecurrenceKind() == RecurKind::FMulAdd) {
     auto *I = dyn_cast<Instruction>(LiveOut);
     Tensor *A = TensorMap[I->getOperand(0)];
     Tensor *B = TensorMap[I->getOperand(1)];
@@ -693,16 +741,74 @@ void emitFold(raw_fd_ostream &FS, Loop *L, Value *LiveOut, PHINode *Iterator, Re
   FS << Total;
 }
 
-void emitMap(Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
+std::string nameMap(PHINode *Iterator, DenseMap<Value *, LevelBounds> &LevelMap) {
+  if (LevelMap[Iterator].LevelType == COMPRESSED)
+    return "(table (" + Val2Sexp(Iterator) + " " + Val2Sexp(Iterator, ".d") + "))";
+  return "(table )";
+}
+
+std::string valMap(Value *LiveOut, LoopInfo *LI, Loop *L, DenseMap<Value *, Tensor *> &TensorMap) {
+  std::string ValMap = "(table ";
+  Executor E;
+  SmallPtrSet<Value*, 4> Loads;
+  makeTopLevelInputs(LiveOut, Loads);
+  for (auto *V : Loads) {
+    if (LI->getLoopFor(cast<LoadInst>(V)->getParent()) != L)
+      continue;
+    auto *T = TensorMap[V];
+    if (T != nullptr && isa<CSR>(T)) {
+      std::string Left = E.SExpr(V);
+      std::string Right = T->toString();
+      ValMap += "(" + Left + " " + Right + ")";
+    }
+  }
+  ValMap += ")";
+  return ValMap;
+}
+
+void emitMap(raw_fd_ostream &FS, Loop *L, LoopInfo *LI, Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
              DenseMap<Value *, LevelBounds> &LevelMap,
              DenseMap<Value *, Tensor *> &TensorMap) {
-  Value *Init;
-  std::string End;
-  if (LevelMap[Iterator].LevelType == COMPRESSED)
-    End = getNameOrAsOperand(Iterator) + ".end";
-  else
-    End = getNameOrAsOperand(LevelMap[Iterator].UpperBound);
-  LLVM_DEBUG({ dbgs() << "map 0 " << End << "\n"; });
+  // TODO merge with emitFold
+  std::string Total;
+  Total += "(loop \"" + L->getHeader()->getName().str() + "\"\n\t";
+  // Name Map
+  std::string Names = nameMap(Iterator, LevelMap);
+  Total += "(namemap \n\t\t" + Names + ")\n\t";
+  // Coord map
+  std::string CrdMap = makeDense(LevelMap[Iterator]);
+  Total += "(crdmap \n\t\t" + CrdMap + ")\n\t";
+  Total += "(valmap \n\t\t" + valMap(LiveOut, LI, L, TensorMap) + ")\n\t";
+
+  // first original
+  std::string InputCode;
+  std::string Idx = Val2Sexp(Iterator);
+  {
+    std::string Start = Val2Sexp(LevelMap[Iterator].LowerBound);
+    std::string End = Val2Sexp(LevelMap[Iterator].UpperBound);
+    std::string Func = buildExpression(LiveOut, Iterator, RD, LevelMap, TensorMap);
+    InputCode = "(map " + Start + " " + Idx + " " + End + " " + Func + ")";
+  }
+  Total += "(src \n\t\t" + InputCode + ")\n\t";
+  // Then dense
+  std::string DenseCode;
+  {
+    std::string Start = "(int 0)";
+    std::string End;
+    if (LevelMap[Iterator].LevelType == COMPRESSED)
+      End = getNameOrAsOperand(Iterator) + ".end";
+    else
+      End = getNameOrAsOperand(LevelMap[Iterator].UpperBound);
+    End = "(int " + End + ")"; // TODO check this is true
+    std::string Inputs;
+    std::string Func = buildDenseExpression(LiveOut, Iterator, RD, LevelMap, TensorMap, Inputs);
+    DenseCode = "(map " + Start + " " + Idx + " " + End + " " + Func + ")";
+  }
+  Total += "(target \n\t\t" + DenseCode + "))\n";
+  LLVM_DEBUG({
+      dbgs() << Total << "\n";
+  });
+  FS << Total;
 }
 
 enum Property { FULL, ORDERED, UNIQUE, BRANCHLESS, COMPACT };
@@ -1266,23 +1372,9 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
                    TensorMap);
           continue;
         }
-        // is it a reduction?
-        //        for (auto &Phi : Loop->getHeader()->phis()) {
-        //          RecurrenceDescriptor RD;
-        //          if (!RecurrenceDescriptor::isReductionPHI(&Phi, Loop, RD,
-        //          &DB, &AC, &DT, &SE))
-        //            continue;
-        //          // see if it's the liveout
-        //          if (RD.getLoopExitInstr() == LiveOut) {
-        //            LLVM_DEBUG(dbgs() << *LiveOut << " is a reduction.\n");
-        //            // candidate for fold
-        //            emitFold(LiveOut, Loop->getInductionVariable(SE),
-        //            LevelMap); continue;
-        //          }
-        //        }
         // is it a map?
         if (auto *Store = dyn_cast<StoreInst>(LiveOut)) {
-          emitMap(LiveOut, Loop->getInductionVariable(SE), RD, LevelMap,
+          emitMap(SExpOut, Loop, &LI, Store->getValueOperand(), Loop->getInductionVariable(SE), RD, LevelMap,
                   TensorMap);
         }
       }
