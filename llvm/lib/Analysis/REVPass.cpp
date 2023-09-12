@@ -899,8 +899,17 @@ bool detectCSRAndCSC(LoopInfo *LI, ScalarEvolution *SE, Value *Root,
 
   IsCSR = true;
   auto *LiveOut = LiveOutMap[LI->getLoopFor(dyn_cast<LoadInst>(Root)->getParent())];
+  /*
+   * Try to obtain the innermost GEP operator of the LiveOut. We know CSC updates
+   * output array in the form of "output[crd[i]]", so we want to verify that "i"
+   * is the loop var for the array that stores row (coordinate) indices in CSC.
+   */
   if (auto *GEP = findInnerMostGEP(LiveOut)) {
     auto *GEPOpSE = SE->getSCEV(skipCasts(GEP->getOperand(1)));
+    /*
+     * If SE is an AddRecExpr, then we assume it's 1D. The loop that goes through
+     * positions array doesn't start from 0 and increment by 1 at a time.
+     */
     if (auto *AddRecExpr = dyn_cast<SCEVAddRecExpr>(GEPOpSE)) {
       if (!AddRecExpr->getStart()->isZero() && AddRecExpr->getStepRecurrence(*SE)->isOne()) {
         auto *Temp = *Row;
@@ -908,7 +917,16 @@ bool detectCSRAndCSC(LoopInfo *LI, ScalarEvolution *SE, Value *Root,
         *Col = Temp;
         IsCSR = false;
       }
-    } else if (auto *AddExpr = dyn_cast<SCEVAddExpr>(GEPOpSE)) {
+    }
+    /*
+     * If SE is an SCEVAddExpr, then we assume it's 2D (i * N + j) and extract the
+     * SCEVMulExpr. Since we assume it was CSR from the start, the value of Col and
+     * Row are swapped, so if any of SCEVMulExpr's operands are equal to Col, then
+     * we know that it's CSC since C is row-major thus the other operand must be
+     * the number of rows, and it doesn't make sense to multiply column index by
+     * the number of rows.
+     */
+    else if (auto *AddExpr = dyn_cast<SCEVAddExpr>(GEPOpSE)) {
       if (auto *MulExpr = dyn_cast<SCEVMulExpr>(AddExpr->getOperand(0))) {
         if (dyn_cast<SCEVUnknown>(MulExpr->getOperand(0))->getValue() == *Col ||
             dyn_cast<SCEVUnknown>(MulExpr->getOperand(1))->getValue() == *Col) {
