@@ -194,6 +194,19 @@ public:
     return "(" + Op + " " + Left + " " + Right + ")";
   }
 
+  std::string visitIntrinsicInst(IntrinsicInst &I) {
+    switch (I.getIntrinsicID()) {
+    default:
+    llvm_unreachable("unsupported intrinsic.");
+    case Intrinsic::fmuladd:
+      auto A = SExpr(I.getOperand(0));
+      auto B = SExpr(I.getOperand(1));
+      auto C = SExpr(I.getOperand(2));
+      return "(+ (* " + A + " " + B + ") " + C + ")";
+
+    }
+  }
+
   std::string visitInstruction(Instruction &I) { return visit(I); }
 };
 
@@ -1275,6 +1288,7 @@ Value *findLiveOut(Loop *L, LoopInfo *LI) {
   return StoreInsts[0];
 }
 
+
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   outs() << F.getName() << "\n";
 
@@ -1282,6 +1296,9 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
   MemorySSA &MSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
+  MSSA.ensureOptimizedUses();
+  auto *Walker = MSSA.getWalker();
+
 //  MemorySSAWalkerAnnotatedWriter Writer(&MSSA);
 //  F.print(OS, &Writer);
   //  DDGAnalysis::Result &DDG = AM.getResult<DDGAnalysis>(F);
@@ -1301,6 +1318,53 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     }
   } else {
     LoopNest LN(*LI.getTopLevelLoops()[0], SE);
+    for (auto *L : LN.getLoops()) {
+      auto *IV = L->getInductionVariable(SE);
+      SmallVector<Value*> Start;
+      SmallVector<PHINode*> Params;
+      auto *MemPhi = MSSA.getMemoryAccess(L->getHeader());
+//      if (MemPhi)
+//        Start.push_back(MemPhi->getIncomingValueForBlock(L->getLoopPreheader()));
+
+      for (auto &Phi : L->getHeader()->phis()) {
+        if (&Phi != IV) {
+          Start.push_back(Phi.getIncomingValueForBlock(L->getLoopPreheader()));
+          Params.push_back(&Phi);
+        }
+      }
+      Params.push_back(IV);
+      // generate f
+      Executor E;
+      std::string f = "Abs([";
+      raw_string_ostream Abs(f);
+      ListSeparator LS(", ");
+      for (auto *P : Params) Abs << LS << getNameOrAsOperand(P);
+      f += "] ";
+      if (MemPhi) {
+        auto *LoopVal = MemPhi->getIncomingValueForBlock(L->getLoopLatch());
+        auto *Def = dyn_cast<MemoryUseOrDef>(LoopVal);
+//        auto *Clob = MSSA.getWalker()->getClobberingMemoryAccess(LoopVal);
+        f += "heap." + L->getName().str() + " ";
+      }
+      for (auto *P : Params) {
+        f += E.SExpr(P->getIncomingValueForBlock(L->getLoopLatch()));
+        f += " ";
+      }
+
+      LLVM_DEBUG({
+        dbgs() << L->getName() << ": \n";
+        dbgs() << "fold (";
+        ListSeparator LS(", ");
+        for (auto *V : Start) dbgs() << LS << *V;
+        dbgs() << ") ";
+        dbgs() << f << ")";
+        auto B = L->getBounds(SE);
+        dbgs() << " Range(" << getNameOrAsOperand(&B->getInitialIVValue())
+               << ", " << getNameOrAsOperand(&B->getFinalIVValue()) << ")\n";
+      });
+    }
+    return PreservedAnalyses::all();
+
     makeLevelBounds(&LN, &SE, Levels);
     DenseMap<Value *, LevelBounds> LevelMap;
     for (auto &Level : Levels)
