@@ -5,6 +5,7 @@
 #include "llvm/Analysis/REVPass.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/DDG.h"
+#include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/Delinearization.h"
 #include "llvm/Analysis/DemandedBits.h"
 #include "llvm/Analysis/IVDescriptors.h"
@@ -1280,6 +1281,9 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
+  MemorySSA &MSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
+//  MemorySSAWalkerAnnotatedWriter Writer(&MSSA);
+//  F.print(OS, &Writer);
   //  DDGAnalysis::Result &DDG = AM.getResult<DDGAnalysis>(F);
 
   Node *LO;
