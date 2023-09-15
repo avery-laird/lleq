@@ -1314,38 +1314,70 @@ Value *findLiveOut(Loop *L, LoopInfo *LI) {
 
 
 void TranslateBB(BasicBlock *From, BasicBlock *To, SmallPtrSetImpl<BasicBlock*> &Visited, LoopInfo *LI, ScalarEvolution *SE);
+
+void TranslateWave(Instruction *Terminator, SmallPtrSetImpl<BasicBlock*> &Visited, BasicBlock *To, LoopInfo *LI, ScalarEvolution *SE) {
+  if (auto *Br = dyn_cast<BranchInst>(Terminator)) {
+    for (auto *O : Br->successors()) {
+      if (all_of(predecessors(O), [&](BasicBlock *P) {
+            if (!Visited.contains(P)) {
+              auto *L = LI->getLoopFor(O);
+              return L && L->getLoopLatch() == P;
+            }
+            return true;
+          }))
+        TranslateBB(O, To, Visited, LI, SE);
+    }
+  }
+}
+
+void TranslateInstruction(Instruction *I) {
+  dbgs() << "let " << *I << "\n";
+}
+
 void TranslateLoop(Loop *L, LoopInfo *LI, ScalarEvolution *SE, SmallPtrSetImpl<BasicBlock*> &Visited) {
   auto *IV = L->getInductionVariable(*SE);
   auto B = L->getBounds(*SE);
   // translate body
-  auto *T = L->getHeader()->getTerminator();
+  auto *Header = L->getHeader();
+  auto *T = Header->getTerminator();
   auto *Latch = L->getLoopLatch();
-  if (auto *Br = dyn_cast<BranchInst>(T)) {
-    for (auto *O : Br->successors()) {
-      TranslateBB(O, Latch, Visited, LI, SE);
-    }
+  for (auto &I : *Header) {
+    if (&I == Header->getTerminator()) break;
+    TranslateInstruction(&I);
   }
+  TranslateWave(T, Visited, Latch, LI, SE);
+//  if (auto *Br = dyn_cast<BranchInst>(T)) {
+//    for (auto *O : Br->successors()) {
+//      TranslateBB(O, Latch, Visited, LI, SE);
+//    }
+//  }
 }
-void TranslateInstruction(Instruction *I) {}
+
 void TranslateBB(BasicBlock *From, BasicBlock *To, SmallPtrSetImpl<BasicBlock*> &Visited, LoopInfo *LI, ScalarEvolution *SE) {
   Visited.insert(From);
   if (LI->isLoopHeader(From)) {
     TranslateLoop(LI->getLoopFor(From), LI, SE, Visited);
   } else {
     for (auto &I : *From) {
+      if (&I == From->getTerminator()) break;
       TranslateInstruction(&I);
     }
     if (From == To)
       return;
     auto *T = From->getTerminator();
-    if (auto *Br = dyn_cast<BranchInst>(T)) {
-      for (auto *O : Br->successors()) {
-        if (all_of(predecessors(O), [&](BasicBlock *P) {
-              return Visited.contains(P);
-            }) || LI->isLoopHeader(O))
-          TranslateBB(O, To, Visited, LI, SE);
-      }
-    }
+    TranslateWave(T, Visited, To, LI, SE);
+//    if (auto *Br = dyn_cast<BranchInst>(T)) {
+//      for (auto *O : Br->successors()) {
+//        if (all_of(predecessors(O), [&](BasicBlock *P) {
+//              if (!Visited.contains(P)) {
+//                auto *L = LI->getLoopFor(O);
+//                return L && L->getLoopLatch() == P;
+//              }
+//              return true;
+//            }))
+//          TranslateBB(O, To, Visited, LI, SE);
+//      }
+//    }
   }
 }
 void Translate(Function *F, LoopInfo *LI, ScalarEvolution *SE) {
