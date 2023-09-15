@@ -83,6 +83,8 @@ std::string Type2String(Type *T) {
     return "int";
   if (T->getTypeID() == Type::DoubleTyID)
     return "double";
+  if (T->getTypeID() == Type::FloatTyID)
+    return "double"; // TODO treat everything as float
   llvm_unreachable("unknown type.");
 }
 
@@ -159,6 +161,16 @@ public:
     return "(tensor dense " + LoadType + " " + Ptr + " " + Idx + ")";
   }
 
+  std::string visitStoreInst(StoreInst &I) {
+    auto *GEP = dyn_cast<GetElementPtrInst>(I.getPointerOperand());
+    assert(GEP->getNumIndices() == 1);
+    std::string Ptr = visit(GEP);
+    std::string Idx = SExpr(GEP->getOperand(1));
+    std::string Val = SExpr(I.getValueOperand());
+    auto StoreType = Type2String(I.getValueOperand()->getType());
+    return "(update " + StoreType + " " + Ptr + " " + Idx + " " + Val + ")";
+  }
+
 
   std::string visitGetElementPtrInst(GetElementPtrInst &I) {
     if (auto *Ptr = dyn_cast<Argument>(I.getPointerOperand()))
@@ -166,6 +178,7 @@ public:
     auto *Inst = dyn_cast<Instruction>(I.getPointerOperand());
     return visit(Inst);
   }
+
   std::string visitPHINode(PHINode &I) {
     auto PhiType = Type2String(I.getType());
     return "(" + PhiType + " " + getNameOrAsOperand(&I) + ")";
@@ -184,6 +197,11 @@ public:
     case Instruction::Add:
     case Instruction::FAdd:
       return "+";
+    case Instruction::Mul:
+    case Instruction::FMul:
+      return "*";
+    case Instruction::FNeg:
+      return "-";
     }
   }
 
@@ -192,6 +210,12 @@ public:
     auto Right = SExpr(I.getOperand(1));
     auto Op = instToOp(I);
     return "(" + Op + " " + Left + " " + Right + ")";
+  }
+
+  std::string visitUnaryOperator(UnaryOperator &I) {
+    auto Input = SExpr(I.getOperand(0));
+    auto Op = instToOp(I);
+    return "(" + Op + " " + Input + ")";
   }
 
   std::string visitIntrinsicInst(IntrinsicInst &I) {
@@ -1340,10 +1364,16 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
       auto *MemPhi = MSSA.getMemoryAccess(L->getHeader());
       if (MemPhi) {
         auto *V = MemPhi->getIncomingValueForBlock(L->getLoopPreheader());
-        if (auto *P = dyn_cast<MemoryPhi>(V))
-          Start.push_back("heap." + std::to_string(P->getID()));
-        else
-          Start.push_back("heap." + L->getName().str());
+        auto *MP = dyn_cast<MemoryPhi>(V);
+        auto *MD = dyn_cast<MemoryUseOrDef>(V);
+        if (MP)
+          Start.push_back("heap." + std::to_string(MP->getID()));
+        else {
+          if (MSSA.isLiveOnEntryDef(MD))
+            Start.push_back("heap.liveOnEntry");
+          else
+            Start.push_back("heap." + getNameOrAsOperand(MD->getMemoryInst()));
+        }
       }
 
       for (auto &Phi : L->getHeader()->phis()) {
@@ -1358,7 +1388,20 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
       std::string f = "Abs([";
       raw_string_ostream Abs(f);
       ListSeparator LS(", ");
-      for (auto *P : Params) Abs << LS << getNameOrAsOperand(P);
+      if (MemPhi) {
+        auto *LoopVal = MemPhi->getIncomingValueForBlock(L->getLoopLatch());
+        auto *MP = dyn_cast<MemoryPhi>(LoopVal);
+        auto *MD = dyn_cast<MemoryUseOrDef>(LoopVal);
+        if (MP)
+          Abs << LS << "heap." + std::to_string(MP->getID());
+        else {
+          auto *MI = MD->getMemoryInst();
+          Abs << LS << E.SExpr(getLoadStorePointerOperand(MI));
+        }
+      }
+      for (auto *P : Params) {
+        Abs << LS << getNameOrAsOperand(P);
+      }
       f += "] ";
       if (MemPhi) {
         auto *LoopVal = MemPhi->getIncomingValueForBlock(L->getLoopLatch());
@@ -1369,8 +1412,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
           f += "heap." + std::to_string(MP->getID());
         else {
           auto *MI = MD->getMemoryInst();
-          auto *P = getLoadStorePointerOperand(MI);
-          f += "heap." + E.SExpr(P) + " ";
+          f += E.SExpr(MI) + " ";
         }
       }
       for (auto *P : Params) {
