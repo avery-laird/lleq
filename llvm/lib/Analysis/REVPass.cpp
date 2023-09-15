@@ -1289,6 +1289,10 @@ Value *findLiveOut(Loop *L, LoopInfo *LI) {
 }
 
 
+//void Translate(Instruction *I) {
+//  I->getNextNode()
+//}
+
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   outs() << F.getName() << "\n";
 
@@ -1318,17 +1322,33 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     }
   } else {
     LoopNest LN(*LI.getTopLevelLoops()[0], SE);
-    for (auto *L : LN.getLoops()) {
+    for (int Depth = LN.getNestDepth(); Depth > 0; --Depth){
+      auto *L = LN.getLoopsAtDepth(Depth)[0];
       auto *IV = L->getInductionVariable(SE);
-      SmallVector<Value*> Start;
+      SmallVector<std::string> Start;
       SmallVector<PHINode*> Params;
+//      for (auto *BB : L->blocks()) {
+//        auto *First = BB->getFirstNonPHI();
+//
+//        for (auto &I : *BB) {
+//          switch (I.get) {
+//
+//          }
+//        }
+//      }
+      
       auto *MemPhi = MSSA.getMemoryAccess(L->getHeader());
-//      if (MemPhi)
-//        Start.push_back(MemPhi->getIncomingValueForBlock(L->getLoopPreheader()));
+      if (MemPhi) {
+        auto *V = MemPhi->getIncomingValueForBlock(L->getLoopPreheader());
+        if (auto *P = dyn_cast<MemoryPhi>(V))
+          Start.push_back("heap." + std::to_string(P->getID()));
+        else
+          Start.push_back("heap." + L->getName().str());
+      }
 
       for (auto &Phi : L->getHeader()->phis()) {
         if (&Phi != IV) {
-          Start.push_back(Phi.getIncomingValueForBlock(L->getLoopPreheader()));
+          Start.push_back(getNameOrAsOperand(Phi.getIncomingValueForBlock(L->getLoopPreheader())));
           Params.push_back(&Phi);
         }
       }
@@ -1342,11 +1362,20 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
       f += "] ";
       if (MemPhi) {
         auto *LoopVal = MemPhi->getIncomingValueForBlock(L->getLoopLatch());
-        auto *Def = dyn_cast<MemoryUseOrDef>(LoopVal);
 //        auto *Clob = MSSA.getWalker()->getClobberingMemoryAccess(LoopVal);
-        f += "heap." + L->getName().str() + " ";
+        auto *MP = dyn_cast<MemoryPhi>(LoopVal);
+        auto *MD = dyn_cast<MemoryUseOrDef>(LoopVal);
+        if (MP)
+          f += "heap." + std::to_string(MP->getID());
+        else {
+          auto *MI = MD->getMemoryInst();
+          auto *P = getLoadStorePointerOperand(MI);
+          f += "heap." + E.SExpr(P) + " ";
+        }
       }
       for (auto *P : Params) {
+        if (P == IV)
+          continue;
         f += E.SExpr(P->getIncomingValueForBlock(L->getLoopLatch()));
         f += " ";
       }
@@ -1355,7 +1384,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
         dbgs() << L->getName() << ": \n";
         dbgs() << "fold (";
         ListSeparator LS(", ");
-        for (auto *V : Start) dbgs() << LS << *V;
+        for (auto &V : Start) dbgs() << LS << V;
         dbgs() << ") ";
         dbgs() << f << ")";
         auto B = L->getBounds(SE);
