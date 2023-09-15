@@ -1313,9 +1313,39 @@ Value *findLiveOut(Loop *L, LoopInfo *LI) {
 }
 
 
-//void Translate(Instruction *I) {
-//  I->getNextNode()
-//}
+void TranslateBB(BasicBlock *BB, LoopInfo *LI, ScalarEvolution *SE);
+void TranslateLoop(Loop *L, LoopInfo *LI, ScalarEvolution *SE) {
+  auto *IV = L->getInductionVariable(*SE);
+  auto B = L->getBounds(*SE);
+  // translate body
+  auto *T = L->getHeader()->getTerminator();
+  if (auto *Br = dyn_cast<BranchInst>(T)) {
+    for (auto *O : Br->successors()) {
+      TranslateBB(O, LI, SE);
+    }
+  }
+}
+void TranslateInstruction(Instruction *I) {}
+void TranslateBB(BasicBlock *BB, LoopInfo *LI, ScalarEvolution *SE) {
+  if (LI->isLoopHeader(BB)) {
+    TranslateLoop(LI->getLoopFor(BB), LI, SE);
+  } else {
+    for (auto &I : *BB) {
+      TranslateInstruction(&I);
+    }
+    auto *T = BB->getTerminator();
+    if (auto *Br = dyn_cast<BranchInst>(T)) {
+      for (auto *O : Br->successors()) {
+        TranslateBB(O, LI, SE);
+      }
+    }
+  }
+}
+void Translate(Function *F, LoopInfo *LI, ScalarEvolution *SE) {
+  auto *Entry = &F->getEntryBlock();
+  TranslateBB(Entry, LI, SE);
+
+}
 
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   outs() << F.getName() << "\n";
@@ -1346,6 +1376,8 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     }
   } else {
     LoopNest LN(*LI.getTopLevelLoops()[0], SE);
+    Translate(&F, &LI, &SE);
+    return PreservedAnalyses::all();
     for (int Depth = LN.getNestDepth(); Depth > 0; --Depth){
       auto *L = LN.getLoopsAtDepth(Depth)[0];
       auto *IV = L->getInductionVariable(SE);
