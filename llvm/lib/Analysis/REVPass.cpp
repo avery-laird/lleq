@@ -1313,37 +1313,45 @@ Value *findLiveOut(Loop *L, LoopInfo *LI) {
 }
 
 
-void TranslateBB(BasicBlock *BB, LoopInfo *LI, ScalarEvolution *SE);
-void TranslateLoop(Loop *L, LoopInfo *LI, ScalarEvolution *SE) {
+void TranslateBB(BasicBlock *From, BasicBlock *To, SmallPtrSetImpl<BasicBlock*> &Visited, LoopInfo *LI, ScalarEvolution *SE);
+void TranslateLoop(Loop *L, LoopInfo *LI, ScalarEvolution *SE, SmallPtrSetImpl<BasicBlock*> &Visited) {
   auto *IV = L->getInductionVariable(*SE);
   auto B = L->getBounds(*SE);
   // translate body
   auto *T = L->getHeader()->getTerminator();
+  auto *Latch = L->getLoopLatch();
   if (auto *Br = dyn_cast<BranchInst>(T)) {
     for (auto *O : Br->successors()) {
-      TranslateBB(O, LI, SE);
+      TranslateBB(O, Latch, Visited, LI, SE);
     }
   }
 }
 void TranslateInstruction(Instruction *I) {}
-void TranslateBB(BasicBlock *BB, LoopInfo *LI, ScalarEvolution *SE) {
-  if (LI->isLoopHeader(BB)) {
-    TranslateLoop(LI->getLoopFor(BB), LI, SE);
+void TranslateBB(BasicBlock *From, BasicBlock *To, SmallPtrSetImpl<BasicBlock*> &Visited, LoopInfo *LI, ScalarEvolution *SE) {
+  Visited.insert(From);
+  if (LI->isLoopHeader(From)) {
+    TranslateLoop(LI->getLoopFor(From), LI, SE, Visited);
   } else {
-    for (auto &I : *BB) {
+    for (auto &I : *From) {
       TranslateInstruction(&I);
     }
-    auto *T = BB->getTerminator();
+    if (From == To)
+      return;
+    auto *T = From->getTerminator();
     if (auto *Br = dyn_cast<BranchInst>(T)) {
       for (auto *O : Br->successors()) {
-        TranslateBB(O, LI, SE);
+        if (all_of(predecessors(O), [&](BasicBlock *P) {
+              return Visited.contains(P);
+            }) || LI->isLoopHeader(O))
+          TranslateBB(O, To, Visited, LI, SE);
       }
     }
   }
 }
 void Translate(Function *F, LoopInfo *LI, ScalarEvolution *SE) {
   auto *Entry = &F->getEntryBlock();
-  TranslateBB(Entry, LI, SE);
+  SmallPtrSet<BasicBlock*, 10> Visited;
+  TranslateBB(Entry, nullptr, Visited, LI, SE);
 
 }
 
