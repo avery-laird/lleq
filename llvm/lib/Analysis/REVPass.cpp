@@ -1479,25 +1479,22 @@ private:
     indent();
 
     if (Header == Latch) {
-      auto *I = Header->getFirstNonPHI();
-      while (I != Header->getTerminator()) {
-        visitInstruction(I);
-        I = I->getNextNode();
+      Executor E;
+      // outputs
+      auto *LiveOut = &*L->getExitBlock()->phis().begin();
+      assert(!(LiveOut && MPhi) && "simultaneous memory and scalar output not supported right now");
+      if (LiveOut) {
+        out() << prefix() << E.SExpr(LiveOut->getIncomingValue(0));
+        //      out() << prefix() << getNameOrAsOperand(LiveOut->getIncomingValue(0));
+      } else {
+        out() << prefix() << E.SExpr(MemInst->getMemoryInst());
+        //      out() << prefix() << getNameOrAsOperand(MemPtr) + ".new";
       }
+      out() << "\n";
     } else {
       // other code in loop body ending at latch
       wave(T, Latch);
     }
-
-    // outputs
-    auto *LiveOut = &*L->getExitBlock()->phis().begin();
-    assert(!(LiveOut && MPhi) && "simultaneous memory and scalar output not supported right now");
-    if (LiveOut) {
-      out() << prefix() << getNameOrAsOperand(LiveOut->getIncomingValue(0));
-    } else {
-      out() << prefix() << getNameOrAsOperand(MemPtr) + ".new";
-    }
-    out() << "\n";
 
     indent();
 
