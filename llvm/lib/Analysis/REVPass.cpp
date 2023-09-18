@@ -1313,123 +1313,276 @@ Value *findLiveOut(Loop *L, LoopInfo *LI) {
   return StoreInsts[0];
 }
 
+class Translate {
+public:
 
-void TranslateBB(std::string Prefix, BasicBlock *From, BasicBlock *To, SmallPtrSetImpl<BasicBlock*> &Visited, LoopInfo *LI, ScalarEvolution *SE);
+  Translate(LoopInfo *LI, ScalarEvolution *SE, MemorySSA *MSSA)
+      : LI(LI), SE(SE), MSSA(MSSA) {}
 
-void TranslateWave(std::string Prefix, Instruction *Terminator, SmallPtrSetImpl<BasicBlock*> &Visited, BasicBlock *To, LoopInfo *LI, ScalarEvolution *SE) {
-  if (auto *Br = dyn_cast<BranchInst>(Terminator)) {
-    for (auto *O : Br->successors()) {
-      if (all_of(predecessors(O), [&](BasicBlock *P) {
-            if (!Visited.contains(P)) {
-              auto *L = LI->getLoopFor(O);
-              return L && L->getLoopLatch() == P;
-            }
-            return true;
-          }))
-        TranslateBB(Prefix, O, To, Visited, LI, SE);
-    }
+  void visit(Function *F) {
+    auto *Entry = &F->getEntryBlock();
+    visitBB(Entry, nullptr);
   }
-}
 
-void TranslateInstruction(std::string Prefix, Instruction *I) {
-  if (auto *Phi = dyn_cast<PHINode>(I)) {
-    // collect pred. branches
-    dbgs() << Prefix << "let " << getNameOrAsOperand(I) << " = ";
-    for (int V = 0;  V < Phi->getNumIncomingValues(); ++V) {
-      auto *Val = Phi->getIncomingValue(V);
-      auto *BB = Phi->getIncomingBlock(V);
-      dbgs() << "if (";
-      auto *T = BB->getTerminator();
-      if (auto *Br = dyn_cast_or_null<BranchInst>(T)) {
-        if (Br->isUnconditional())
-          dbgs() << "true";
-        else {
-          if (Br->getSuccessor(1) == BB) // true
-            dbgs() << getNameOrAsOperand(Br->getCondition());
-          else
-            dbgs() << "!" << getNameOrAsOperand(Br->getCondition());
-        }
+private:
+  LoopInfo *LI = nullptr;
+  ScalarEvolution *SE = nullptr;
+  MemorySSA *MSSA = nullptr;
+  SmallPtrSet<BasicBlock*, 10> Visited = {};
+  int Indent = 0;
+
+  void indent() {
+    Indent++;
+  }
+
+  void deindent() {
+    Indent--;
+  }
+
+  std::string prefix() {
+    std::string Prefix = "";
+    for (int i=0; i < Indent; ++i) Prefix += "\t";
+    return Prefix;
+  }
+
+  void visitBB(BasicBlock *From, BasicBlock *To) {
+    Visited.insert(From);
+    if (LI->isLoopHeader(From)) {
+      visitLoop(LI->getLoopFor(From), To);
+    } else {
+      //    dbgs() << Prefix << From->getName() << ":\n";
+      for (auto &I : *From) {
+        if (&I == From->getTerminator()) break;
+        visitInstruction(&I);
       }
-      dbgs() << ") then " << getNameOrAsOperand(Val) << " ";
-      if (V + 1 < Phi->getNumIncomingValues())
-        dbgs() << "else ";
+      if (From == To)
+        return;
+      auto *T = From->getTerminator();
+      wave(T, To);
     }
-    dbgs() << "\n";
-  } else {
-    dbgs() << Prefix << "let " << *I << " in\n";
   }
-}
 
-void TranslateLoop(std::string Prefix, Loop *L, LoopInfo *LI, ScalarEvolution *SE, SmallPtrSetImpl<BasicBlock*> &Visited) {
-  auto *IV = L->getInductionVariable(*SE);
-  auto B = L->getBounds(*SE);
-  auto *Header = L->getHeader();
-  auto *T = Header->getTerminator();
-  auto *Latch = L->getLoopLatch();
-
-  dbgs() << Prefix << "let f = λ";
-  std::string ArgNames;
-  for (auto &P : Header->phis()) {
-    if (&P == IV) continue;
-    ArgNames += getNameOrAsOperand(&P) + " ";
-  }
-  dbgs() << ArgNames << getNameOrAsOperand(IV) << ".\n";
-
-  auto NewPrefix = Prefix + "\t";
-
-  if (Header == Latch) {
-    auto *I = Header->getFirstNonPHI();
-    while (I != Header->getTerminator()) {
-      TranslateInstruction(NewPrefix, I);
-      I = I->getNextNode();
+  void wave(Instruction *Terminator, BasicBlock *To) {
+    if (auto *Br = dyn_cast<BranchInst>(Terminator)) {
+      for (auto *O : Br->successors()) {
+        if (all_of(predecessors(O), [&](BasicBlock *P) {
+              if (!Visited.contains(P)) {
+                auto *L = LI->getLoopFor(O);
+                return L && L->getLoopLatch() == P;
+              }
+              return true;
+            }))
+          visitBB(O, To);
+      }
     }
-  } else {
-    // other code in loop body ending at latch
-    TranslateWave(NewPrefix, T, Visited, Latch, LI, SE);
   }
 
-  NewPrefix += "\t";
-
-  dbgs() << NewPrefix << "let r = fold (";
-  // grab phis
-  ListSeparator LS(", ");
-  std::string OutNames;
-  for (auto &P : Header->phis()) {
-    if (&P == IV)
-      continue;
-    dbgs() << LS << getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopPreheader()));
-    OutNames += getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopLatch())) + ", ";
-  }
-  dbgs() << ") f Range(" << getNameOrAsOperand(&B->getInitialIVValue())
-         << ", " << getNameOrAsOperand(&B->getFinalIVValue()) << ") in\n";
-  dbgs() << NewPrefix << "\t" << "let " << OutNames << "= r in\n";
-
-}
-
-void TranslateBB(std::string Prefix, BasicBlock *From, BasicBlock *To, SmallPtrSetImpl<BasicBlock*> &Visited, LoopInfo *LI, ScalarEvolution *SE) {
-  Visited.insert(From);
-  if (LI->isLoopHeader(From)) {
-    TranslateLoop(Prefix, LI->getLoopFor(From), LI, SE, Visited);
-    auto *Exit = LI->getLoopFor(From)->getExitBlock();
-    TranslateBB(Prefix + "\t", Exit, To, Visited, LI, SE);
-  } else {
-//    dbgs() << Prefix << From->getName() << ":\n";
-    for (auto &I : *From) {
-      if (&I == From->getTerminator()) break;
-      TranslateInstruction(Prefix, &I);
+  void visitInstruction(Instruction *I) {
+    if (auto *Phi = dyn_cast<PHINode>(I)) {
+      // collect pred. branches
+      dbgs() << prefix() << "let " << getNameOrAsOperand(I) << " = ";
+      for (int V = 0;  V < Phi->getNumIncomingValues(); ++V) {
+        auto *Val = Phi->getIncomingValue(V);
+        auto *BB = Phi->getIncomingBlock(V);
+        dbgs() << "if (";
+        auto *T = BB->getTerminator();
+        if (auto *Br = dyn_cast_or_null<BranchInst>(T)) {
+          if (Br->isUnconditional())
+            dbgs() << "true";
+          else {
+            if (Br->getSuccessor(1) == BB) // true
+              dbgs() << getNameOrAsOperand(Br->getCondition());
+            else
+              dbgs() << "!" << getNameOrAsOperand(Br->getCondition());
+          }
+        }
+        dbgs() << ") then " << getNameOrAsOperand(Val) << " ";
+        if (V + 1 < Phi->getNumIncomingValues())
+          dbgs() << "else ";
+      }
+      dbgs() << "\n";
+    } else {
+      dbgs() << prefix() << "let " << *I << " in\n";
     }
-    if (From == To)
-      return;
-    auto *T = From->getTerminator();
-    TranslateWave(Prefix, T, Visited, To, LI, SE);
   }
-}
-void Translate(Function *F, LoopInfo *LI, ScalarEvolution *SE) {
-  auto *Entry = &F->getEntryBlock();
-  SmallPtrSet<BasicBlock*, 10> Visited;
-  TranslateBB("", Entry, nullptr, Visited, LI, SE);
 
-}
+  void visitLoop(Loop *L, BasicBlock *To) {
+    auto *IV = L->getInductionVariable(*SE);
+    auto B = L->getBounds(*SE);
+    auto *Header = L->getHeader();
+    auto *T = Header->getTerminator();
+    auto *Latch = L->getLoopLatch();
+
+    dbgs() << prefix() << "let f = λ";
+    std::string ArgNames;
+    for (auto &P : Header->phis()) {
+      if (&P == IV) continue;
+      ArgNames += getNameOrAsOperand(&P) + " ";
+    }
+    // check memory phi
+    for (auto &MA : *MSSA->getBlockDefs(Header)) {
+      if (auto *MP = dyn_cast<MemoryPhi>(&MA))
+
+    }
+
+    dbgs() << ArgNames << getNameOrAsOperand(IV) << ".\n";
+
+    indent();
+
+    if (Header == Latch) {
+      auto *I = Header->getFirstNonPHI();
+      while (I != Header->getTerminator()) {
+        visitInstruction(I);
+        I = I->getNextNode();
+      }
+    } else {
+      // other code in loop body ending at latch
+      wave(T, Latch);
+    }
+
+    indent();
+
+    dbgs() << prefix() << "let r = fold (";
+    // grab phis
+    ListSeparator LS(", ");
+    std::string OutNames;
+    for (auto &P : Header->phis()) {
+      if (&P == IV)
+        continue;
+      dbgs() << LS << getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopPreheader()));
+      OutNames += getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopLatch())) + ", ";
+    }
+    dbgs() << ") f Range(" << getNameOrAsOperand(&B->getInitialIVValue())
+           << ", " << getNameOrAsOperand(&B->getFinalIVValue()) << ") in\n";
+    dbgs() << prefix() << "\t" << "let " << OutNames << "= r in\n";
+
+    indent();
+
+    auto *Exit = L->getExitBlock();
+    visitBB(Exit, To);
+
+    deindent();
+    deindent();
+    deindent();
+  }
+};
+
+//void TranslateBB(std::string Prefix, BasicBlock *From, BasicBlock *To, SmallPtrSetImpl<BasicBlock*> &Visited, LoopInfo *LI, ScalarEvolution *SE);
+//
+//void TranslateWave(std::string Prefix, Instruction *Terminator, SmallPtrSetImpl<BasicBlock*> &Visited, BasicBlock *To, LoopInfo *LI, ScalarEvolution *SE) {
+//  if (auto *Br = dyn_cast<BranchInst>(Terminator)) {
+//    for (auto *O : Br->successors()) {
+//      if (all_of(predecessors(O), [&](BasicBlock *P) {
+//            if (!Visited.contains(P)) {
+//              auto *L = LI->getLoopFor(O);
+//              return L && L->getLoopLatch() == P;
+//            }
+//            return true;
+//          }))
+//        TranslateBB(Prefix, O, To, Visited, LI, SE);
+//    }
+//  }
+//}
+//
+//void TranslateInstruction(std::string Prefix, Instruction *I) {
+//  if (auto *Phi = dyn_cast<PHINode>(I)) {
+//    // collect pred. branches
+//    dbgs() << Prefix << "let " << getNameOrAsOperand(I) << " = ";
+//    for (int V = 0;  V < Phi->getNumIncomingValues(); ++V) {
+//      auto *Val = Phi->getIncomingValue(V);
+//      auto *BB = Phi->getIncomingBlock(V);
+//      dbgs() << "if (";
+//      auto *T = BB->getTerminator();
+//      if (auto *Br = dyn_cast_or_null<BranchInst>(T)) {
+//        if (Br->isUnconditional())
+//          dbgs() << "true";
+//        else {
+//          if (Br->getSuccessor(1) == BB) // true
+//            dbgs() << getNameOrAsOperand(Br->getCondition());
+//          else
+//            dbgs() << "!" << getNameOrAsOperand(Br->getCondition());
+//        }
+//      }
+//      dbgs() << ") then " << getNameOrAsOperand(Val) << " ";
+//      if (V + 1 < Phi->getNumIncomingValues())
+//        dbgs() << "else ";
+//    }
+//    dbgs() << "\n";
+//  } else {
+//    dbgs() << Prefix << "let " << *I << " in\n";
+//  }
+//}
+//
+//void TranslateLoop(std::string Prefix, Loop *L, LoopInfo *LI, ScalarEvolution *SE, SmallPtrSetImpl<BasicBlock*> &Visited) {
+//  auto *IV = L->getInductionVariable(*SE);
+//  auto B = L->getBounds(*SE);
+//  auto *Header = L->getHeader();
+//  auto *T = Header->getTerminator();
+//  auto *Latch = L->getLoopLatch();
+//
+//  dbgs() << Prefix << "let f = λ";
+//  std::string ArgNames;
+//  for (auto &P : Header->phis()) {
+//    if (&P == IV) continue;
+//    ArgNames += getNameOrAsOperand(&P) + " ";
+//  }
+//  dbgs() << ArgNames << getNameOrAsOperand(IV) << ".\n";
+//
+//  auto NewPrefix = Prefix + "\t";
+//
+//  if (Header == Latch) {
+//    auto *I = Header->getFirstNonPHI();
+//    while (I != Header->getTerminator()) {
+//      TranslateInstruction(NewPrefix, I);
+//      I = I->getNextNode();
+//    }
+//  } else {
+//    // other code in loop body ending at latch
+//    TranslateWave(NewPrefix, T, Visited, Latch, LI, SE);
+//  }
+//
+//  NewPrefix += "\t";
+//
+//  dbgs() << NewPrefix << "let r = fold (";
+//  // grab phis
+//  ListSeparator LS(", ");
+//  std::string OutNames;
+//  for (auto &P : Header->phis()) {
+//    if (&P == IV)
+//      continue;
+//    dbgs() << LS << getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopPreheader()));
+//    OutNames += getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopLatch())) + ", ";
+//  }
+//  dbgs() << ") f Range(" << getNameOrAsOperand(&B->getInitialIVValue())
+//         << ", " << getNameOrAsOperand(&B->getFinalIVValue()) << ") in\n";
+//  dbgs() << NewPrefix << "\t" << "let " << OutNames << "= r in\n";
+//
+//}
+//
+//void TranslateBB(std::string Prefix, BasicBlock *From, BasicBlock *To, SmallPtrSetImpl<BasicBlock*> &Visited, LoopInfo *LI, ScalarEvolution *SE) {
+//  Visited.insert(From);
+//  if (LI->isLoopHeader(From)) {
+//    TranslateLoop(Prefix, LI->getLoopFor(From), LI, SE, Visited);
+//    auto *Exit = LI->getLoopFor(From)->getExitBlock();
+//    TranslateBB(Prefix + "\t", Exit, To, Visited, LI, SE);
+//  } else {
+////    dbgs() << Prefix << From->getName() << ":\n";
+//    for (auto &I : *From) {
+//      if (&I == From->getTerminator()) break;
+//      TranslateInstruction(Prefix, &I);
+//    }
+//    if (From == To)
+//      return;
+//    auto *T = From->getTerminator();
+//    TranslateWave(Prefix, T, Visited, To, LI, SE);
+//  }
+//}
+//void Translate(Function *F, LoopInfo *LI, ScalarEvolution *SE) {
+//  auto *Entry = &F->getEntryBlock();
+//  SmallPtrSet<BasicBlock*, 10> Visited;
+//  TranslateBB("", Entry, nullptr, Visited, LI, SE);
+//
+//}
 
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   outs() << F.getName() << "\n";
@@ -1470,7 +1623,8 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
 //      // either a loop or a normal BB
 //      if (LI.isLoopHeader(BB))
 //    }
-    Translate(&F, &LI, &SE);
+    Translate Tr(&LI, &SE, &MSSA);
+    Tr.visit(&F);
     return PreservedAnalyses::all();
     for (int Depth = LN.getNestDepth(); Depth > 0; --Depth){
       auto *L = LN.getLoopsAtDepth(Depth)[0];
