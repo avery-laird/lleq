@@ -1723,7 +1723,7 @@ public:
         auto *Latch = L->getLoopLatch();
         auto *ExitBlock = L->getExitBlock();
         auto *IV = L->getInductionVariable(SE);
-        auto Params = make_filter_range(ExitBlock->phis(),
+        auto Params = make_filter_range(Header->phis(),
                                         [IV](PHINode &P) { return &P != IV; });
         Exit2Loop[ExitBlock] = L;
         Latch2Loop[Latch] = L;
@@ -1785,7 +1785,7 @@ private:
     Executor E;
     if (!LiveOuts.empty()) {
       for (auto &LO : LiveOuts)
-        dbgs() << Tabs << E.SExpr(&LO) << " ";
+        dbgs() << Tabs << E.SExpr(LO.getIncomingValue(0)) << " ";
     } else {
       auto *Inst = MemInst->getMemoryInst();
       if (LI.getLoopFor(Inst->getParent()) == L)
