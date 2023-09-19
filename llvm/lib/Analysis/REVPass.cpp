@@ -1667,6 +1667,160 @@ raw_ostream &operator<<(raw_ostream &OS, const Translate &T) {
 //
 //}
 
+//std::string PhisAsParams(iterator_range<filter_iterator<BasicBlock>> Phis, PHINode *IV) {
+//  std::string StrParam = "";
+//  raw_string_ostream Params(StrParam);
+//  ListSeparator LS(", ");
+//  for (auto &Phi : Phis) {
+//    Params << LS << getNameOrAsOperand(&Phi);
+//  }
+//  if (!Phis.empty())
+//    Params << ", ";
+//  Params << getNameOrAsOperand(IV);
+//  return StrParam;
+//}
+
+//std::string PhisAsArgs(BasicBlock *Header, PHINode *IV) {
+//  std::string Args = "";
+//  for (auto &Phi : Header->phis()) {
+//    if (IV == &Phi) continue;
+//    if (&Phi != &*Header->phis().begin())
+//      Args += ", ";
+//    Args += getNameOrAsOperand(Phi.getIncomingValueForBlock());
+//  }
+//  if (!Header->phis().empty())
+//    Params += ", ";
+//  Params += getNameOrAsOperand(IV);
+//}
+
+class Lambda {
+public:
+  Lambda(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA)
+      : LI(LI), SE(SE), MSSA(MSSA) {}
+
+
+  void translate(Function &F) {
+    analyzeMemory(&F);
+    Exit2Loop.clear();
+    Latch2Loop.clear();
+    ReversePostOrderTraversal<Function*> RPOT(&F);
+    SmallPtrSet<BasicBlock*, 5> Visited;
+
+    for (auto *BB : RPOT) {
+      if (Visited.contains(BB))
+        continue;
+      Visited.insert(BB);
+      if (Latch2Loop[BB]) {
+        Tabs.pop_back();
+        latch(BB);
+      }
+      else if (Exit2Loop[BB]) {
+        exit(BB);
+      }
+      else if (LI.isLoopHeader(BB)) {
+        auto *Header = BB;
+        auto *L = LI.getLoopFor(Header);
+        auto *Latch = L->getLoopLatch();
+        auto *ExitBlock = L->getExitBlock();
+        auto *IV = L->getInductionVariable(SE);
+        auto Params = make_filter_range(ExitBlock->phis(),
+                                        [IV](PHINode &P) { return &P != IV; });
+        Exit2Loop[ExitBlock] = L;
+        Latch2Loop[Latch] = L;
+        auto *MemPhi = MSSA.getMemoryAccess(Header);
+        auto LiveOuts = ExitBlock->phis();
+        assert((!MemPhi || LiveOuts.empty()) && "simultaneous memory and scalar output not supported right now.");
+        std::string StrParam = "";
+        if (MemPhi) {
+          auto *Clob = MSSA.getWalker()->getClobberingMemoryAccess(MemPhi);
+          StrParam += getNameOrAsOperand(MemPtr) + " ";
+        }
+        {
+          raw_string_ostream Ps(StrParam);
+          ListSeparator LS(" ");
+          for (auto &Phi : Params) {
+            Ps << LS << getNameOrAsOperand(&Phi);
+          }
+          if (!Params.empty())
+            Ps << " ";
+          Ps << getNameOrAsOperand(IV);
+        }
+
+        dbgs() << Tabs << BB->getName() << " = λ" <<  StrParam << ". \n";
+
+        if (Header != Latch)
+          Tabs += "\t";
+        else
+          latch(Latch);
+      } else {
+//        dbgs() << Tabs << BB->getName();
+//        if (Latch2Loop[BB])
+//          dbgs() << " (end " << Latch2Loop[BB]->getHeader()->getName() << ")";
+//        dbgs() << "\n";
+      }
+    }
+  }
+
+private:
+  LoopInfo &LI;
+  ScalarEvolution &SE;
+  MemorySSA &MSSA;
+  const MemoryDef *MemInst = nullptr;
+  Value *MemPtr = nullptr;
+  DenseMap<BasicBlock*, Loop*> Exit2Loop;
+  DenseMap<BasicBlock*, Loop*> Latch2Loop;
+  std::string Tabs = "";
+
+  void exit(BasicBlock *Exit) {
+    Loop *L = Exit2Loop[Exit];
+    dbgs() << Tabs << Exit->getName() << " = fold "
+           << "() "
+           << L->getHeader()->getName() << " "
+           << "Range(...) \n";
+  }
+
+  void latch(BasicBlock *Latch) {
+    Loop *L = Latch2Loop[Latch];
+    auto LiveOuts = L->getExitBlock()->phis();
+    Executor E;
+    if (!LiveOuts.empty()) {
+      for (auto &LO : LiveOuts)
+        dbgs() << Tabs << E.SExpr(&LO) << " ";
+    } else {
+      auto *Inst = MemInst->getMemoryInst();
+      if (LI.getLoopFor(Inst->getParent()) == L)
+        dbgs() << Tabs << E.SExpr(MemInst->getMemoryInst()) << " ";
+      else {
+        // nearest clobber
+        auto *LatchPhi = MSSA.getMemoryAccess(Latch);
+
+      }
+    }
+    dbgs() << "\n";
+  }
+
+  void analyzeMemory(Function *F) {
+    for (auto &BB : *F) {
+      const auto *Defs = MSSA.getBlockDefs(&BB);
+      if (Defs) {
+        for (const auto &MA : *Defs) {
+          if (auto *D = dyn_cast<MemoryDef>(&MA)) {
+            assert(!MemPtr && "only 1 stored ptr supported right now");
+            MemInst = D;
+          }
+        }
+      }
+    }
+    if (MemInst) {
+      auto *Ptr = SE.getSCEV(MemInst->getMemoryInst()->getOperand(1));
+      auto *Base = dyn_cast<SCEVUnknown>(SE.getPointerBase(Ptr));
+      MemPtr = Base->getValue();
+      dbgs() << getNameOrAsOperand(MemPtr) << " is modified\n";
+    }
+  }
+
+};
+
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   outs() << F.getName() << "\n";
   for (auto &A : F.args()) {
@@ -1682,8 +1836,10 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   MSSA.ensureOptimizedUses();
   auto *Walker = MSSA.getWalker();
 
+  Lambda Lam(LI, SE, MSSA);
+  Lam.translate(F);
 
-
+  return PreservedAnalyses::all();
   Node *LO;
   std::vector<LevelBounds> Levels;
   struct CSRLevels CSR;
