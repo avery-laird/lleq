@@ -204,6 +204,11 @@ public:
       return "*";
     case Instruction::FNeg:
       return "-";
+    case Instruction::ICmp:
+      auto Pred = dyn_cast<ICmpInst>(&Op)->getSignedPredicate();
+      if (Pred == CmpInst::Predicate::ICMP_SGT)
+        return ">";
+      llvm_unreachable("unsupported ICmp predicate.");
     }
   }
 
@@ -231,6 +236,13 @@ public:
       return "(+ (* " + A + " " + B + ") " + C + ")";
 
     }
+  }
+
+  std::string visitICmpInst(ICmpInst &I) {
+    auto Left = SExpr(I.getOperand(0));
+    auto Right = SExpr(I.getOperand(1));
+    auto Cmp = instToOp(I);
+    return "(" + Cmp + " " + Left + " " + Right + ")";
   }
 
   std::string visitInstruction(Instruction &I) { return visit(I); }
@@ -1713,6 +1725,7 @@ public:
       if (Latch2Loop[BB]) {
         Tabs.pop_back();
         latch(BB);
+        dbgs() << " in\n";
       }
       else if (Exit2Loop[BB]) {
         exit(BB);
@@ -1746,13 +1759,15 @@ public:
           Ps << getNameOrAsOperand(IV);
         }
 
-        dbgs() << Tabs << BB->getName() << " = λ" <<  StrParam << ". \n";
+        dbgs() << Tabs << "let " << BB->getName() << " = λ" <<  StrParam << ". \n";
 
         if (Header != Latch)
           Tabs += "\t";
         else
           latch(Latch);
+        dbgs() << " in\n";
       } else {
+        bb(BB);
 //        dbgs() << Tabs << BB->getName();
 //        if (Latch2Loop[BB])
 //          dbgs() << " (end " << Latch2Loop[BB]->getHeader()->getName() << ")";
@@ -1771,12 +1786,37 @@ private:
   DenseMap<BasicBlock*, Loop*> Latch2Loop;
   std::string Tabs = "";
 
+  void phi(PHINode *P) {
+    dbgs() << "<empty>";
+  }
+
+  void bb(BasicBlock *BB) {
+    Executor E;
+    for (auto &P : BB->phis()) {
+      dbgs() << Tabs << "let " << getNameOrAsOperand(&P) << " = ";
+      phi(&P);
+      dbgs() << " in\n";
+    }
+    auto *I = BB->getFirstNonPHI();
+    auto *T = BB->getTerminator();
+    while (I && I != T) {
+      dbgs() << Tabs << "let " << getNameOrAsOperand(I) << " = " << E.SExpr(I) << " in\n";
+      I = I->getNextNode();
+    }
+    if (auto *Ret = dyn_cast<ReturnInst>(T)) {
+      if (!Ret->getReturnValue())
+        dbgs() << getNameOrAsOperand(MemPtr) << "\n";
+      else
+        dbgs() << getNameOrAsOperand(Ret->getReturnValue()) << "\n";
+    }
+  }
+
   void exit(BasicBlock *Exit) {
     Loop *L = Exit2Loop[Exit];
-    dbgs() << Tabs << Exit->getName() << " = fold "
+    dbgs() << Tabs << "let " << getNameOrAsOperand(&*Exit->phis().begin()) << " = fold "
            << "() "
            << L->getHeader()->getName() << " "
-           << "Range(...) \n";
+           << "Range(...) in\n";
   }
 
   void latch(BasicBlock *Latch) {
@@ -1796,7 +1836,7 @@ private:
 
       }
     }
-    dbgs() << "\n";
+//    dbgs() << "\n";
   }
 
   void analyzeMemory(Function *F) {
