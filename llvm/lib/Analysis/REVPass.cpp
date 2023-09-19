@@ -1718,6 +1718,14 @@ public:
     ReversePostOrderTraversal<Function*> RPOT(&F);
     SmallPtrSet<BasicBlock*, 5> Visited;
 
+    std::string Params = "";
+    for (auto &Arg : F.args()) {
+      if (&Arg != &*F.arg_begin()) Params += " ";
+      Params += getNameOrAsOperand(&Arg);
+    }
+    dbgs() << "let " << F.getName() << " = λ" << Params << ".\n";
+    Tabs += "\t";
+
     for (auto *BB : RPOT) {
       if (Visited.contains(BB))
         continue;
@@ -1787,7 +1795,21 @@ private:
   std::string Tabs = "";
 
   void phi(PHINode *P) {
-    dbgs() << "<empty>";
+    Executor E;
+    assert(P->getNumIncomingValues() == 2 && "only 2 incoming vals supported right now");
+    auto *B1 = P->getIncomingBlock(0);
+    auto *B2 = P->getIncomingBlock(1);
+    auto *Br1 = dyn_cast<BranchInst>(B1->getTerminator());
+    auto *Br2 = dyn_cast<BranchInst>(B2->getTerminator());
+    auto *Then = Br1->isConditional() ? Br1 : Br2;
+    auto *Else = Br1->isConditional() ? Br2 : Br1;
+    assert(Else->isUnconditional() && "unsupported control flow.");
+    auto Cond = getNameOrAsOperand(Then->getCondition());
+    if (Then->getOperand(1) == P->getParent()) // False target
+      Cond = "(not " + Cond + ")";
+    dbgs() << "if " << Cond;
+    dbgs() << " then " << E.SExpr(P->getIncomingValueForBlock(Then->getParent()));
+    dbgs() << " else " << E.SExpr(P->getIncomingValueForBlock(Else->getParent()));
   }
 
   void bb(BasicBlock *BB) {
@@ -1805,18 +1827,33 @@ private:
     }
     if (auto *Ret = dyn_cast<ReturnInst>(T)) {
       if (!Ret->getReturnValue())
-        dbgs() << getNameOrAsOperand(MemPtr) << "\n";
+        dbgs() << Tabs << getNameOrAsOperand(MemPtr) << "\n";
       else
-        dbgs() << getNameOrAsOperand(Ret->getReturnValue()) << "\n";
+        dbgs() << Tabs << getNameOrAsOperand(Ret->getReturnValue()) << "\n";
     }
   }
 
   void exit(BasicBlock *Exit) {
+    Executor E;
     Loop *L = Exit2Loop[Exit];
-    dbgs() << Tabs << "let " << getNameOrAsOperand(&*Exit->phis().begin()) << " = fold "
-           << "() "
+    auto *Header = L->getHeader();
+    auto *IV = L->getInductionVariable(SE);
+    auto B = L->getBounds(SE);
+    auto Start = E.SExpr(B->getInitialIVValue());
+    auto End = E.SExpr(B->getFinalIVValue());
+    std::string Base = "";
+    auto Params = make_filter_range(Header->phis(),
+                                    [IV](PHINode &P) { return &P != IV; });
+    std::string Args = "";
+    for (auto &P : Params) {
+      if (&P != &*Params.begin()) Args += ", ";
+      Args += E.SExpr(P.getIncomingValueForBlock(L->getLoopPreheader()));
+    }
+
+    dbgs() << Tabs << "let " << getNameOrAsOperand(&*Exit->phis().begin()) << " = fold"
+           << " (" << Args << ") "
            << L->getHeader()->getName() << " "
-           << "Range(...) in\n";
+           << "Range(" << Start << ", " << End << ")" << " in\n";
   }
 
   void latch(BasicBlock *Latch) {
