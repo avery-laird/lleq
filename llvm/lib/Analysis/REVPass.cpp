@@ -140,8 +140,17 @@ public:
 
 class Exp {
 public:
+  enum ExpKind {
+      EK_Var, EK_Abs, EK_Apply,
+      EK_Builtin, EK_IfThen, EK_Let,
+      EK_Tuple, EK_MemLoad, EK_MemStore
+  };
+  Exp(ExpKind K) : Kind(K) {}
   virtual void print(raw_ostream &OS) const = 0;
   void dump() { print(dbgs()); }
+  ExpKind getKind() const { return Kind; }
+private:
+  const ExpKind Kind;
 };
 raw_ostream &operator<<(raw_ostream &OS, Exp const &E) {
   E.print(OS);
@@ -151,9 +160,9 @@ raw_ostream &operator<<(raw_ostream &OS, Exp const &E) {
 class Var : public Exp {
   std::vector<Value*> Elems;
 public:
-  Var(Value* V) { Elems.push_back(V); }
-  Var(std::vector<Value*> &Elems) : Elems(Elems) {}
-  Var(iterator_range<Function::arg_iterator> Args) {
+  Var(Value* V) : Exp(EK_Var) { Elems.push_back(V); }
+  Var(std::vector<Value*> &Elems) : Exp(EK_Var), Elems(Elems) {}
+  Var(iterator_range<Function::arg_iterator> Args) : Exp(EK_Var) {
     for (auto &A : Args)
       Elems.push_back(&A);
   }
@@ -169,7 +178,10 @@ class Abs : public Exp {
   Var *Params = nullptr;
   Exp *Body = nullptr;
 public:
-  Abs(Var *P, Exp *B) : Params(P), Body(B) {}
+  Abs(Var *P, Exp *B) : Exp(EK_Abs), Params(P), Body(B) {}
+  void print(raw_ostream &OS) const {
+    OS << "λ" << *Params << ". " << *Body;
+  }
 };
 class Apply : public Exp {};
 class Builtin : public Exp {
@@ -208,10 +220,10 @@ public:
   };
   SupportedOps Op;
 
-  Builtin(Instruction *Op, Exp *L, Exp *R) : InstOp(Op), Es({L, R}) {
+  Builtin(Instruction *Op, Exp *L, Exp *R) : Exp(EK_Builtin), InstOp(Op), Es({L, R}) {
     makeOp();
   }
-  Builtin(SupportedOps Op, Exp *E) : Op(Op), Es({E}) {}
+  Builtin(SupportedOps Op, Exp *E) : Exp(EK_Builtin), Op(Op), Es({E}) {}
   static Builtin *mkNot(Exp *E) {
     return new Builtin(Not, E);
   }
@@ -233,7 +245,7 @@ class IfThen : public Exp {
   Exp *Then;
   Exp *Else;
 public:
-  IfThen(Exp *C, Exp *T, Exp *E) : C(C), Then(T), Else(E) {}
+  IfThen(Exp *C, Exp *T, Exp *E) : Exp(EK_IfThen), C(C), Then(T), Else(E) {}
   void print(raw_ostream &OS) const {
     OS << "if " << *C << " then " << *Then << " else " << *Else;
   }
@@ -243,9 +255,21 @@ class Let : public Exp {
   Exp *V;
   Exp *B;
 public:
-  Let(Var *L, Exp *V, Exp *B) : L(L), V(V), B(B) {}
+  Let(Var *L, Exp *V, Exp *B) : Exp(EK_Let), L(L), V(V), B(B) {}
+  Let() : Exp(EK_Let), L(nullptr), V(nullptr), B(nullptr) {}
   void print(raw_ostream &OS) const {
     OS << "let " << *L << " = " << *V << " in " << *B << "\n";
+  }
+  void insert(Exp *E) { // TODO cache bottom ptr to make O(1) not O(n)
+    if (B == nullptr) {
+      B = E;
+    } else if (auto *Chain = dyn_cast<Let>(B)) {
+      Chain->insert(E);
+    } else
+        llvm_unreachable("something weird");
+  }
+  static bool classof(const Exp *E) {
+    return E->getKind() == EK_Let;
   }
 };
 class Tuple : public Exp {};
@@ -254,7 +278,7 @@ class MemLoad : public Exp {
   Exp *Idx;
   LoadInst *L = nullptr;
 public:
-  MemLoad(Exp *Ptr, Exp *Idx, LoadInst *L) : Ptr(Ptr), Idx(Idx), L(L) {}
+  MemLoad(Exp *Ptr, Exp *Idx, LoadInst *L) : Exp(EK_MemLoad), Ptr(Ptr), Idx(Idx), L(L) {}
   void print(raw_ostream &OS) const {
     OS << *Ptr << "[" << *Idx << "]";
   }
@@ -264,11 +288,14 @@ class MemStore : public Exp {};
 // inline everything except for loads
 class Inline : public InstVisitor<Inline, Exp*> {
 public:
-//  Inline(raw_ostream &OS) : OS(OS) {}
+  Inline(DominatorTree &DT) : DT(DT) {}
 
   Exp *run(Value *V) {
-    if (auto *I = dyn_cast<Instruction>(V))
-      return visit(I);
+    if (auto *I = dyn_cast<Instruction>(V)) {
+        Exp *Result = visit(I);
+        Var *Left = new Var(I);
+        return new Let(Left, Result, {});
+    }
     return new Var(V);
   }
 
@@ -304,10 +331,33 @@ public:
 
   Exp *visitCmpInst(CmpInst &I) { return visitBinOrCmp(I); }
 
+  Exp *visitPHINode(PHINode &I) {
+    if (I.getNumIncomingValues() == 1)
+      return new Var(I.getOperand(0));
+    auto *BB1 = I.getIncomingBlock(0);
+    auto *BB2 = I.getIncomingBlock(1);
+    auto *Denom = DT.findNearestCommonDominator(BB1, BB2);
+    auto *Br = dyn_cast<BranchInst>(Denom->getTerminator());
+    assert(Br && Br->isConditional() && "something weird");
+    auto *True = Br->getSuccessor(0);
+    auto *False = Br->getSuccessor(1);
+    auto *Cond = Br->getCondition();
+    Value *Then, *Else;
+    if (DT.dominates(True, I.getIncomingBlock(0))) {
+      Then = I.getIncomingValue(0);
+      Else = I.getIncomingValue(1);
+    } else {
+      assert(DT.dominates(True, I.getIncomingBlock(1)) && "something weird");
+      Else = I.getIncomingValue(0);
+      Then = I.getIncomingValue(1);
+    }
+    IfThen(run(Cond), run(Then), run(Else));
+  }
+
   Exp *visitInstruction(Instruction &I) { return visit(I); }
 
 private:
-//  raw_ostream &OS;
+  DominatorTree &DT;
 };
 
 class Executor : public InstVisitor<Executor, std::string> {
@@ -1884,7 +1934,7 @@ Value *findLiveOut(Loop *L, LoopInfo *LI) {
 class LambdaV2 {
 public:
   LambdaV2(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA)
-      : LI(LI), SE(SE), MSSA(MSSA), ToLam(Inline()), DT(MSSA.getDomTree()) {}
+      : LI(LI), SE(SE), MSSA(MSSA), DT(MSSA.getDomTree()), ToLam(Inline(DT)) {}
 
 
   void translate(Function &F) {
@@ -1894,10 +1944,21 @@ public:
     ReversePostOrderTraversal<Function*> RPOT(&F);
     SmallPtrSet<BasicBlock*, 5> Visited;
 
+    BasicBlock *RetBlock = nullptr;
+    for (auto &BB : F) {
+      if (isa<ReturnInst>(BB.getTerminator())) {
+        assert(RetBlock == nullptr && "only one exit block allowed right now");
+        RetBlock = &BB;
+      }
+    }
+
     // make first Abs
     Var Params(F.args());
-
     Params.dump();
+    Exp *Body = translateBB(RetBlock);
+    Abs LFunc = Abs(&Params, Body);
+    Var FuncVar = Var(&F);
+//    Top = Body;
 
     for (auto *BB : RPOT) {
       if (Visited.contains(BB))
@@ -1937,9 +1998,11 @@ private:
   Value *MemPtr = nullptr;
   DenseMap<BasicBlock*, Loop*> Exit2Loop;
   DenseMap<BasicBlock*, Loop*> Latch2Loop;
-  Inline ToLam;
   DominatorTree &DT;
+  Inline ToLam;
   std::string Tabs = "";
+  Let *Top = nullptr;
+  DenseMap<Value*, Exp*> ExprMap;
 
   Exp *phi(PHINode *P) {
     assert(P->getNumIncomingValues() == 2 && "only 2 incoming vals supported right now");
@@ -1959,7 +2022,6 @@ private:
   }
 
   void bb(BasicBlock *BB) {
-    std::vector<Exp*> Es;
     for (auto &P : BB->phis()) {
       if (P.getNumIncomingValues() == 1)
         continue; // let left = right
@@ -1984,7 +2046,13 @@ private:
       dbgs() << "condition = " << getNameOrAsOperand(Cond) << "\n";
       dbgs() << "true branch = " << getNameOrAsOperand(Then) << "\n";
       dbgs() << "else branch = " << getNameOrAsOperand(Else) << "\n";
-
+      IfThen(ToLam.run(Cond), ToLam.run(Then), ToLam.run(Else));
+    }
+    auto *I = BB->getFirstNonPHI();
+    auto *T = BB->getTerminator();
+    while (I && I != T) {
+      Top->insert(ToLam.run(I));
+      I = I->getNextNode();
     }
   }
 
@@ -2050,204 +2118,208 @@ private:
       dbgs() << getNameOrAsOperand(MemPtr) << " is modified\n";
     }
   }
-};
 
-class Lambda {
-public:
-  Lambda(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA)
-      : LI(LI), SE(SE), MSSA(MSSA), ToLam(Inline()) {}
+  Exp *translateBB(BasicBlock *BB) {
 
-
-  void translate(Function &F) {
-    analyzeMemory(&F);
-    Exit2Loop.clear();
-    Latch2Loop.clear();
-    ReversePostOrderTraversal<Function*> RPOT(&F);
-    SmallPtrSet<BasicBlock*, 5> Visited;
-
-    // make first Abs
-    Var Params1(F.args());
-
-
-    std::string Params = "";
-    for (auto &Arg : F.args()) {
-      if (&Arg != &*F.arg_begin()) Params += " ";
-      Params += getNameOrAsOperand(&Arg);
-    }
-    dbgs() << "let " << F.getName() << " = λ" << Params << ".\n";
-    Tabs += "\t";
-
-    for (auto *BB : RPOT) {
-      if (Visited.contains(BB))
-        continue;
-      Visited.insert(BB);
-      if (Latch2Loop[BB]) {
-        Tabs.pop_back();
-        latch(BB);
-        dbgs() << " in\n";
-      }
-      else if (Exit2Loop[BB]) {
-        exit(BB);
-      }
-      else if (LI.isLoopHeader(BB)) {
-        auto *Header = BB;
-        auto *L = LI.getLoopFor(Header);
-        auto *Latch = L->getLoopLatch();
-        auto *ExitBlock = L->getExitBlock();
-        auto *IV = L->getInductionVariable(SE);
-        auto Params = make_filter_range(Header->phis(),
-                                        [IV](PHINode &P) { return &P != IV; });
-        Exit2Loop[ExitBlock] = L;
-        Latch2Loop[Latch] = L;
-        auto *MemPhi = MSSA.getMemoryAccess(Header);
-        auto LiveOuts = ExitBlock->phis();
-        assert((!MemPhi || LiveOuts.empty()) && "simultaneous memory and scalar output not supported right now.");
-        std::string StrParam = "";
-        if (MemPhi) {
-          auto *Clob = MSSA.getWalker()->getClobberingMemoryAccess(MemPhi);
-          StrParam += getNameOrAsOperand(MemPtr) + " ";
-        }
-        {
-          raw_string_ostream Ps(StrParam);
-          ListSeparator LS(" ");
-          for (auto &Phi : Params) {
-            Ps << LS << getNameOrAsOperand(&Phi);
-          }
-          if (!Params.empty())
-            Ps << " ";
-          Ps << getNameOrAsOperand(IV);
-        }
-
-        dbgs() << Tabs << "let " << BB->getName() << " = λ" <<  StrParam << ". \n";
-
-        if (Header != Latch)
-          Tabs += "\t";
-        else
-          latch(Latch);
-        dbgs() << " in\n";
-      } else {
-        bb(BB);
-//        dbgs() << Tabs << BB->getName();
-//        if (Latch2Loop[BB])
-//          dbgs() << " (end " << Latch2Loop[BB]->getHeader()->getName() << ")";
-//        dbgs() << "\n";
-      }
-    }
-  }
-
-private:
-  LoopInfo &LI;
-  ScalarEvolution &SE;
-  MemorySSA &MSSA;
-  const MemoryDef *MemInst = nullptr;
-  Value *MemPtr = nullptr;
-  DenseMap<BasicBlock*, Loop*> Exit2Loop;
-  DenseMap<BasicBlock*, Loop*> Latch2Loop;
-  Inline ToLam;
-  std::string Tabs = "";
-
-  void phi(PHINode *P) {
-    Executor E;
-    assert(P->getNumIncomingValues() == 2 && "only 2 incoming vals supported right now");
-    auto *B1 = P->getIncomingBlock(0);
-    auto *B2 = P->getIncomingBlock(1);
-    auto *Br1 = dyn_cast<BranchInst>(B1->getTerminator());
-    auto *Br2 = dyn_cast<BranchInst>(B2->getTerminator());
-    auto *Then = Br1->isConditional() ? Br1 : Br2;
-    auto *Else = Br1->isConditional() ? Br2 : Br1;
-    assert(Else->isUnconditional() && "unsupported control flow.");
-    auto Cond = getNameOrAsOperand(Then->getCondition());
-    if (Then->getOperand(1) == P->getParent()) // False target
-      Cond = "(not " + Cond + ")";
-    dbgs() << "if " << Cond;
-    dbgs() << " then " << E.SExpr(P->getIncomingValueForBlock(Then->getParent()));
-    dbgs() << " else " << E.SExpr(P->getIncomingValueForBlock(Else->getParent()));
-  }
-
-  void bb(BasicBlock *BB) {
-    Executor E;
-    for (auto &P : BB->phis()) {
-      dbgs() << Tabs << "let " << getNameOrAsOperand(&P) << " = ";
-      phi(&P);
-      dbgs() << " in\n";
-    }
-    auto *I = BB->getFirstNonPHI();
-    auto *T = BB->getTerminator();
-    while (I && I != T) {
-      dbgs() << Tabs << "let " << getNameOrAsOperand(I) << " = " << E.SExpr(I) << " in\n";
-      I = I->getNextNode();
-    }
-    if (auto *Ret = dyn_cast<ReturnInst>(T)) {
-      if (!Ret->getReturnValue())
-        dbgs() << Tabs << getNameOrAsOperand(MemPtr) << "\n";
-      else
-        dbgs() << Tabs << getNameOrAsOperand(Ret->getReturnValue()) << "\n";
-    }
-  }
-
-  void exit(BasicBlock *Exit) {
-    Executor E;
-    Loop *L = Exit2Loop[Exit];
-    auto *Header = L->getHeader();
-    auto *IV = L->getInductionVariable(SE);
-    auto B = L->getBounds(SE);
-    auto Start = E.SExpr(B->getInitialIVValue());
-    auto End = E.SExpr(B->getFinalIVValue());
-    std::string Base = "";
-    auto Params = make_filter_range(Header->phis(),
-                                    [IV](PHINode &P) { return &P != IV; });
-    std::string Args = "";
-    for (auto &P : Params) {
-      if (&P != &*Params.begin()) Args += ", ";
-      Args += E.SExpr(P.getIncomingValueForBlock(L->getLoopPreheader()));
-    }
-
-    dbgs() << Tabs << "let " << getNameOrAsOperand(&*Exit->phis().begin()) << " = fold"
-           << " (" << Args << ") "
-           << L->getHeader()->getName() << " "
-           << "Range(" << Start << ", " << End << ")" << " in\n";
-  }
-
-  void latch(BasicBlock *Latch) {
-    Loop *L = Latch2Loop[Latch];
-    auto LiveOuts = L->getExitBlock()->phis();
-    Executor E;
-    if (!LiveOuts.empty()) {
-      for (auto &LO : LiveOuts)
-        dbgs() << Tabs << E.SExpr(LO.getIncomingValue(0)) << " ";
-    } else {
-      auto *Inst = MemInst->getMemoryInst();
-      if (LI.getLoopFor(Inst->getParent()) == L)
-        dbgs() << Tabs << E.SExpr(MemInst->getMemoryInst()) << " ";
-      else {
-        // nearest clobber
-        auto *LatchPhi = MSSA.getMemoryAccess(Latch);
-
-      }
-    }
-//    dbgs() << "\n";
-  }
-
-  void analyzeMemory(Function *F) {
-    for (auto &BB : *F) {
-      const auto *Defs = MSSA.getBlockDefs(&BB);
-      if (Defs) {
-        for (const auto &MA : *Defs) {
-          if (auto *D = dyn_cast<MemoryDef>(&MA)) {
-            assert(!MemPtr && "only 1 stored ptr supported right now");
-            MemInst = D;
-          }
-        }
-      }
-    }
-    if (MemInst) {
-      auto *Ptr = SE.getSCEV(MemInst->getMemoryInst()->getOperand(1));
-      auto *Base = dyn_cast<SCEVUnknown>(SE.getPointerBase(Ptr));
-      MemPtr = Base->getValue();
-      dbgs() << getNameOrAsOperand(MemPtr) << " is modified\n";
-    }
   }
 };
+
+//class Lambda {
+//public:
+//  Lambda(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA)
+//      : LI(LI), SE(SE), MSSA(MSSA), ToLam(Inline()) {}
+//
+//
+//  void translate(Function &F) {
+//    analyzeMemory(&F);
+//    Exit2Loop.clear();
+//    Latch2Loop.clear();
+//    ReversePostOrderTraversal<Function*> RPOT(&F);
+//    SmallPtrSet<BasicBlock*, 5> Visited;
+//
+//    // make first Abs
+//    Var Params1(F.args());
+//
+//
+//    std::string Params = "";
+//    for (auto &Arg : F.args()) {
+//      if (&Arg != &*F.arg_begin()) Params += " ";
+//      Params += getNameOrAsOperand(&Arg);
+//    }
+//    dbgs() << "let " << F.getName() << " = λ" << Params << ".\n";
+//    Tabs += "\t";
+//
+//    for (auto *BB : RPOT) {
+//      if (Visited.contains(BB))
+//        continue;
+//      Visited.insert(BB);
+//      if (Latch2Loop[BB]) {
+//        Tabs.pop_back();
+//        latch(BB);
+//        dbgs() << " in\n";
+//      }
+//      else if (Exit2Loop[BB]) {
+//        exit(BB);
+//      }
+//      else if (LI.isLoopHeader(BB)) {
+//        auto *Header = BB;
+//        auto *L = LI.getLoopFor(Header);
+//        auto *Latch = L->getLoopLatch();
+//        auto *ExitBlock = L->getExitBlock();
+//        auto *IV = L->getInductionVariable(SE);
+//        auto Params = make_filter_range(Header->phis(),
+//                                        [IV](PHINode &P) { return &P != IV; });
+//        Exit2Loop[ExitBlock] = L;
+//        Latch2Loop[Latch] = L;
+//        auto *MemPhi = MSSA.getMemoryAccess(Header);
+//        auto LiveOuts = ExitBlock->phis();
+//        assert((!MemPhi || LiveOuts.empty()) && "simultaneous memory and scalar output not supported right now.");
+//        std::string StrParam = "";
+//        if (MemPhi) {
+//          auto *Clob = MSSA.getWalker()->getClobberingMemoryAccess(MemPhi);
+//          StrParam += getNameOrAsOperand(MemPtr) + " ";
+//        }
+//        {
+//          raw_string_ostream Ps(StrParam);
+//          ListSeparator LS(" ");
+//          for (auto &Phi : Params) {
+//            Ps << LS << getNameOrAsOperand(&Phi);
+//          }
+//          if (!Params.empty())
+//            Ps << " ";
+//          Ps << getNameOrAsOperand(IV);
+//        }
+//
+//        dbgs() << Tabs << "let " << BB->getName() << " = λ" <<  StrParam << ". \n";
+//
+//        if (Header != Latch)
+//          Tabs += "\t";
+//        else
+//          latch(Latch);
+//        dbgs() << " in\n";
+//      } else {
+//        bb(BB);
+////        dbgs() << Tabs << BB->getName();
+////        if (Latch2Loop[BB])
+////          dbgs() << " (end " << Latch2Loop[BB]->getHeader()->getName() << ")";
+////        dbgs() << "\n";
+//      }
+//    }
+//  }
+//
+//private:
+//  LoopInfo &LI;
+//  ScalarEvolution &SE;
+//  MemorySSA &MSSA;
+//  const MemoryDef *MemInst = nullptr;
+//  Value *MemPtr = nullptr;
+//  DenseMap<BasicBlock*, Loop*> Exit2Loop;
+//  DenseMap<BasicBlock*, Loop*> Latch2Loop;
+//  Inline ToLam;
+//  std::string Tabs = "";
+//
+//  void phi(PHINode *P) {
+//    Executor E;
+//    assert(P->getNumIncomingValues() == 2 && "only 2 incoming vals supported right now");
+//    auto *B1 = P->getIncomingBlock(0);
+//    auto *B2 = P->getIncomingBlock(1);
+//    auto *Br1 = dyn_cast<BranchInst>(B1->getTerminator());
+//    auto *Br2 = dyn_cast<BranchInst>(B2->getTerminator());
+//    auto *Then = Br1->isConditional() ? Br1 : Br2;
+//    auto *Else = Br1->isConditional() ? Br2 : Br1;
+//    assert(Else->isUnconditional() && "unsupported control flow.");
+//    auto Cond = getNameOrAsOperand(Then->getCondition());
+//    if (Then->getOperand(1) == P->getParent()) // False target
+//      Cond = "(not " + Cond + ")";
+//    dbgs() << "if " << Cond;
+//    dbgs() << " then " << E.SExpr(P->getIncomingValueForBlock(Then->getParent()));
+//    dbgs() << " else " << E.SExpr(P->getIncomingValueForBlock(Else->getParent()));
+//  }
+//
+//  void bb(BasicBlock *BB) {
+//    Executor E;
+//    for (auto &P : BB->phis()) {
+//      dbgs() << Tabs << "let " << getNameOrAsOperand(&P) << " = ";
+//      phi(&P);
+//      dbgs() << " in\n";
+//    }
+//    auto *I = BB->getFirstNonPHI();
+//    auto *T = BB->getTerminator();
+//    while (I && I != T) {
+//      dbgs() << Tabs << "let " << getNameOrAsOperand(I) << " = " << E.SExpr(I) << " in\n";
+//      I = I->getNextNode();
+//    }
+//    if (auto *Ret = dyn_cast<ReturnInst>(T)) {
+//      if (!Ret->getReturnValue())
+//        dbgs() << Tabs << getNameOrAsOperand(MemPtr) << "\n";
+//      else
+//        dbgs() << Tabs << getNameOrAsOperand(Ret->getReturnValue()) << "\n";
+//    }
+//  }
+//
+//  void exit(BasicBlock *Exit) {
+//    Executor E;
+//    Loop *L = Exit2Loop[Exit];
+//    auto *Header = L->getHeader();
+//    auto *IV = L->getInductionVariable(SE);
+//    auto B = L->getBounds(SE);
+//    auto Start = E.SExpr(B->getInitialIVValue());
+//    auto End = E.SExpr(B->getFinalIVValue());
+//    std::string Base = "";
+//    auto Params = make_filter_range(Header->phis(),
+//                                    [IV](PHINode &P) { return &P != IV; });
+//    std::string Args = "";
+//    for (auto &P : Params) {
+//      if (&P != &*Params.begin()) Args += ", ";
+//      Args += E.SExpr(P.getIncomingValueForBlock(L->getLoopPreheader()));
+//    }
+//
+//    dbgs() << Tabs << "let " << getNameOrAsOperand(&*Exit->phis().begin()) << " = fold"
+//           << " (" << Args << ") "
+//           << L->getHeader()->getName() << " "
+//           << "Range(" << Start << ", " << End << ")" << " in\n";
+//  }
+//
+//  void latch(BasicBlock *Latch) {
+//    Loop *L = Latch2Loop[Latch];
+//    auto LiveOuts = L->getExitBlock()->phis();
+//    Executor E;
+//    if (!LiveOuts.empty()) {
+//      for (auto &LO : LiveOuts)
+//        dbgs() << Tabs << E.SExpr(LO.getIncomingValue(0)) << " ";
+//    } else {
+//      auto *Inst = MemInst->getMemoryInst();
+//      if (LI.getLoopFor(Inst->getParent()) == L)
+//        dbgs() << Tabs << E.SExpr(MemInst->getMemoryInst()) << " ";
+//      else {
+//        // nearest clobber
+//        auto *LatchPhi = MSSA.getMemoryAccess(Latch);
+//
+//      }
+//    }
+////    dbgs() << "\n";
+//  }
+//
+//  void analyzeMemory(Function *F) {
+//    for (auto &BB : *F) {
+//      const auto *Defs = MSSA.getBlockDefs(&BB);
+//      if (Defs) {
+//        for (const auto &MA : *Defs) {
+//          if (auto *D = dyn_cast<MemoryDef>(&MA)) {
+//            assert(!MemPtr && "only 1 stored ptr supported right now");
+//            MemInst = D;
+//          }
+//        }
+//      }
+//    }
+//    if (MemInst) {
+//      auto *Ptr = SE.getSCEV(MemInst->getMemoryInst()->getOperand(1));
+//      auto *Base = dyn_cast<SCEVUnknown>(SE.getPointerBase(Ptr));
+//      MemPtr = Base->getValue();
+//      dbgs() << getNameOrAsOperand(MemPtr) << " is modified\n";
+//    }
+//  }
+//};
 
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   outs() << F.getName() << "\n";
