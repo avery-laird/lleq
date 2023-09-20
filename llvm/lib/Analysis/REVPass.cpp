@@ -16,6 +16,7 @@
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/BasicAliasAnalysis.h"
 #include "llvm/IR/Argument.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstVisitor.h"
@@ -136,6 +137,179 @@ public:
   }
 };
 
+
+class Exp {
+public:
+  virtual void print(raw_ostream &OS) const = 0;
+  void dump() { print(dbgs()); }
+};
+raw_ostream &operator<<(raw_ostream &OS, Exp const &E) {
+  E.print(OS);
+  return OS;
+}
+
+class Var : public Exp {
+  std::vector<Value*> Elems;
+public:
+  Var(Value* V) { Elems.push_back(V); }
+  Var(std::vector<Value*> &Elems) : Elems(Elems) {}
+  Var(iterator_range<Function::arg_iterator> Args) {
+    for (auto &A : Args)
+      Elems.push_back(&A);
+  }
+  void print(raw_ostream &OS) const {
+    OS << "(";
+    ListSeparator LS(", ");
+    for (auto *V : Elems)
+      OS << LS << getNameOrAsOperand(V);
+    OS << ")";
+  }
+};
+class Abs : public Exp {
+  Var *Params = nullptr;
+  Exp *Body = nullptr;
+public:
+  Abs(Var *P, Exp *B) : Params(P), Body(B) {}
+};
+class Apply : public Exp {};
+class Builtin : public Exp {
+  Instruction *InstOp;
+  std::vector<Exp *> Es;
+
+  void makeOp() {
+    switch (InstOp->getOpcode()) {
+    default:
+      llvm_unreachable("unsupported builtin.");
+    case Instruction::ICmp:
+      auto Pred = dyn_cast<CmpInst>(InstOp)->getPredicate();
+      if (Pred == CmpInst::Predicate::ICMP_SGT)
+        Op = GT;
+      else
+        llvm_unreachable("unsupported ICmp predicate.");
+    }
+  }
+  std::string op2String() const {
+    switch (Op) {
+    case Add:
+      return "+";
+    case Mult:
+      return "*";
+    case LT:
+      return "<";
+    case GT:
+      return ">";
+    case Not:
+      return "not";
+    }
+  }
+public:
+  enum SupportedOps {
+    Add, Mult, LT, GT, Not
+  };
+  SupportedOps Op;
+
+  Builtin(Instruction *Op, Exp *L, Exp *R) : InstOp(Op), Es({L, R}) {
+    makeOp();
+  }
+  Builtin(SupportedOps Op, Exp *E) : Op(Op), Es({E}) {}
+  static Builtin *mkNot(Exp *E) {
+    return new Builtin(Not, E);
+  }
+  void print(raw_ostream &OS) const {
+    OS << "("  << op2String() << " ";
+    ListSeparator LS(" ");
+    for (auto *Operand : Es) {
+      OS << LS;
+      Operand->print(OS);
+    }
+    OS << ")";
+  }
+
+
+};
+
+class IfThen : public Exp {
+  Exp *C;
+  Exp *Then;
+  Exp *Else;
+public:
+  IfThen(Exp *C, Exp *T, Exp *E) : C(C), Then(T), Else(E) {}
+  void print(raw_ostream &OS) const {
+    OS << "if " << *C << " then " << *Then << " else " << *Else;
+  }
+};
+class Let : public Exp {
+  Var *L;
+  Exp *V;
+  Exp *B;
+public:
+  Let(Var *L, Exp *V, Exp *B) : L(L), V(V), B(B) {}
+  void print(raw_ostream &OS) const {
+    OS << "let " << *L << " = " << *V << " in " << *B << "\n";
+  }
+};
+class Tuple : public Exp {};
+class MemLoad : public Exp {
+  Exp *Ptr;
+  Exp *Idx;
+  LoadInst *L = nullptr;
+public:
+  MemLoad(Exp *Ptr, Exp *Idx, LoadInst *L) : Ptr(Ptr), Idx(Idx), L(L) {}
+  void print(raw_ostream &OS) const {
+    OS << *Ptr << "[" << *Idx << "]";
+  }
+};
+class MemStore : public Exp {};
+
+// inline everything except for loads
+class Inline : public InstVisitor<Inline, Exp*> {
+public:
+//  Inline(raw_ostream &OS) : OS(OS) {}
+
+  Exp *run(Value *V) {
+    if (auto *I = dyn_cast<Instruction>(V))
+      return visit(I);
+    return new Var(V);
+  }
+
+  Exp *visitLoadInst(LoadInst &I) {
+    // try to construct tensors optimistically
+    auto *GEP = dyn_cast<GetElementPtrInst>(I.getPointerOperand());
+    assert(GEP->getNumIndices() == 1);
+    auto Ptr = visit(GEP);
+    Exp *Idx;
+    if (auto *Index = dyn_cast<Instruction>(GEP->getOperand(1)))
+      Idx = visit(Index);
+    else
+      Idx = new Var(GEP->getOperand(1));
+    return new MemLoad(Ptr, Idx, &I);
+  }
+
+  Exp *visitGetElementPtrInst(GetElementPtrInst &I) {
+    if (auto *Ptr = dyn_cast<Argument>(I.getPointerOperand()))
+      return new Var(Ptr);
+    auto *Inst = dyn_cast<Instruction>(I.getPointerOperand());
+    return visit(Inst);
+  }
+
+  Exp *visitCastInst(CastInst &I) { return run(I.getOperand(0)); }
+
+  Exp *visitBinOrCmp(Instruction &I) {
+    auto Left = run(I.getOperand(0));
+    auto Right = run(I.getOperand(1));
+    return new Builtin(&I, Left, Right);
+  }
+
+  Exp *visitBinaryOperator(BinaryOperator &I) { return visitBinOrCmp(I); }
+
+  Exp *visitCmpInst(CmpInst &I) { return visitBinOrCmp(I); }
+
+  Exp *visitInstruction(Instruction &I) { return visit(I); }
+
+private:
+//  raw_ostream &OS;
+};
+
 class Executor : public InstVisitor<Executor, std::string> {
 public:
   //  Loop *L;
@@ -185,6 +359,7 @@ public:
     auto PhiType = Type2String(I.getType());
     return "(" + PhiType + " " + getNameOrAsOperand(&I) + ")";
   }
+
   std::string visitCastInst(CastInst &I) {
     if (auto *Inst = dyn_cast<Instruction>(I.getOperand(0)))
       return visit(Inst);
@@ -1326,241 +1501,241 @@ Value *findLiveOut(Loop *L, LoopInfo *LI) {
   return StoreInsts[0];
 }
 
-class Translate {
-public:
-
-  Translate(LoopInfo *LI, ScalarEvolution *SE, MemorySSA *MSSA)
-      : LI(LI), SE(SE), MSSA(MSSA) {
-    Out = new raw_string_ostream(StrOutput);
-  }
-
-  ~Translate() {
-    delete Out;
-  }
-
-  void visit(Function *F) {
-    analyzeMemory(F);
-    auto *Entry = &F->getEntryBlock();
-    visitBB(Entry, nullptr);
-  }
-
-private:
-  LoopInfo *LI = nullptr;
-  ScalarEvolution *SE = nullptr;
-  MemorySSA *MSSA = nullptr;
-  SmallPtrSet<BasicBlock*, 10> Visited = {};
-  int Indent = 0;
-  std::string StrOutput = "";
-  raw_ostream *Out;
-  const MemoryDef *MemInst = nullptr;
-  Value *MemPtr = nullptr;
-
-  raw_ostream &out() {
-    return *Out;
-  }
-
-  void indent() {
-    Indent++;
-  }
-
-  void deindent() {
-    Indent--;
-  }
-
-  std::string prefix() {
-    std::string Prefix = "";
-    for (int i=0; i < Indent; ++i) Prefix += "\t";
-    return Prefix;
-  }
-
-  void analyzeMemory(Function *F) {
-    for (auto &BB : *F) {
-      const auto *Defs = MSSA->getBlockDefs(&BB);
-      if (Defs) {
-        for (const auto &MA : *Defs) {
-          if (auto *D = dyn_cast<MemoryDef>(&MA)) {
-            assert(!MemPtr && "only 1 stored ptr supported right now");
-            MemInst = D;
-          }
-        }
-      }
-    }
-    if (MemInst) {
-      auto *Ptr = SE->getSCEV(MemInst->getMemoryInst()->getOperand(1));
-      auto *Base = dyn_cast<SCEVUnknown>(SE->getPointerBase(Ptr));
-      MemPtr = Base->getValue();
-      dbgs() << getNameOrAsOperand(MemPtr) << " is modified\n";
-    }
-  }
-
-  void visitBB(BasicBlock *From, BasicBlock *To) {
-    Visited.insert(From);
-    if (LI->isLoopHeader(From)) {
-      visitLoop(LI->getLoopFor(From), To);
-    } else {
-      //    out() << Prefix << From->getName() << ":\n";
-      for (auto &I : *From) {
-        if (&I == From->getTerminator()) break;
-        visitInstruction(&I);
-      }
-      auto *T = From->getTerminator();
-//      if (auto *Ret = dyn_cast<ReturnInst>(T)) {
-//        visitRet(Ret);
+//class Translate {
+//public:
+//
+//  Translate(LoopInfo *LI, ScalarEvolution *SE, MemorySSA *MSSA)
+//      : LI(LI), SE(SE), MSSA(MSSA) {
+//    Out = new raw_string_ostream(StrOutput);
+//  }
+//
+//  ~Translate() {
+//    delete Out;
+//  }
+//
+//  void visit(Function *F) {
+//    analyzeMemory(F);
+//    auto *Entry = &F->getEntryBlock();
+//    visitBB(Entry, nullptr);
+//  }
+//
+//private:
+//  LoopInfo *LI = nullptr;
+//  ScalarEvolution *SE = nullptr;
+//  MemorySSA *MSSA = nullptr;
+//  SmallPtrSet<BasicBlock*, 10> Visited = {};
+//  int Indent = 0;
+//  std::string StrOutput = "";
+//  raw_ostream *Out;
+//  const MemoryDef *MemInst = nullptr;
+//  Value *MemPtr = nullptr;
+//
+//  raw_ostream &out() {
+//    return *Out;
+//  }
+//
+//  void indent() {
+//    Indent++;
+//  }
+//
+//  void deindent() {
+//    Indent--;
+//  }
+//
+//  std::string prefix() {
+//    std::string Prefix = "";
+//    for (int i=0; i < Indent; ++i) Prefix += "\t";
+//    return Prefix;
+//  }
+//
+//  void analyzeMemory(Function *F) {
+//    for (auto &BB : *F) {
+//      const auto *Defs = MSSA->getBlockDefs(&BB);
+//      if (Defs) {
+//        for (const auto &MA : *Defs) {
+//          if (auto *D = dyn_cast<MemoryDef>(&MA)) {
+//            assert(!MemPtr && "only 1 stored ptr supported right now");
+//            MemInst = D;
+//          }
+//        }
 //      }
-      if (From == To)
-        return;
-      wave(T, To);
-    }
-  }
-
-  void visitRet(ReturnInst *Ret) {
-    if (Ret->getType()->isVoidTy())
-      out() << prefix() << getNameOrAsOperand(MemPtr) << "\n";
-    else
-      out() << prefix() << getNameOrAsOperand(Ret->getReturnValue()) << "\n";
-  }
-
-  void wave(Instruction *Terminator, BasicBlock *To) {
-    if (auto *Br = dyn_cast<BranchInst>(Terminator)) {
-      for (auto *O : Br->successors()) {
-        if (all_of(predecessors(O), [&](BasicBlock *P) {
-              if (!Visited.contains(P)) {
-                auto *L = LI->getLoopFor(O);
-                return L && L->getLoopLatch() == P;
-              }
-              return true;
-            }))
-          visitBB(O, To);
-      }
-    }
-  }
-
-  void visitInstruction(Instruction *I) {
-    if (auto *Phi = dyn_cast<PHINode>(I)) {
-      // collect pred. branches
-      out() << prefix() << "let " << getNameOrAsOperand(I) << " = ";
-      if (Phi->getNumIncomingValues() == 1) {
-        out() << getNameOrAsOperand(Phi->getIncomingValue(0)) << " ";
-      } else {
-        for (int V = 0; V < Phi->getNumIncomingValues(); ++V) {
-          auto *Val = Phi->getIncomingValue(V);
-          auto *BB = Phi->getIncomingBlock(V);
-          out() << "if (";
-          auto *T = BB->getTerminator();
-          if (auto *Br = dyn_cast_or_null<BranchInst>(T)) {
-            if (Br->isUnconditional())
-              out() << "true";
-            else {
-              if (Br->getSuccessor(1) == BB) // true
-                out() << getNameOrAsOperand(Br->getCondition());
-              else
-                out() << "!" << getNameOrAsOperand(Br->getCondition());
-            }
-          }
-          out() << ") then " << getNameOrAsOperand(Val) << " ";
-          if (V + 1 < Phi->getNumIncomingValues())
-            out() << "else ";
-        }
-      }
-      out() << "in\n";
-    } else {
-      out() << prefix() << "let " << *I << " in\n";
-    }
-  }
-
-  void visitLoop(Loop *L, BasicBlock *To) {
-    auto *IV = L->getInductionVariable(*SE);
-    auto B = L->getBounds(*SE);
-    auto *Header = L->getHeader();
-    auto *T = Header->getTerminator();
-    auto *Latch = L->getLoopLatch();
-    auto FoldName = Header->getName().str();
-
-    out() << prefix() << "let " << FoldName << " = λ";
-    std::string ArgNames;
-    auto *MPhi = MSSA->getMemoryAccess(Header);
-    if (MPhi) {
-      ArgNames += getNameOrAsOperand(MemPtr) + ".old ";
-    }
-    for (auto &P : Header->phis()) {
-      if (&P == IV) continue;
-      ArgNames += getNameOrAsOperand(&P) + " ";
-    }
-    out() << ArgNames << getNameOrAsOperand(IV) << ".\n";
-
-    indent();
-
-    if (Header == Latch) {
-      Executor E;
-      // outputs
-      auto *LiveOut = &*L->getExitBlock()->phis().begin();
-      assert(!(LiveOut && MPhi) && "simultaneous memory and scalar output not supported right now");
-      if (LiveOut) {
-        out() << prefix() << E.SExpr(LiveOut->getIncomingValue(0));
-        //      out() << prefix() << getNameOrAsOperand(LiveOut->getIncomingValue(0));
-      } else {
-        out() << prefix() << E.SExpr(MemInst->getMemoryInst());
-        //      out() << prefix() << getNameOrAsOperand(MemPtr) + ".new";
-      }
-      out() << "\n";
-    } else {
-      // other code in loop body ending at latch
-      wave(T, Latch);
-    }
-
-    indent();
-
-    out() << prefix() << "let r = fold (";
-    // grab phis
-    ListSeparator LS(", ");
-    std::string OutNames;
-    if (MPhi) {
-      // initial val
-      auto *Incoming = MPhi->getIncomingValueForBlock(L->getLoopPreheader());
-      auto FreshMem = getNameOrAsOperand(MemPtr) + "." + Incoming->getBlock()->getName().str();
-      out() << LS << FreshMem;
-      // ongoing val
-      OutNames += getNameOrAsOperand(MemPtr) + "." + L->getLoopLatch()->getName().str();
-    }
-
-    for (auto &P : Header->phis()) {
-      if (&P == IV)
-        continue;
-      if (&P != &*Header->phis().begin() || MPhi)
-        OutNames += ", ";
-      out() << LS << getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopPreheader()));
-      OutNames += getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopLatch()));
-    }
-
-    out() << ") " << FoldName << " Range(" << getNameOrAsOperand(&B->getInitialIVValue())
-           << ", " << getNameOrAsOperand(&B->getFinalIVValue()) << ") in\n";
-
-    indent();
-    out() << prefix() << "let " << OutNames << " = r in\n";
-    indent();
-    if (MPhi)
-      out() << prefix() << OutNames;
-    else {
-      auto *LiveOut = &*L->getExitBlock()->phis().begin();
-      out() << prefix() << getNameOrAsOperand(LiveOut->getIncomingValue(0));
-    }
-    out() << "\n";
-
-    auto *Exit = L->getExitBlock();
-    visitBB(Exit, To);
-
-    deindent();
-    deindent();
-    deindent();
-    deindent();
-  }
-
-  friend raw_ostream &operator<<(raw_ostream &OS, const Translate &T);
-};
-
-raw_ostream &operator<<(raw_ostream &OS, const Translate &T) {
-  return OS << T.StrOutput;
-}
+//    }
+//    if (MemInst) {
+//      auto *Ptr = SE->getSCEV(MemInst->getMemoryInst()->getOperand(1));
+//      auto *Base = dyn_cast<SCEVUnknown>(SE->getPointerBase(Ptr));
+//      MemPtr = Base->getValue();
+//      dbgs() << getNameOrAsOperand(MemPtr) << " is modified\n";
+//    }
+//  }
+//
+//  void visitBB(BasicBlock *From, BasicBlock *To) {
+//    Visited.insert(From);
+//    if (LI->isLoopHeader(From)) {
+//      visitLoop(LI->getLoopFor(From), To);
+//    } else {
+//      //    out() << Prefix << From->getName() << ":\n";
+//      for (auto &I : *From) {
+//        if (&I == From->getTerminator()) break;
+//        visitInstruction(&I);
+//      }
+//      auto *T = From->getTerminator();
+////      if (auto *Ret = dyn_cast<ReturnInst>(T)) {
+////        visitRet(Ret);
+////      }
+//      if (From == To)
+//        return;
+//      wave(T, To);
+//    }
+//  }
+//
+//  void visitRet(ReturnInst *Ret) {
+//    if (Ret->getType()->isVoidTy())
+//      out() << prefix() << getNameOrAsOperand(MemPtr) << "\n";
+//    else
+//      out() << prefix() << getNameOrAsOperand(Ret->getReturnValue()) << "\n";
+//  }
+//
+//  void wave(Instruction *Terminator, BasicBlock *To) {
+//    if (auto *Br = dyn_cast<BranchInst>(Terminator)) {
+//      for (auto *O : Br->successors()) {
+//        if (all_of(predecessors(O), [&](BasicBlock *P) {
+//              if (!Visited.contains(P)) {
+//                auto *L = LI->getLoopFor(O);
+//                return L && L->getLoopLatch() == P;
+//              }
+//              return true;
+//            }))
+//          visitBB(O, To);
+//      }
+//    }
+//  }
+//
+//  void visitInstruction(Instruction *I) {
+//    if (auto *Phi = dyn_cast<PHINode>(I)) {
+//      // collect pred. branches
+//      out() << prefix() << "let " << getNameOrAsOperand(I) << " = ";
+//      if (Phi->getNumIncomingValues() == 1) {
+//        out() << getNameOrAsOperand(Phi->getIncomingValue(0)) << " ";
+//      } else {
+//        for (int V = 0; V < Phi->getNumIncomingValues(); ++V) {
+//          auto *Val = Phi->getIncomingValue(V);
+//          auto *BB = Phi->getIncomingBlock(V);
+//          out() << "if (";
+//          auto *T = BB->getTerminator();
+//          if (auto *Br = dyn_cast_or_null<BranchInst>(T)) {
+//            if (Br->isUnconditional())
+//              out() << "true";
+//            else {
+//              if (Br->getSuccessor(1) == BB) // true
+//                out() << getNameOrAsOperand(Br->getCondition());
+//              else
+//                out() << "!" << getNameOrAsOperand(Br->getCondition());
+//            }
+//          }
+//          out() << ") then " << getNameOrAsOperand(Val) << " ";
+//          if (V + 1 < Phi->getNumIncomingValues())
+//            out() << "else ";
+//        }
+//      }
+//      out() << "in\n";
+//    } else {
+//      out() << prefix() << "let " << *I << " in\n";
+//    }
+//  }
+//
+//  void visitLoop(Loop *L, BasicBlock *To) {
+//    auto *IV = L->getInductionVariable(*SE);
+//    auto B = L->getBounds(*SE);
+//    auto *Header = L->getHeader();
+//    auto *T = Header->getTerminator();
+//    auto *Latch = L->getLoopLatch();
+//    auto FoldName = Header->getName().str();
+//
+//    out() << prefix() << "let " << FoldName << " = λ";
+//    std::string ArgNames;
+//    auto *MPhi = MSSA->getMemoryAccess(Header);
+//    if (MPhi) {
+//      ArgNames += getNameOrAsOperand(MemPtr) + ".old ";
+//    }
+//    for (auto &P : Header->phis()) {
+//      if (&P == IV) continue;
+//      ArgNames += getNameOrAsOperand(&P) + " ";
+//    }
+//    out() << ArgNames << getNameOrAsOperand(IV) << ".\n";
+//
+//    indent();
+//
+//    if (Header == Latch) {
+//      Executor E;
+//      // outputs
+//      auto *LiveOut = &*L->getExitBlock()->phis().begin();
+//      assert(!(LiveOut && MPhi) && "simultaneous memory and scalar output not supported right now");
+//      if (LiveOut) {
+//        out() << prefix() << E.SExpr(LiveOut->getIncomingValue(0));
+//        //      out() << prefix() << getNameOrAsOperand(LiveOut->getIncomingValue(0));
+//      } else {
+//        out() << prefix() << E.SExpr(MemInst->getMemoryInst());
+//        //      out() << prefix() << getNameOrAsOperand(MemPtr) + ".new";
+//      }
+//      out() << "\n";
+//    } else {
+//      // other code in loop body ending at latch
+//      wave(T, Latch);
+//    }
+//
+//    indent();
+//
+//    out() << prefix() << "let r = fold (";
+//    // grab phis
+//    ListSeparator LS(", ");
+//    std::string OutNames;
+//    if (MPhi) {
+//      // initial val
+//      auto *Incoming = MPhi->getIncomingValueForBlock(L->getLoopPreheader());
+//      auto FreshMem = getNameOrAsOperand(MemPtr) + "." + Incoming->getBlock()->getName().str();
+//      out() << LS << FreshMem;
+//      // ongoing val
+//      OutNames += getNameOrAsOperand(MemPtr) + "." + L->getLoopLatch()->getName().str();
+//    }
+//
+//    for (auto &P : Header->phis()) {
+//      if (&P == IV)
+//        continue;
+//      if (&P != &*Header->phis().begin() || MPhi)
+//        OutNames += ", ";
+//      out() << LS << getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopPreheader()));
+//      OutNames += getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopLatch()));
+//    }
+//
+//    out() << ") " << FoldName << " Range(" << getNameOrAsOperand(&B->getInitialIVValue())
+//           << ", " << getNameOrAsOperand(&B->getFinalIVValue()) << ") in\n";
+//
+//    indent();
+//    out() << prefix() << "let " << OutNames << " = r in\n";
+//    indent();
+//    if (MPhi)
+//      out() << prefix() << OutNames;
+//    else {
+//      auto *LiveOut = &*L->getExitBlock()->phis().begin();
+//      out() << prefix() << getNameOrAsOperand(LiveOut->getIncomingValue(0));
+//    }
+//    out() << "\n";
+//
+//    auto *Exit = L->getExitBlock();
+//    visitBB(Exit, To);
+//
+//    deindent();
+//    deindent();
+//    deindent();
+//    deindent();
+//  }
+//
+//  friend raw_ostream &operator<<(raw_ostream &OS, const Translate &T);
+//};
+//
+//raw_ostream &operator<<(raw_ostream &OS, const Translate &T) {
+//  return OS << T.StrOutput;
+//}
 
 //void TranslateBB(std::string Prefix, BasicBlock *From, BasicBlock *To, SmallPtrSetImpl<BasicBlock*> &Visited, LoopInfo *LI, ScalarEvolution *SE);
 //
@@ -1705,10 +1880,11 @@ raw_ostream &operator<<(raw_ostream &OS, const Translate &T) {
 //  Params += getNameOrAsOperand(IV);
 //}
 
-class Lambda {
+
+class LambdaV2 {
 public:
-  Lambda(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA)
-      : LI(LI), SE(SE), MSSA(MSSA) {}
+  LambdaV2(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA)
+      : LI(LI), SE(SE), MSSA(MSSA), ToLam(Inline()) {}
 
 
   void translate(Function &F) {
@@ -1717,6 +1893,197 @@ public:
     Latch2Loop.clear();
     ReversePostOrderTraversal<Function*> RPOT(&F);
     SmallPtrSet<BasicBlock*, 5> Visited;
+
+    // make first Abs
+    Var Params(F.args());
+
+    Params.dump();
+
+    return;
+
+    for (auto *BB : RPOT) {
+      if (Visited.contains(BB))
+        continue;
+      Visited.insert(BB);
+      if (Latch2Loop[BB]) {
+        latch(BB);
+      }
+      else if (Exit2Loop[BB]) {
+        exit(BB);
+      }
+      else if (LI.isLoopHeader(BB)) {
+        auto *Header = BB;
+        auto *L = LI.getLoopFor(Header);
+        auto *Latch = L->getLoopLatch();
+        auto *ExitBlock = L->getExitBlock();
+        auto *IV = L->getInductionVariable(SE);
+        auto Params = make_filter_range(Header->phis(),
+                                        [IV](PHINode &P) { return &P != IV; });
+        Exit2Loop[ExitBlock] = L;
+        Latch2Loop[Latch] = L;
+        auto *MemPhi = MSSA.getMemoryAccess(Header);
+        auto LiveOuts = ExitBlock->phis();
+        assert((!MemPhi || LiveOuts.empty()) && "simultaneous memory and scalar output not supported right now.");
+        std::string StrParam = "";
+        if (MemPhi) {
+          auto *Clob = MSSA.getWalker()->getClobberingMemoryAccess(MemPhi);
+          StrParam += getNameOrAsOperand(MemPtr) + " ";
+        }
+        {
+          raw_string_ostream Ps(StrParam);
+          ListSeparator LS(" ");
+          for (auto &Phi : Params) {
+            Ps << LS << getNameOrAsOperand(&Phi);
+          }
+          if (!Params.empty())
+            Ps << " ";
+          Ps << getNameOrAsOperand(IV);
+        }
+
+        dbgs() << Tabs << "let " << BB->getName() << " = λ" <<  StrParam << ". \n";
+
+        if (Header != Latch)
+          Tabs += "\t";
+        else
+          latch(Latch);
+        dbgs() << " in\n";
+      } else {
+        bb(BB);
+      }
+    }
+  }
+
+private:
+  LoopInfo &LI;
+  ScalarEvolution &SE;
+  MemorySSA &MSSA;
+  const MemoryDef *MemInst = nullptr;
+  Value *MemPtr = nullptr;
+  DenseMap<BasicBlock*, Loop*> Exit2Loop;
+  DenseMap<BasicBlock*, Loop*> Latch2Loop;
+  Inline ToLam;
+  std::string Tabs = "";
+
+  Exp *phi(PHINode *P) {
+    assert(P->getNumIncomingValues() == 2 && "only 2 incoming vals supported right now");
+    auto *B1 = P->getIncomingBlock(0);
+    auto *B2 = P->getIncomingBlock(1);
+    auto *Br1 = dyn_cast<BranchInst>(B1->getTerminator());
+    auto *Br2 = dyn_cast<BranchInst>(B2->getTerminator());
+    auto *Then = Br1->isConditional() ? Br1 : Br2;
+    auto *Else = Br1->isConditional() ? Br2 : Br1;
+    assert(Else->isUnconditional() && "unsupported control flow.");
+    auto *Cond = ToLam.run(Then->getCondition());
+    if (Then->getOperand(1) == P->getParent()) // False target
+      Cond = Builtin::mkNot(Cond);
+    auto *True = ToLam.run(P->getIncomingValueForBlock(Then->getParent()));
+    auto *False = ToLam.run(P->getIncomingValueForBlock(Else->getParent()));
+    return new IfThen(Cond, True, False);
+  }
+
+  void bb(BasicBlock *BB) {
+    std::vector<Exp*> Es;
+    for (auto &P : BB->phis()) {
+      auto *Left = ToLam.run(&P);
+      auto *Right = phi(&P);
+      dbgs() << Tabs << "let " << getNameOrAsOperand(&P) << " = ";
+      phi(&P);
+      dbgs() << " in\n";
+    }
+//    auto *I = BB->getFirstNonPHI();
+//    auto *T = BB->getTerminator();
+//    while (I && I != T) {
+//      dbgs() << Tabs << "let " << getNameOrAsOperand(I) << " = " << E.SExpr(I) << " in\n";
+//      I = I->getNextNode();
+//    }
+//    if (auto *Ret = dyn_cast<ReturnInst>(T)) {
+//      if (!Ret->getReturnValue())
+//        dbgs() << Tabs << getNameOrAsOperand(MemPtr) << "\n";
+//      else
+//        dbgs() << Tabs << getNameOrAsOperand(Ret->getReturnValue()) << "\n";
+//    }
+  }
+
+  void exit(BasicBlock *Exit) {
+    Executor E;
+    Loop *L = Exit2Loop[Exit];
+    auto *Header = L->getHeader();
+    auto *IV = L->getInductionVariable(SE);
+    auto B = L->getBounds(SE);
+    auto Start = E.SExpr(B->getInitialIVValue());
+    auto End = E.SExpr(B->getFinalIVValue());
+    std::string Base = "";
+    auto Params = make_filter_range(Header->phis(),
+                                    [IV](PHINode &P) { return &P != IV; });
+    std::string Args = "";
+    for (auto &P : Params) {
+      if (&P != &*Params.begin()) Args += ", ";
+      Args += E.SExpr(P.getIncomingValueForBlock(L->getLoopPreheader()));
+    }
+
+    dbgs() << Tabs << "let " << getNameOrAsOperand(&*Exit->phis().begin()) << " = fold"
+           << " (" << Args << ") "
+           << L->getHeader()->getName() << " "
+           << "Range(" << Start << ", " << End << ")" << " in\n";
+  }
+
+  void latch(BasicBlock *Latch) {
+    Loop *L = Latch2Loop[Latch];
+    auto LiveOuts = L->getExitBlock()->phis();
+    Executor E;
+    if (!LiveOuts.empty()) {
+      for (auto &LO : LiveOuts)
+        dbgs() << Tabs << E.SExpr(LO.getIncomingValue(0)) << " ";
+    } else {
+      auto *Inst = MemInst->getMemoryInst();
+      if (LI.getLoopFor(Inst->getParent()) == L)
+        dbgs() << Tabs << E.SExpr(MemInst->getMemoryInst()) << " ";
+      else {
+        // nearest clobber
+        auto *LatchPhi = MSSA.getMemoryAccess(Latch);
+
+      }
+    }
+    //    dbgs() << "\n";
+  }
+
+  void analyzeMemory(Function *F) {
+    for (auto &BB : *F) {
+      const auto *Defs = MSSA.getBlockDefs(&BB);
+      if (Defs) {
+        for (const auto &MA : *Defs) {
+          if (auto *D = dyn_cast<MemoryDef>(&MA)) {
+            assert(!MemPtr && "only 1 stored ptr supported right now");
+            MemInst = D;
+          }
+        }
+      }
+    }
+    if (MemInst) {
+      auto *Ptr = SE.getSCEV(MemInst->getMemoryInst()->getOperand(1));
+      auto *Base = dyn_cast<SCEVUnknown>(SE.getPointerBase(Ptr));
+      MemPtr = Base->getValue();
+      dbgs() << getNameOrAsOperand(MemPtr) << " is modified\n";
+    }
+  }
+};
+
+class Lambda {
+public:
+  Lambda(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA)
+      : LI(LI), SE(SE), MSSA(MSSA), ToLam(Inline()) {}
+
+
+  void translate(Function &F) {
+    analyzeMemory(&F);
+    Exit2Loop.clear();
+    Latch2Loop.clear();
+    ReversePostOrderTraversal<Function*> RPOT(&F);
+    SmallPtrSet<BasicBlock*, 5> Visited;
+
+    // make first Abs
+    Var Params1(F.args());
+
 
     std::string Params = "";
     for (auto &Arg : F.args()) {
@@ -1792,6 +2159,7 @@ private:
   Value *MemPtr = nullptr;
   DenseMap<BasicBlock*, Loop*> Exit2Loop;
   DenseMap<BasicBlock*, Loop*> Latch2Loop;
+  Inline ToLam;
   std::string Tabs = "";
 
   void phi(PHINode *P) {
@@ -1895,7 +2263,6 @@ private:
       dbgs() << getNameOrAsOperand(MemPtr) << " is modified\n";
     }
   }
-
 };
 
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
@@ -1913,7 +2280,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   MSSA.ensureOptimizedUses();
   auto *Walker = MSSA.getWalker();
 
-  Lambda Lam(LI, SE, MSSA);
+  LambdaV2 Lam(LI, SE, MSSA);
   Lam.translate(F);
 
   return PreservedAnalyses::all();
@@ -1931,10 +2298,10 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
       }
     }
   } else {
-    Translate Tr(&LI, &SE, &MSSA);
-    Tr.visit(&F);
-    dbgs() << Tr;
-    return PreservedAnalyses::all();
+//    Translate Tr(&LI, &SE, &MSSA);
+//    Tr.visit(&F);
+//    dbgs() << Tr;
+//    return PreservedAnalyses::all();
 
     LoopNest LN(*LI.getTopLevelLoops()[0], SE);
     for (int Depth = LN.getNestDepth(); Depth > 0; --Depth){
