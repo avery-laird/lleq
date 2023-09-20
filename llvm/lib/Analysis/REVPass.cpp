@@ -1884,7 +1884,7 @@ Value *findLiveOut(Loop *L, LoopInfo *LI) {
 class LambdaV2 {
 public:
   LambdaV2(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA)
-      : LI(LI), SE(SE), MSSA(MSSA), ToLam(Inline()) {}
+      : LI(LI), SE(SE), MSSA(MSSA), ToLam(Inline()), DT(MSSA.getDomTree()) {}
 
 
   void translate(Function &F) {
@@ -1899,17 +1899,16 @@ public:
 
     Params.dump();
 
-    return;
-
     for (auto *BB : RPOT) {
       if (Visited.contains(BB))
         continue;
       Visited.insert(BB);
+
       if (Latch2Loop[BB]) {
-        latch(BB);
+//        latch(BB);
       }
       else if (Exit2Loop[BB]) {
-        exit(BB);
+//        exit(BB);
       }
       else if (LI.isLoopHeader(BB)) {
         auto *Header = BB;
@@ -1921,35 +1920,12 @@ public:
                                         [IV](PHINode &P) { return &P != IV; });
         Exit2Loop[ExitBlock] = L;
         Latch2Loop[Latch] = L;
-        auto *MemPhi = MSSA.getMemoryAccess(Header);
-        auto LiveOuts = ExitBlock->phis();
-        assert((!MemPhi || LiveOuts.empty()) && "simultaneous memory and scalar output not supported right now.");
-        std::string StrParam = "";
-        if (MemPhi) {
-          auto *Clob = MSSA.getWalker()->getClobberingMemoryAccess(MemPhi);
-          StrParam += getNameOrAsOperand(MemPtr) + " ";
-        }
-        {
-          raw_string_ostream Ps(StrParam);
-          ListSeparator LS(" ");
-          for (auto &Phi : Params) {
-            Ps << LS << getNameOrAsOperand(&Phi);
-          }
-          if (!Params.empty())
-            Ps << " ";
-          Ps << getNameOrAsOperand(IV);
-        }
-
-        dbgs() << Tabs << "let " << BB->getName() << " = λ" <<  StrParam << ". \n";
-
-        if (Header != Latch)
-          Tabs += "\t";
-        else
-          latch(Latch);
-        dbgs() << " in\n";
+        LLVM_DEBUG(dbgs() << BB->getName() << " to " << ExitBlock->getName() << "\n");
       } else {
+        LLVM_DEBUG(dbgs() << BB->getName() << "\n");
         bb(BB);
       }
+
     }
   }
 
@@ -1962,6 +1938,7 @@ private:
   DenseMap<BasicBlock*, Loop*> Exit2Loop;
   DenseMap<BasicBlock*, Loop*> Latch2Loop;
   Inline ToLam;
+  DominatorTree &DT;
   std::string Tabs = "";
 
   Exp *phi(PHINode *P) {
@@ -1984,24 +1961,31 @@ private:
   void bb(BasicBlock *BB) {
     std::vector<Exp*> Es;
     for (auto &P : BB->phis()) {
-      auto *Left = ToLam.run(&P);
-      auto *Right = phi(&P);
-      dbgs() << Tabs << "let " << getNameOrAsOperand(&P) << " = ";
-      phi(&P);
-      dbgs() << " in\n";
+      if (P.getNumIncomingValues() == 1)
+        continue; // let left = right
+      auto *BB1 = P.getIncomingBlock(0);
+      auto *BB2 = P.getIncomingBlock(1);
+      auto *Denom = DT.findNearestCommonDominator(BB1, BB2);
+      dbgs() << "nearest common denominator for " << getNameOrAsOperand(&P) << " is " << Denom->getName() << "\n";
+      auto *Br = dyn_cast<BranchInst>(Denom->getTerminator());
+      assert(Br && Br->isConditional() && "something weird");
+      auto *True = Br->getSuccessor(0);
+      auto *False = Br->getSuccessor(1);
+      auto *Cond = Br->getCondition();
+      Value *Then, *Else;
+      if (DT.dominates(True, P.getIncomingBlock(0))) {
+        Then = P.getIncomingValue(0);
+        Else = P.getIncomingValue(1);
+      } else {
+        assert(DT.dominates(True, P.getIncomingBlock(1)) && "something weird");
+        Else = P.getIncomingValue(0);
+        Then = P.getIncomingValue(1);
+      }
+      dbgs() << "condition = " << getNameOrAsOperand(Cond) << "\n";
+      dbgs() << "true branch = " << getNameOrAsOperand(Then) << "\n";
+      dbgs() << "else branch = " << getNameOrAsOperand(Else) << "\n";
+
     }
-//    auto *I = BB->getFirstNonPHI();
-//    auto *T = BB->getTerminator();
-//    while (I && I != T) {
-//      dbgs() << Tabs << "let " << getNameOrAsOperand(I) << " = " << E.SExpr(I) << " in\n";
-//      I = I->getNextNode();
-//    }
-//    if (auto *Ret = dyn_cast<ReturnInst>(T)) {
-//      if (!Ret->getReturnValue())
-//        dbgs() << Tabs << getNameOrAsOperand(MemPtr) << "\n";
-//      else
-//        dbgs() << Tabs << getNameOrAsOperand(Ret->getReturnValue()) << "\n";
-//    }
   }
 
   void exit(BasicBlock *Exit) {
