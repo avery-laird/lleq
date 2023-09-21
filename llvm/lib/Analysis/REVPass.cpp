@@ -1273,22 +1273,45 @@ public:
       Out = MemOutputs[0];
       opChain<MemoryAccess>(dyn_cast<MemoryAccess>(MemOutputs[0]), Chain);
     }
-    LLVM_DEBUG({
+//    LLVM_DEBUG({
       dbgs() << L->getName() << " = λ";
-      for (auto *V : MemInputs) dbgs() << getNameOrAsOperand(MemPtr) << "." << V->getID() << " ";
+//      for (auto *V : MemInputs) dbgs() << getNameOrAsOperand(MemPtr) << "." << V->getID() << " ";
+      for (auto *V : MemInputs) dbgs() << getNameOrAsOperand(MemPtr) << " ";
       for (auto *V : Inputs) dbgs() << getNameOrAsOperand(V) << " ";
       dbgs() << ".\n";
       for (auto I = Chain.rbegin(), E = Chain.rend(); I != E; ++I) {
-        if (auto *MA = dyn_cast<MemoryAccess>(*I))
-            dbgs() << *MA << "\n";
-        else
+        if (auto *MA = dyn_cast<MemoryAccess>(*I)) {
+          if (auto *MP = dyn_cast<MemoryPhi>(MA)) {
+            auto *BB1 = MP->getIncomingBlock(0);
+            auto *BB2 = MP->getIncomingBlock(1);
+            auto *Denom = DT->findNearestCommonDominator(BB1, BB2);
+            auto *Br = dyn_cast<BranchInst>(Denom->getTerminator());
+            auto MemName = getNameOrAsOperand(MemPtr);
+            auto LeftName = MemName + "." + std::to_string(MP->getID());
+            dbgs() << "  " << LeftName << " = if " << getNameOrAsOperand(Br->getCondition()) << " then ";
+            if (BB1 == L->getHeader())
+                dbgs() << MemName;
+            else
+                dbgs() << MemName << "." << MP->getIncomingValue(0)->getID();
+            dbgs() << " else ";
+            if (BB2 == L->getHeader())
+                dbgs() << MemName;
+            else
+                dbgs() << MemName << "." << MP->getIncomingValue(1)->getID();
+            dbgs() << "\n";
+          } else {
+            dbgs() << *MA << "\n"; // TODO should never happen now?
+          }
+        } else
             dbgs() << **I << "\n";
       }
+      std::string OutputName = "";
       if (auto *M = dyn_cast<MemoryAccess>(Out))
-        dbgs() << "  " << getNameOrAsOperand(MemPtr) << "." << M->getID() << "\n";
+        OutputName = getNameOrAsOperand(MemPtr) + "." + std::to_string(M->getID());
       else
-        dbgs() << "  " << getNameOrAsOperand(Out) << "\n";
-      dbgs() << "fold (";
+        OutputName = getNameOrAsOperand(Out);
+      dbgs() << "  " << OutputName << "\n";
+      dbgs() << OutputName << " = fold (";
       ListSeparator LS(", ");
       for (auto *V : MemInputs) {
         auto *Incoming = V->getIncomingValueForBlock(L->getLoopPreheader());
@@ -1304,7 +1327,7 @@ public:
       }
       dbgs() << ") " << L->getName() << " ";
       dbgs() << "Range(" << getNameOrAsOperand(&Start) << ", " << getNameOrAsOperand(&End) << ")\n";
-    });
+//    });
   }
 
   template<typename PHITy>
@@ -1612,7 +1635,6 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
   BasicAAResult &AA = AM.getResult<BasicAA>(F);
   MemorySSA &MSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
-//  std::unique_ptr<DataDependenceGraph> &DDG = AM.getResult<DDGAnalysis>(F);
 
   MSSA.ensureOptimizedUses();
   auto *Walker = MSSA.getWalker();
