@@ -205,6 +205,11 @@ public:
     return this->DefsOnlyType::getReverseIterator();
   }
 
+  /// Used for debugging and tracking things about MemoryAccesses.
+  /// Guaranteed unique among MemoryAccesses, no guarantees otherwise.
+  inline unsigned getID() const;
+  // TODO Avery changed this as a hack to name memory versions
+
 protected:
   friend class MemoryDef;
   friend class MemoryPhi;
@@ -216,9 +221,6 @@ protected:
   /// moved.
   void setBlock(BasicBlock *BB) { Block = BB; }
 
-  /// Used for debugging and tracking things about MemoryAccesses.
-  /// Guaranteed unique among MemoryAccesses, no guarantees otherwise.
-  inline unsigned getID() const;
 
   MemoryAccess(LLVMContext &C, unsigned Vty, DeleteValueTy DeleteValue,
                BasicBlock *BB, unsigned NumOperands)
