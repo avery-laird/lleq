@@ -1304,6 +1304,8 @@ public:
 
   template <class ChainTy>
   void collectInsts(ChainTy *V, std::vector<Value *> &Chain) {
+    if (any_of(Chain.begin(), Chain.end(), [&](Value *E) {return V == E; }))
+        return; // TODO make this O(1) instead of O(n)
 //    LLVM_DEBUG({
 //      dbgs() << "chain is: ";
 //      for (auto *N : Chain) {
@@ -1364,11 +1366,11 @@ public:
         auto *IV = Loop->getInductionVariable(SE);
         std::vector<MemoryAccess*> MemOutputs;
         std::vector<Value*> Outputs;
-        if (auto *P = dyn_cast_or_null<MemoryPhi>(MSSA.getMemoryAccess(Latch)))
-          MemOutputs.push_back(P);
-        else if (MSSA.getBlockDefs(Latch)) {
+        if (MSSA.getBlockDefs(Latch))
           MemOutputs.push_back(const_cast<MemoryAccess*>(&*MSSA.getBlockDefs(Latch)->rbegin()));
-        }
+        else if (auto *P = dyn_cast_or_null<MemoryPhi>(MSSA.getMemoryAccess(Latch)))
+          MemOutputs.push_back(P);
+
 
         for (auto &P : Exit->phis())
           Outputs.push_back(&P);
