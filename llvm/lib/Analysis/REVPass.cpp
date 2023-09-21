@@ -953,8 +953,25 @@ bool detectCSC(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
   return true;
 }
 
-bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
-               Value **I, Value **J, DenseMap<Value *, LevelBounds> &LevelMap) {
+GEPOperator *findInnerMostGEP(Value *Start) {
+  GEPOperator *Result = nullptr;
+  Value *Curr = getLoadStorePointerOperand(Start);
+  while (Curr != nullptr) {
+    if (auto *GEP = dyn_cast<GEPOperator>(Curr)) {
+      Result = GEP;
+      Curr = getLoadStorePointerOperand(skipCasts(GEP->getOperand(1)));
+    } else {
+      break;
+    }
+  }
+  return Result;
+}
+
+bool detectCSRAndCSC(LoopInfo *LI, ScalarEvolution *SE, Value *Root,
+                     Value **Row, Value **Col, Value **Val, Value **I,
+                     Value **J, bool &IsCSR,
+                     DenseMap<Value *, LevelBounds> &LevelMap,
+                     DenseMap<Loop *, Value *> LiveOutMap) {
   // Col is optional
   //  Instruction *I, *J;
   *Row = *Col = *Val = *I = *J = nullptr;
@@ -1022,6 +1039,48 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
     auto JBounds = LevelMap[*J];
     JBounds.LevelType = DENSE;
     LevelMap[*Col] = JBounds;
+  }
+
+  IsCSR = true;
+  auto *LiveOut = LiveOutMap[LI->getLoopFor(dyn_cast<LoadInst>(Root)->getParent())];
+  /*
+   * Try to obtain the innermost GEP operator of the LiveOut. We know CSC updates
+   * output array in the form of "output[crd[i]]", so we want to verify that "i"
+   * is the loop var for the array that stores row (coordinate) indices in CSC.
+   */
+  if (auto *GEP = findInnerMostGEP(LiveOut)) {
+    auto *GEPOpSE = SE->getSCEV(skipCasts(GEP->getOperand(1)));
+    /*
+     * If SE is an AddRecExpr, then we assume it's 1D. The loop that goes through
+     * positions array doesn't start from 0 and increment by 1 at a time.
+     */
+    if (auto *AddRecExpr = dyn_cast<SCEVAddRecExpr>(GEPOpSE)) {
+      if (!AddRecExpr->getStart()->isZero() && AddRecExpr->getStepRecurrence(*SE)->isOne()) {
+        auto *Temp = *Row;
+        *Row = *Col;
+        *Col = Temp;
+        IsCSR = false;
+      }
+    }
+    /*
+     * If SE is an SCEVAddExpr, then we assume it's 2D (i * N + j) and extract the
+     * SCEVMulExpr. Since we assume it was CSR from the start, the value of Col and
+     * Row are swapped, so if any of SCEVMulExpr's operands are equal to Col, then
+     * we know that it's CSC since C is row-major thus the other operand must be
+     * the number of rows, and it doesn't make sense to multiply column index by
+     * the number of rows.
+     */
+    else if (auto *AddExpr = dyn_cast<SCEVAddExpr>(GEPOpSE)) {
+      if (auto *MulExpr = dyn_cast<SCEVMulExpr>(AddExpr->getOperand(0))) {
+        if (dyn_cast<SCEVUnknown>(MulExpr->getOperand(0))->getValue() == *Col ||
+            dyn_cast<SCEVUnknown>(MulExpr->getOperand(1))->getValue() == *Col) {
+          auto *Temp = *Row;
+          *Row = *Col;
+          *Col = Temp;
+          IsCSR = false;
+        }
+      }
+    }
   }
   return true;
 }
@@ -1128,6 +1187,7 @@ bool detectDense1D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **x,
 
 bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
                    SmallVector<LoadInst *> &Loads,
+                   DenseMap<Loop *, Value *> &LiveOutMap,
                    DenseMap<Value *, LevelBounds> &LevelMap,
                    SmallPtrSetImpl<LoadInst *> &Leftover,
                    DenseMap<Value *, Tensor *> &TensorMap) {
@@ -1144,13 +1204,20 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
     for (auto *Load :
          WorkList) { // TODO figure out how to undo LevelMap mutations
       Value *Row, *Col, *Val, *I, *J;
-      auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, &I, &J, LevelMap);
-      if (IsCSR) {
+      bool IsCSR;
+      auto IsCSCCSR = detectCSRAndCSC(LI, SE, Load, &Row, &Col, &Val, &I, &J,
+                                      IsCSR, LevelMap, LiveOutMap);
+      if (IsCSCCSR) {
+        Value *LiveOut = LiveOutMap[LI->getLoopFor(Load->getParent())];
         auto *TensorCSR = new CSR({I, J}, Load->getType(), Val, Row, Col);
         //        CSR TensorCSR({Rows, nullptr}, Val, Row, Col);
         TensorMap[Load] = TensorCSR;
         LLVM_DEBUG({
-          dbgs() << "detected CSR:\n";
+          if (IsCSR)
+            dbgs() << "detected CSR:\n";
+          else
+            dbgs() << "detected CSC:\n";
+          dbgs() << "load = " << *Load << "\n";
           dbgs() << "val = " << *Val << "\n";
           dbgs() << "row = " << *Row << "\n";
           if (Col)
@@ -1476,7 +1543,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     SmallPtrSet<LoadInst *, 5> Leftover;
     DenseMap<Value *, Tensor *> TensorMap;
     auto AllCovered =
-        coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap, Leftover, TensorMap);
+        coverAllLoads(&LI, &SE, TopLevelLoads, LiveOutMap, LevelMap, Leftover, TensorMap);
     LLVM_DEBUG({
       if (AllCovered)
         dbgs() << "all loads covered.\n";
