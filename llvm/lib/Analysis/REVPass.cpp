@@ -598,37 +598,6 @@ bool findCrd(Value *Inst, Value **Crd) {
   return DFS(Inst, nullptr, 0, {});
 }
 
-// bool findCrd(Value *Inst, Value **Crd) {
-//   std::vector<Value*> Stack;
-//   SmallPtrSet<Value*, 4> Visited;
-//   Stack.push_back(Inst);
-//   int LoadCount = 0;
-//   Value *PrevLoad = nullptr;
-//   while (!Stack.empty()) {
-//     auto *ToVisit = Stack.back();
-//     Stack.pop_back();
-//     if (!Visited.contains(ToVisit)) {
-//       Visited.insert(ToVisit);
-//       if (auto *Load = dyn_cast<LoadInst>(ToVisit)) {
-//         if (LoadCount++ == 1) {
-////          auto *GEP = dyn_cast<GEPOperator>(getPointerOperand(PrevLoad));
-////          if (GEP == nullptr)
-////            return false;
-////          *Crd = GEP->getPointerOperand();
-//          *Crd = PrevLoad;
-//          return true;
-//        } else {
-//          PrevLoad = Load;
-//        }
-//      }
-//      for (auto *Use : ToVisit->users()) {
-//        if (auto *I = dyn_cast<Instruction>(Use))
-//          Stack.push_back(I);
-//      }
-//    }
-//  }
-//  return false;
-//}
 
 void makeLevelBounds(LoopNest *LN, ScalarEvolution *SE,
                      std::vector<LevelBounds> &Levels) {
@@ -708,148 +677,6 @@ struct CSRLevels {
   Value *Val = nullptr;
 };
 
-static void GetLiveIns(Function *F, SmallPtrSet<Value *, 4> &LiveIns) {
-  for (auto &A : F->args())
-    LiveIns.insert(&A);
-  return;
-}
-
-struct Atom {
-  std::string Name;
-  std::string Type;
-  std::string Pred;
-};
-
-std::string Type2String(Value *V) {
-  std::string TypeOutput;
-  raw_string_ostream TypeOutputStream(TypeOutput);
-  V->getType()->print(TypeOutputStream);
-  return TypeOutput;
-}
-
-struct Node {
-  std::string Op;
-  std::string Register;
-  std::string Type;
-  std::vector<Atom> Children;
-
-public:
-  Node(Instruction *I) {
-    Op = I->getOpcodeName();
-    if (auto *ICmp = dyn_cast<ICmpInst>(I)) {
-      std::string Pred = CmpInst::getPredicateName(ICmp->getPredicate()).str();
-      Children.push_back({Pred, "conditioncode"});
-    }
-    Register = getNameOrAsOperand(I);
-    Type = Type2String(I);
-    auto *Phi = dyn_cast<PHINode>(I);
-    for (auto &C : I->operands()) {
-      std::string TypeOutput = Type2String(C);
-      std::string Pred = "";
-      if (Phi)
-        Pred = getNameOrAsOperand(Phi->getIncomingBlock(C));
-      Children.push_back({getNameOrAsOperand(C), TypeOutput, Pred});
-    }
-  }
-};
-
-struct BBNode {
-  std::string Name;
-  std::vector<Node> Nodes;
-};
-
-namespace llvm::yaml {
-
-template <> struct MappingTraits<Instruction *> {
-  static void mapping(IO &io, Instruction *&I) {
-    EmptyContext Ctx;
-    yamlize(io, I, false, Ctx);
-    //    io.mapRequired("op", I->getOpcodeName());
-  }
-};
-
-template <> struct SequenceTraits<std::vector<Atom>> {
-  static size_t size(IO &io, std::vector<Atom> &list) { return list.size(); }
-  static Atom &element(IO &io, std::vector<Atom> &list, size_t index) {
-    return list[index];
-  }
-};
-
-template <> struct SequenceTraits<std::vector<::Node>> {
-  static size_t size(IO &io, std::vector<::Node> &list) { return list.size(); }
-  static ::Node &element(IO &io, std::vector<::Node> &list, size_t index) {
-    return list[index];
-  }
-};
-
-template <> struct SequenceTraits<std::vector<BBNode>> {
-  static size_t size(IO &io, std::vector<BBNode> &list) { return list.size(); }
-  static BBNode &element(IO &io, std::vector<BBNode> &list, size_t index) {
-    return list[index];
-  }
-};
-
-template <> struct MappingTraits<Atom> {
-  static void mapping(IO &io, Atom &A) {
-    io.mapRequired("type", A.Type);
-    io.mapRequired("name", A.Name);
-    if (A.Pred != "")
-      io.mapRequired("pred", A.Pred);
-  }
-};
-
-template <> struct MappingTraits<::Node> {
-  static void mapping(IO &io, ::Node &N) {
-    io.mapRequired("name", N.Register);
-    io.mapRequired("op", N.Op);
-    io.mapRequired("type", N.Type);
-    io.mapRequired("operands", N.Children);
-  }
-};
-
-template <> struct MappingTraits<BBNode> {
-  static void mapping(IO &io, BBNode &BN) {
-    io.mapRequired("name", BN.Name);
-    io.mapRequired("nodes", BN.Nodes);
-  }
-};
-
-template <> struct MappingTraits<Tensor *> {
-  static void mapping(IO &io, Tensor *&T) {
-    std::string RootName = getNameOrAsOperand(T->Root);
-    std::string Format = Format2String(T->Kind);
-    io.mapRequired("root", RootName);
-    io.mapRequired("format", Format);
-    if (auto *CSRTensor = dyn_cast<CSR>(T)) {
-      std::string Row = getNameOrAsOperand(CSRTensor->Row);
-      std::string Col = getNameOrAsOperand(CSRTensor->Col);
-      io.mapRequired("row", Row);
-      io.mapRequired("col", Col);
-    } else if (auto *V = dyn_cast<Vector>(T)) {
-      // do nothing
-    } else {
-      llvm_unreachable("unknown format.");
-    }
-  }
-};
-template <> struct SequenceTraits<std::vector<Tensor *>> {
-  static size_t size(IO &io, std::vector<Tensor *> &list) {
-    return list.size();
-  }
-  static Tensor *&element(IO &io, std::vector<Tensor *> &list, size_t index) {
-    return list[index];
-  }
-};
-
-// template <> struct MappingTraits<LevelBounds> {
-//   static void mapping(IO &io, LevelBounds &LB) {
-//     std::string IndVar = getNameOrAsOperand(LB.Iterator);
-//     std::string LevelType = printLevelType(LB.LevelType);
-//     io.mapRequired("indvar", LB.);
-//     io.mapRequired("nodes", BN.Nodes);
-//   }
-// };
-} // namespace llvm::yaml
 
 void allLoadsInCurrentScope(Loop *L, SmallPtrSet<LoadInst *, 4> &Loads) {
   for (auto *BB : L->blocks()) {
@@ -1043,50 +870,7 @@ std::string valMap(Value *LiveOut, LoopInfo *LI, Loop *L, DenseMap<Value *, Tens
   return ValMap;
 }
 
-void emitMap(raw_fd_ostream &FS, Loop *L, LoopInfo *LI, Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
-             DenseMap<Value *, LevelBounds> &LevelMap,
-             DenseMap<Value *, Tensor *> &TensorMap) {
-  // TODO merge with emitFold
-  std::string Total;
-  Total += "(loop \"" + L->getHeader()->getName().str() + "\"\n\t";
-  // Name Map
-  std::string Names = nameMap(Iterator, LevelMap);
-  Total += "(namemap \n\t\t" + Names + ")\n\t";
-  // Coord map
-  std::string CrdMap = makeDense(LevelMap[Iterator]);
-  Total += "(crdmap \n\t\t" + CrdMap + ")\n\t";
-  Total += "(valmap \n\t\t" + valMap(LiveOut, LI, L, TensorMap) + ")\n\t";
 
-  // first original
-  std::string InputCode;
-  std::string Idx = Val2Sexp(Iterator);
-  {
-    std::string Start = Val2Sexp(LevelMap[Iterator].LowerBound);
-    std::string End = Val2Sexp(LevelMap[Iterator].UpperBound);
-    std::string Func = buildExpression(LiveOut, Iterator, RD, LevelMap, TensorMap);
-    InputCode = "(map " + Start + " " + Idx + " " + End + " " + Func + ")";
-  }
-  Total += "(src \n\t\t" + InputCode + ")\n\t";
-  // Then dense
-  std::string DenseCode;
-  {
-    std::string Start = "(int 0)";
-    std::string End;
-    if (LevelMap[Iterator].LevelType == COMPRESSED)
-      End = getNameOrAsOperand(Iterator) + ".end";
-    else
-      End = getNameOrAsOperand(LevelMap[Iterator].UpperBound);
-    End = "(int " + End + ")"; // TODO check this is true
-    std::string Inputs;
-    std::string Func = buildDenseExpression(LiveOut, Iterator, RD, LevelMap, TensorMap, Inputs);
-    DenseCode = "(map " + Start + " " + Idx + " " + End + " " + Func + ")";
-  }
-  Total += "(target \n\t\t" + DenseCode + "))\n";
-  LLVM_DEBUG({
-      dbgs() << Total << "\n";
-  });
-  FS << Total;
-}
 
 enum Property { FULL, ORDERED, UNIQUE, BRANCHLESS, COMPACT };
 
@@ -1320,19 +1104,6 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
 
   return true;
 
-  //  const SCEV *AccessFn = SE->getSCEVAtScope(getPointerOperand(Root),
-  //  LI->getLoopFor(Root->getParent())); const SCEV *BasePointer =
-  //  dyn_cast<SCEVUnknown>(SE->getPointerBase(AccessFn)); AccessFn =
-  //  SE->getMinusSCEV(AccessFn, BasePointer); auto *TryCast =
-  //  dyn_cast<SCEVAddRecExpr>(AccessFn); LLVM_DEBUG(dbgs() << *Root << " ==> "
-  //  << *TryCast << "\n"); SmallVector<const SCEV*> Subscripts, Sizes;
-  //  delinearize(*SE, TryCast, Subscripts, Sizes, SE->getElementSize(Root));
-  //  LLVM_DEBUG({
-  //      for (auto *S : Subscripts)
-  //        dbgs() << *S << "\n";
-  //      for (auto *S : Sizes)
-  //        dbgs() << *S << "\n";
-  //  });
 
   return false;
 }
@@ -1400,19 +1171,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
         Change = true;
         continue;
       }
-      //      auto IsCSC = detectCSC(LI, Load, &Row, &Col, &Val, LevelMap);
-      //      if (IsCSC) {
-      //        LLVM_DEBUG({
-      //          dbgs() << "detected CSC:\n";
-      //          dbgs() << "val = " << *Val << "\n";
-      //          dbgs() << "row = " << *Row << "\n";
-      //          if (Col)
-      //            dbgs() << "col = " << *Col << "\n";
-      //        });
-      //        ToRemove.push_back(Load);
-      //        Change = true;
-      //        continue;
-      //      }
+
       Value *A, *Pk_1, *Nk, *Ik;
       auto IsDense2D =
           detectDense2D(LI, SE, Load, &A, &Pk_1, &Nk, &Ik, LevelMap);
@@ -1459,49 +1218,6 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
   Leftover.insert(WorkList.begin(), WorkList.end());
 
   return WorkList.size() == 0;
-  //  for (auto *Load : Loads) {
-  //    Value *Row, *Col, *Val;
-  //    auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, LevelMap);
-  //    if (IsCSR) {
-  //      LLVM_DEBUG({
-  //        dbgs() << "detected CSR:\n";
-  //         dbgs() << "val = " << *Val << "\n";
-  //         dbgs() << "row = " << *Row << "\n";
-  //         if (Col)
-  //           dbgs() << "col = " << *Col << "\n";
-  //      });
-  //      continue;
-  //    }
-  //    Value *A, *Pk_1, *Nk, *Ik;
-  //    auto IsDense2D = detectDense2D(LI, SE, Load, &A, &Pk_1, &Nk, &Ik,
-  //    LevelMap); if (IsDense2D) {
-  //      LLVM_DEBUG({
-  //          dbgs() << "detected dense 2d\n";
-  //          dbgs() << "A = " << *A << "\n";
-  //          dbgs() << "p_{k-1} = " << *Pk_1 << "\n";
-  //          dbgs() << "N_k = " << *Nk << "\n";
-  //          dbgs() << "i_k = " << *Ik << "\n";
-  //      });
-  //      continue;
-  //    }
-
-  //    const SCEV *AccessFn = SE->getSCEV(getPointerOperand(Load));
-  //    const SCEV *BasePointer =
-  //    dyn_cast<SCEVUnknown>(SE->getPointerBase(AccessFn)); AccessFn =
-  //    SE->getMinusSCEV(AccessFn, BasePointer); auto *TryCast =
-  //    dyn_cast<SCEVAddRecExpr>(AccessFn); bool IsAffine = TryCast != nullptr
-  //    && TryCast->isAffine(); LLVM_DEBUG(dbgs() << *AccessFn << ", isAffine="
-  //    << IsAffine << "\n"); if (!IsAffine) {
-  //      // chase load
-  //    } else {
-  //      // lookup level access
-  //    }
-  //    if (SCEVExprContains(AccessFn, [](const SCEV *S) { return }))
-  //    SmallVector<const SCEV*> Subscripts, Sizes;
-  //    delinearize(*SE, AccessFn, Subscripts, Sizes, SE->getElementSize(Load));
-  //    for (auto *S : Subscripts) {
-  //      LLVM_DEBUG(dbgs() << *S << "\n");
-  //    }
 }
 
 void makeTopLevelInputs(Value *LiveOut, SmallPtrSetImpl<Value *> &Inputs) {
@@ -1520,416 +1236,28 @@ void makeTopLevelInputs(Value *LiveOut, SmallPtrSetImpl<Value *> &Inputs) {
   }
 }
 
-Value *findLiveOut(Loop *L, LoopInfo *LI) {
-  auto *ExitBB = L->getExitBlock();
-  assert(ExitBB && "only one exit block allowed.");
-  Value *MemoryLO = nullptr;
-  PHINode *ScalarLO = nullptr;
-  int NumPhis = 0;
-  for (auto &Phi : ExitBB->phis()) {
-    ScalarLO = &Phi;
-    NumPhis++;
+
+class Fold {
+  std::vector<MemoryPhi*> MemInputs;
+  std::vector<Value*> Inputs;
+  std::vector<const MemoryAccess*> MemOutputs;
+  std::vector<Value*> Outputs;
+  Loop *L;
+public:
+  Fold(Loop *L, std::vector<MemoryPhi*> MI, std::vector<Value*> I, std::vector<const MemoryAccess*> MO, std::vector<Value*> C)
+      : MemInputs(MI), Inputs(I), MemOutputs(MO), Outputs(C), L(L) {}
+  // init is generated by incoming val for all input phis
+  // combiner is generated by translating the output phis/stores
+  void dump() {
+    dbgs() << "loop " << L->getName() << " has inputs: ";
+    for (auto *V : MemInputs) dbgs() << *V << " ";
+    for (auto *V : Inputs) dbgs() << *V << " ";
+    dbgs() << "\nloop " << L->getName() << " has outputs: ";
+    for (auto *V : MemOutputs) dbgs() << *V << " ";
+    for (auto *V : Outputs) dbgs() << *V << " ";
+    dbgs() << "\n";
   }
-  SmallVector<Value *> StoreInsts;
-  for (auto *BB : L->blocks())
-    for (auto &I : *BB) {
-      auto *ParentLoop = LI->getLoopFor(I.getParent());
-      if (ParentLoop != L)
-        break;
-      if (isa<StoreInst>(&I))
-        StoreInsts.push_back(&I);
-    }
-  if (NumPhis == 0 && StoreInsts.empty())
-    return nullptr;
-  bool Legal = (NumPhis == 1) != (StoreInsts.size() == 1);
-  assert(Legal && "only one live out allowed.");
-  if (NumPhis == 1) {
-    assert(ScalarLO->getNumIncomingValues() == 1 &&
-           "only one incoming value allowed.");
-    return ScalarLO->getOperand(0);
-  }
-  return StoreInsts[0];
-}
-
-//class Translate {
-//public:
-//
-//  Translate(LoopInfo *LI, ScalarEvolution *SE, MemorySSA *MSSA)
-//      : LI(LI), SE(SE), MSSA(MSSA) {
-//    Out = new raw_string_ostream(StrOutput);
-//  }
-//
-//  ~Translate() {
-//    delete Out;
-//  }
-//
-//  void visit(Function *F) {
-//    analyzeMemory(F);
-//    auto *Entry = &F->getEntryBlock();
-//    visitBB(Entry, nullptr);
-//  }
-//
-//private:
-//  LoopInfo *LI = nullptr;
-//  ScalarEvolution *SE = nullptr;
-//  MemorySSA *MSSA = nullptr;
-//  SmallPtrSet<BasicBlock*, 10> Visited = {};
-//  int Indent = 0;
-//  std::string StrOutput = "";
-//  raw_ostream *Out;
-//  const MemoryDef *MemInst = nullptr;
-//  Value *MemPtr = nullptr;
-//
-//  raw_ostream &out() {
-//    return *Out;
-//  }
-//
-//  void indent() {
-//    Indent++;
-//  }
-//
-//  void deindent() {
-//    Indent--;
-//  }
-//
-//  std::string prefix() {
-//    std::string Prefix = "";
-//    for (int i=0; i < Indent; ++i) Prefix += "\t";
-//    return Prefix;
-//  }
-//
-//  void analyzeMemory(Function *F) {
-//    for (auto &BB : *F) {
-//      const auto *Defs = MSSA->getBlockDefs(&BB);
-//      if (Defs) {
-//        for (const auto &MA : *Defs) {
-//          if (auto *D = dyn_cast<MemoryDef>(&MA)) {
-//            assert(!MemPtr && "only 1 stored ptr supported right now");
-//            MemInst = D;
-//          }
-//        }
-//      }
-//    }
-//    if (MemInst) {
-//      auto *Ptr = SE->getSCEV(MemInst->getMemoryInst()->getOperand(1));
-//      auto *Base = dyn_cast<SCEVUnknown>(SE->getPointerBase(Ptr));
-//      MemPtr = Base->getValue();
-//      dbgs() << getNameOrAsOperand(MemPtr) << " is modified\n";
-//    }
-//  }
-//
-//  void visitBB(BasicBlock *From, BasicBlock *To) {
-//    Visited.insert(From);
-//    if (LI->isLoopHeader(From)) {
-//      visitLoop(LI->getLoopFor(From), To);
-//    } else {
-//      //    out() << Prefix << From->getName() << ":\n";
-//      for (auto &I : *From) {
-//        if (&I == From->getTerminator()) break;
-//        visitInstruction(&I);
-//      }
-//      auto *T = From->getTerminator();
-////      if (auto *Ret = dyn_cast<ReturnInst>(T)) {
-////        visitRet(Ret);
-////      }
-//      if (From == To)
-//        return;
-//      wave(T, To);
-//    }
-//  }
-//
-//  void visitRet(ReturnInst *Ret) {
-//    if (Ret->getType()->isVoidTy())
-//      out() << prefix() << getNameOrAsOperand(MemPtr) << "\n";
-//    else
-//      out() << prefix() << getNameOrAsOperand(Ret->getReturnValue()) << "\n";
-//  }
-//
-//  void wave(Instruction *Terminator, BasicBlock *To) {
-//    if (auto *Br = dyn_cast<BranchInst>(Terminator)) {
-//      for (auto *O : Br->successors()) {
-//        if (all_of(predecessors(O), [&](BasicBlock *P) {
-//              if (!Visited.contains(P)) {
-//                auto *L = LI->getLoopFor(O);
-//                return L && L->getLoopLatch() == P;
-//              }
-//              return true;
-//            }))
-//          visitBB(O, To);
-//      }
-//    }
-//  }
-//
-//  void visitInstruction(Instruction *I) {
-//    if (auto *Phi = dyn_cast<PHINode>(I)) {
-//      // collect pred. branches
-//      out() << prefix() << "let " << getNameOrAsOperand(I) << " = ";
-//      if (Phi->getNumIncomingValues() == 1) {
-//        out() << getNameOrAsOperand(Phi->getIncomingValue(0)) << " ";
-//      } else {
-//        for (int V = 0; V < Phi->getNumIncomingValues(); ++V) {
-//          auto *Val = Phi->getIncomingValue(V);
-//          auto *BB = Phi->getIncomingBlock(V);
-//          out() << "if (";
-//          auto *T = BB->getTerminator();
-//          if (auto *Br = dyn_cast_or_null<BranchInst>(T)) {
-//            if (Br->isUnconditional())
-//              out() << "true";
-//            else {
-//              if (Br->getSuccessor(1) == BB) // true
-//                out() << getNameOrAsOperand(Br->getCondition());
-//              else
-//                out() << "!" << getNameOrAsOperand(Br->getCondition());
-//            }
-//          }
-//          out() << ") then " << getNameOrAsOperand(Val) << " ";
-//          if (V + 1 < Phi->getNumIncomingValues())
-//            out() << "else ";
-//        }
-//      }
-//      out() << "in\n";
-//    } else {
-//      out() << prefix() << "let " << *I << " in\n";
-//    }
-//  }
-//
-//  void visitLoop(Loop *L, BasicBlock *To) {
-//    auto *IV = L->getInductionVariable(*SE);
-//    auto B = L->getBounds(*SE);
-//    auto *Header = L->getHeader();
-//    auto *T = Header->getTerminator();
-//    auto *Latch = L->getLoopLatch();
-//    auto FoldName = Header->getName().str();
-//
-//    out() << prefix() << "let " << FoldName << " = λ";
-//    std::string ArgNames;
-//    auto *MPhi = MSSA->getMemoryAccess(Header);
-//    if (MPhi) {
-//      ArgNames += getNameOrAsOperand(MemPtr) + ".old ";
-//    }
-//    for (auto &P : Header->phis()) {
-//      if (&P == IV) continue;
-//      ArgNames += getNameOrAsOperand(&P) + " ";
-//    }
-//    out() << ArgNames << getNameOrAsOperand(IV) << ".\n";
-//
-//    indent();
-//
-//    if (Header == Latch) {
-//      Executor E;
-//      // outputs
-//      auto *LiveOut = &*L->getExitBlock()->phis().begin();
-//      assert(!(LiveOut && MPhi) && "simultaneous memory and scalar output not supported right now");
-//      if (LiveOut) {
-//        out() << prefix() << E.SExpr(LiveOut->getIncomingValue(0));
-//        //      out() << prefix() << getNameOrAsOperand(LiveOut->getIncomingValue(0));
-//      } else {
-//        out() << prefix() << E.SExpr(MemInst->getMemoryInst());
-//        //      out() << prefix() << getNameOrAsOperand(MemPtr) + ".new";
-//      }
-//      out() << "\n";
-//    } else {
-//      // other code in loop body ending at latch
-//      wave(T, Latch);
-//    }
-//
-//    indent();
-//
-//    out() << prefix() << "let r = fold (";
-//    // grab phis
-//    ListSeparator LS(", ");
-//    std::string OutNames;
-//    if (MPhi) {
-//      // initial val
-//      auto *Incoming = MPhi->getIncomingValueForBlock(L->getLoopPreheader());
-//      auto FreshMem = getNameOrAsOperand(MemPtr) + "." + Incoming->getBlock()->getName().str();
-//      out() << LS << FreshMem;
-//      // ongoing val
-//      OutNames += getNameOrAsOperand(MemPtr) + "." + L->getLoopLatch()->getName().str();
-//    }
-//
-//    for (auto &P : Header->phis()) {
-//      if (&P == IV)
-//        continue;
-//      if (&P != &*Header->phis().begin() || MPhi)
-//        OutNames += ", ";
-//      out() << LS << getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopPreheader()));
-//      OutNames += getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopLatch()));
-//    }
-//
-//    out() << ") " << FoldName << " Range(" << getNameOrAsOperand(&B->getInitialIVValue())
-//           << ", " << getNameOrAsOperand(&B->getFinalIVValue()) << ") in\n";
-//
-//    indent();
-//    out() << prefix() << "let " << OutNames << " = r in\n";
-//    indent();
-//    if (MPhi)
-//      out() << prefix() << OutNames;
-//    else {
-//      auto *LiveOut = &*L->getExitBlock()->phis().begin();
-//      out() << prefix() << getNameOrAsOperand(LiveOut->getIncomingValue(0));
-//    }
-//    out() << "\n";
-//
-//    auto *Exit = L->getExitBlock();
-//    visitBB(Exit, To);
-//
-//    deindent();
-//    deindent();
-//    deindent();
-//    deindent();
-//  }
-//
-//  friend raw_ostream &operator<<(raw_ostream &OS, const Translate &T);
-//};
-//
-//raw_ostream &operator<<(raw_ostream &OS, const Translate &T) {
-//  return OS << T.StrOutput;
-//}
-
-//void TranslateBB(std::string Prefix, BasicBlock *From, BasicBlock *To, SmallPtrSetImpl<BasicBlock*> &Visited, LoopInfo *LI, ScalarEvolution *SE);
-//
-//void TranslateWave(std::string Prefix, Instruction *Terminator, SmallPtrSetImpl<BasicBlock*> &Visited, BasicBlock *To, LoopInfo *LI, ScalarEvolution *SE) {
-//  if (auto *Br = dyn_cast<BranchInst>(Terminator)) {
-//    for (auto *O : Br->successors()) {
-//      if (all_of(predecessors(O), [&](BasicBlock *P) {
-//            if (!Visited.contains(P)) {
-//              auto *L = LI->getLoopFor(O);
-//              return L && L->getLoopLatch() == P;
-//            }
-//            return true;
-//          }))
-//        TranslateBB(Prefix, O, To, Visited, LI, SE);
-//    }
-//  }
-//}
-//
-//void TranslateInstruction(std::string Prefix, Instruction *I) {
-//  if (auto *Phi = dyn_cast<PHINode>(I)) {
-//    // collect pred. branches
-//    dbgs() << Prefix << "let " << getNameOrAsOperand(I) << " = ";
-//    for (int V = 0;  V < Phi->getNumIncomingValues(); ++V) {
-//      auto *Val = Phi->getIncomingValue(V);
-//      auto *BB = Phi->getIncomingBlock(V);
-//      dbgs() << "if (";
-//      auto *T = BB->getTerminator();
-//      if (auto *Br = dyn_cast_or_null<BranchInst>(T)) {
-//        if (Br->isUnconditional())
-//          dbgs() << "true";
-//        else {
-//          if (Br->getSuccessor(1) == BB) // true
-//            dbgs() << getNameOrAsOperand(Br->getCondition());
-//          else
-//            dbgs() << "!" << getNameOrAsOperand(Br->getCondition());
-//        }
-//      }
-//      dbgs() << ") then " << getNameOrAsOperand(Val) << " ";
-//      if (V + 1 < Phi->getNumIncomingValues())
-//        dbgs() << "else ";
-//    }
-//    dbgs() << "\n";
-//  } else {
-//    dbgs() << Prefix << "let " << *I << " in\n";
-//  }
-//}
-//
-//void TranslateLoop(std::string Prefix, Loop *L, LoopInfo *LI, ScalarEvolution *SE, SmallPtrSetImpl<BasicBlock*> &Visited) {
-//  auto *IV = L->getInductionVariable(*SE);
-//  auto B = L->getBounds(*SE);
-//  auto *Header = L->getHeader();
-//  auto *T = Header->getTerminator();
-//  auto *Latch = L->getLoopLatch();
-//
-//  dbgs() << Prefix << "let f = λ";
-//  std::string ArgNames;
-//  for (auto &P : Header->phis()) {
-//    if (&P == IV) continue;
-//    ArgNames += getNameOrAsOperand(&P) + " ";
-//  }
-//  dbgs() << ArgNames << getNameOrAsOperand(IV) << ".\n";
-//
-//  auto NewPrefix = Prefix + "\t";
-//
-//  if (Header == Latch) {
-//    auto *I = Header->getFirstNonPHI();
-//    while (I != Header->getTerminator()) {
-//      TranslateInstruction(NewPrefix, I);
-//      I = I->getNextNode();
-//    }
-//  } else {
-//    // other code in loop body ending at latch
-//    TranslateWave(NewPrefix, T, Visited, Latch, LI, SE);
-//  }
-//
-//  NewPrefix += "\t";
-//
-//  dbgs() << NewPrefix << "let r = fold (";
-//  // grab phis
-//  ListSeparator LS(", ");
-//  std::string OutNames;
-//  for (auto &P : Header->phis()) {
-//    if (&P == IV)
-//      continue;
-//    dbgs() << LS << getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopPreheader()));
-//    OutNames += getNameOrAsOperand(P.getIncomingValueForBlock(L->getLoopLatch())) + ", ";
-//  }
-//  dbgs() << ") f Range(" << getNameOrAsOperand(&B->getInitialIVValue())
-//         << ", " << getNameOrAsOperand(&B->getFinalIVValue()) << ") in\n";
-//  dbgs() << NewPrefix << "\t" << "let " << OutNames << "= r in\n";
-//
-//}
-//
-//void TranslateBB(std::string Prefix, BasicBlock *From, BasicBlock *To, SmallPtrSetImpl<BasicBlock*> &Visited, LoopInfo *LI, ScalarEvolution *SE) {
-//  Visited.insert(From);
-//  if (LI->isLoopHeader(From)) {
-//    TranslateLoop(Prefix, LI->getLoopFor(From), LI, SE, Visited);
-//    auto *Exit = LI->getLoopFor(From)->getExitBlock();
-//    TranslateBB(Prefix + "\t", Exit, To, Visited, LI, SE);
-//  } else {
-////    dbgs() << Prefix << From->getName() << ":\n";
-//    for (auto &I : *From) {
-//      if (&I == From->getTerminator()) break;
-//      TranslateInstruction(Prefix, &I);
-//    }
-//    if (From == To)
-//      return;
-//    auto *T = From->getTerminator();
-//    TranslateWave(Prefix, T, Visited, To, LI, SE);
-//  }
-//}
-//void Translate(Function *F, LoopInfo *LI, ScalarEvolution *SE) {
-//  auto *Entry = &F->getEntryBlock();
-//  SmallPtrSet<BasicBlock*, 10> Visited;
-//  TranslateBB("", Entry, nullptr, Visited, LI, SE);
-//
-//}
-
-//std::string PhisAsParams(iterator_range<filter_iterator<BasicBlock>> Phis, PHINode *IV) {
-//  std::string StrParam = "";
-//  raw_string_ostream Params(StrParam);
-//  ListSeparator LS(", ");
-//  for (auto &Phi : Phis) {
-//    Params << LS << getNameOrAsOperand(&Phi);
-//  }
-//  if (!Phis.empty())
-//    Params << ", ";
-//  Params << getNameOrAsOperand(IV);
-//  return StrParam;
-//}
-
-//std::string PhisAsArgs(BasicBlock *Header, PHINode *IV) {
-//  std::string Args = "";
-//  for (auto &Phi : Header->phis()) {
-//    if (IV == &Phi) continue;
-//    if (&Phi != &*Header->phis().begin())
-//      Args += ", ";
-//    Args += getNameOrAsOperand(Phi.getIncomingValueForBlock());
-//  }
-//  if (!Header->phis().empty())
-//    Params += ", ";
-//  Params += getNameOrAsOperand(IV);
-//}
-
+};
 
 class LambdaV2 {
 public:
@@ -1939,8 +1267,47 @@ public:
 
   void translate(Function &F) {
     analyzeMemory(&F);
-    Exit2Loop.clear();
-    Latch2Loop.clear();
+//    Exit2Loop.clear();
+//    Latch2Loop.clear();
+
+    for (auto *TopLoop : LI.getTopLevelLoops()) {
+      LoopNest LN(*TopLoop, SE);
+      for (auto *Loop : LN.getLoops()) {
+        auto *Header = Loop->getHeader();
+        auto *Exit = Loop->getExitBlock();
+        auto *Latch = Loop->getLoopLatch();
+        auto *IV = Loop->getInductionVariable(SE);
+        std::vector<const MemoryAccess*> MemOutputs;
+        std::vector<Value*> Outputs;
+        if (auto *P = dyn_cast_or_null<MemoryPhi>(MSSA.getMemoryAccess(Latch)))
+          MemOutputs.push_back(P);
+        else if (MSSA.getBlockDefs(Latch)) {
+          MemOutputs.push_back(&*MSSA.getBlockDefs(Latch)->rbegin());
+        }
+
+        for (auto &P : Exit->phis())
+          Outputs.push_back(&P);
+        // memory
+        // a phi in the latch means the loop body is somehow modifiying memory
+        // (might be in a subloop)
+
+        std::vector<MemoryPhi*> MemInputs;
+        std::vector<Value*> Inputs;
+        if (auto *P = MSSA.getMemoryAccess(Header))
+          MemInputs.push_back(P);
+        for (auto &P : Header->phis()) {
+          if (&P == IV) continue;
+          Inputs.push_back(&P);
+        }
+        Inputs.push_back(IV);
+
+        Fold Fl(Loop, MemInputs, Inputs, MemOutputs, Outputs);
+        Fl.dump();
+      }
+    }
+
+    return;
+
     ReversePostOrderTraversal<Function*> RPOT(&F);
     SmallPtrSet<BasicBlock*, 5> Visited;
 
@@ -2124,202 +1491,6 @@ private:
   }
 };
 
-//class Lambda {
-//public:
-//  Lambda(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA)
-//      : LI(LI), SE(SE), MSSA(MSSA), ToLam(Inline()) {}
-//
-//
-//  void translate(Function &F) {
-//    analyzeMemory(&F);
-//    Exit2Loop.clear();
-//    Latch2Loop.clear();
-//    ReversePostOrderTraversal<Function*> RPOT(&F);
-//    SmallPtrSet<BasicBlock*, 5> Visited;
-//
-//    // make first Abs
-//    Var Params1(F.args());
-//
-//
-//    std::string Params = "";
-//    for (auto &Arg : F.args()) {
-//      if (&Arg != &*F.arg_begin()) Params += " ";
-//      Params += getNameOrAsOperand(&Arg);
-//    }
-//    dbgs() << "let " << F.getName() << " = λ" << Params << ".\n";
-//    Tabs += "\t";
-//
-//    for (auto *BB : RPOT) {
-//      if (Visited.contains(BB))
-//        continue;
-//      Visited.insert(BB);
-//      if (Latch2Loop[BB]) {
-//        Tabs.pop_back();
-//        latch(BB);
-//        dbgs() << " in\n";
-//      }
-//      else if (Exit2Loop[BB]) {
-//        exit(BB);
-//      }
-//      else if (LI.isLoopHeader(BB)) {
-//        auto *Header = BB;
-//        auto *L = LI.getLoopFor(Header);
-//        auto *Latch = L->getLoopLatch();
-//        auto *ExitBlock = L->getExitBlock();
-//        auto *IV = L->getInductionVariable(SE);
-//        auto Params = make_filter_range(Header->phis(),
-//                                        [IV](PHINode &P) { return &P != IV; });
-//        Exit2Loop[ExitBlock] = L;
-//        Latch2Loop[Latch] = L;
-//        auto *MemPhi = MSSA.getMemoryAccess(Header);
-//        auto LiveOuts = ExitBlock->phis();
-//        assert((!MemPhi || LiveOuts.empty()) && "simultaneous memory and scalar output not supported right now.");
-//        std::string StrParam = "";
-//        if (MemPhi) {
-//          auto *Clob = MSSA.getWalker()->getClobberingMemoryAccess(MemPhi);
-//          StrParam += getNameOrAsOperand(MemPtr) + " ";
-//        }
-//        {
-//          raw_string_ostream Ps(StrParam);
-//          ListSeparator LS(" ");
-//          for (auto &Phi : Params) {
-//            Ps << LS << getNameOrAsOperand(&Phi);
-//          }
-//          if (!Params.empty())
-//            Ps << " ";
-//          Ps << getNameOrAsOperand(IV);
-//        }
-//
-//        dbgs() << Tabs << "let " << BB->getName() << " = λ" <<  StrParam << ". \n";
-//
-//        if (Header != Latch)
-//          Tabs += "\t";
-//        else
-//          latch(Latch);
-//        dbgs() << " in\n";
-//      } else {
-//        bb(BB);
-////        dbgs() << Tabs << BB->getName();
-////        if (Latch2Loop[BB])
-////          dbgs() << " (end " << Latch2Loop[BB]->getHeader()->getName() << ")";
-////        dbgs() << "\n";
-//      }
-//    }
-//  }
-//
-//private:
-//  LoopInfo &LI;
-//  ScalarEvolution &SE;
-//  MemorySSA &MSSA;
-//  const MemoryDef *MemInst = nullptr;
-//  Value *MemPtr = nullptr;
-//  DenseMap<BasicBlock*, Loop*> Exit2Loop;
-//  DenseMap<BasicBlock*, Loop*> Latch2Loop;
-//  Inline ToLam;
-//  std::string Tabs = "";
-//
-//  void phi(PHINode *P) {
-//    Executor E;
-//    assert(P->getNumIncomingValues() == 2 && "only 2 incoming vals supported right now");
-//    auto *B1 = P->getIncomingBlock(0);
-//    auto *B2 = P->getIncomingBlock(1);
-//    auto *Br1 = dyn_cast<BranchInst>(B1->getTerminator());
-//    auto *Br2 = dyn_cast<BranchInst>(B2->getTerminator());
-//    auto *Then = Br1->isConditional() ? Br1 : Br2;
-//    auto *Else = Br1->isConditional() ? Br2 : Br1;
-//    assert(Else->isUnconditional() && "unsupported control flow.");
-//    auto Cond = getNameOrAsOperand(Then->getCondition());
-//    if (Then->getOperand(1) == P->getParent()) // False target
-//      Cond = "(not " + Cond + ")";
-//    dbgs() << "if " << Cond;
-//    dbgs() << " then " << E.SExpr(P->getIncomingValueForBlock(Then->getParent()));
-//    dbgs() << " else " << E.SExpr(P->getIncomingValueForBlock(Else->getParent()));
-//  }
-//
-//  void bb(BasicBlock *BB) {
-//    Executor E;
-//    for (auto &P : BB->phis()) {
-//      dbgs() << Tabs << "let " << getNameOrAsOperand(&P) << " = ";
-//      phi(&P);
-//      dbgs() << " in\n";
-//    }
-//    auto *I = BB->getFirstNonPHI();
-//    auto *T = BB->getTerminator();
-//    while (I && I != T) {
-//      dbgs() << Tabs << "let " << getNameOrAsOperand(I) << " = " << E.SExpr(I) << " in\n";
-//      I = I->getNextNode();
-//    }
-//    if (auto *Ret = dyn_cast<ReturnInst>(T)) {
-//      if (!Ret->getReturnValue())
-//        dbgs() << Tabs << getNameOrAsOperand(MemPtr) << "\n";
-//      else
-//        dbgs() << Tabs << getNameOrAsOperand(Ret->getReturnValue()) << "\n";
-//    }
-//  }
-//
-//  void exit(BasicBlock *Exit) {
-//    Executor E;
-//    Loop *L = Exit2Loop[Exit];
-//    auto *Header = L->getHeader();
-//    auto *IV = L->getInductionVariable(SE);
-//    auto B = L->getBounds(SE);
-//    auto Start = E.SExpr(B->getInitialIVValue());
-//    auto End = E.SExpr(B->getFinalIVValue());
-//    std::string Base = "";
-//    auto Params = make_filter_range(Header->phis(),
-//                                    [IV](PHINode &P) { return &P != IV; });
-//    std::string Args = "";
-//    for (auto &P : Params) {
-//      if (&P != &*Params.begin()) Args += ", ";
-//      Args += E.SExpr(P.getIncomingValueForBlock(L->getLoopPreheader()));
-//    }
-//
-//    dbgs() << Tabs << "let " << getNameOrAsOperand(&*Exit->phis().begin()) << " = fold"
-//           << " (" << Args << ") "
-//           << L->getHeader()->getName() << " "
-//           << "Range(" << Start << ", " << End << ")" << " in\n";
-//  }
-//
-//  void latch(BasicBlock *Latch) {
-//    Loop *L = Latch2Loop[Latch];
-//    auto LiveOuts = L->getExitBlock()->phis();
-//    Executor E;
-//    if (!LiveOuts.empty()) {
-//      for (auto &LO : LiveOuts)
-//        dbgs() << Tabs << E.SExpr(LO.getIncomingValue(0)) << " ";
-//    } else {
-//      auto *Inst = MemInst->getMemoryInst();
-//      if (LI.getLoopFor(Inst->getParent()) == L)
-//        dbgs() << Tabs << E.SExpr(MemInst->getMemoryInst()) << " ";
-//      else {
-//        // nearest clobber
-//        auto *LatchPhi = MSSA.getMemoryAccess(Latch);
-//
-//      }
-//    }
-////    dbgs() << "\n";
-//  }
-//
-//  void analyzeMemory(Function *F) {
-//    for (auto &BB : *F) {
-//      const auto *Defs = MSSA.getBlockDefs(&BB);
-//      if (Defs) {
-//        for (const auto &MA : *Defs) {
-//          if (auto *D = dyn_cast<MemoryDef>(&MA)) {
-//            assert(!MemPtr && "only 1 stored ptr supported right now");
-//            MemInst = D;
-//          }
-//        }
-//      }
-//    }
-//    if (MemInst) {
-//      auto *Ptr = SE.getSCEV(MemInst->getMemoryInst()->getOperand(1));
-//      auto *Base = dyn_cast<SCEVUnknown>(SE.getPointerBase(Ptr));
-//      MemPtr = Base->getValue();
-//      dbgs() << getNameOrAsOperand(MemPtr) << " is modified\n";
-//    }
-//  }
-//};
 
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   outs() << F.getName() << "\n";
@@ -2339,285 +1510,5 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   LambdaV2 Lam(LI, SE, MSSA);
   Lam.translate(F);
 
-  return PreservedAnalyses::all();
-  Node *LO;
-  std::vector<LevelBounds> Levels;
-  struct CSRLevels CSR;
-  if (LI.getTopLevelLoops().size() == 0) {
-    // TODO handle memory too
-    for (auto &BB : F) {
-      for (auto &I : BB) {
-        if (auto *Ret = dyn_cast<ReturnInst>(&I)) {
-          LO = new Node(Ret);
-          break; // TODO multiple values
-        }
-      }
-    }
-  } else {
-//    Translate Tr(&LI, &SE, &MSSA);
-//    Tr.visit(&F);
-//    dbgs() << Tr;
-//    return PreservedAnalyses::all();
-
-    LoopNest LN(*LI.getTopLevelLoops()[0], SE);
-    for (int Depth = LN.getNestDepth(); Depth > 0; --Depth){
-      auto *L = LN.getLoopsAtDepth(Depth)[0];
-      auto *IV = L->getInductionVariable(SE);
-      SmallVector<std::string> Start;
-      SmallVector<PHINode*> Params;
-//      for (auto *BB : L->blocks()) {
-//        auto *First = BB->getFirstNonPHI();
-//
-//        for (auto &I : *BB) {
-//          switch (I.get) {
-//
-//          }
-//        }
-//      }
-      
-      auto *MemPhi = MSSA.getMemoryAccess(L->getHeader());
-      if (MemPhi) {
-        auto *V = MemPhi->getIncomingValueForBlock(L->getLoopPreheader());
-        auto *MP = dyn_cast<MemoryPhi>(V);
-        auto *MD = dyn_cast<MemoryUseOrDef>(V);
-        if (MP)
-          Start.push_back("heap." + std::to_string(MP->getID()));
-        else {
-          if (MSSA.isLiveOnEntryDef(MD))
-            Start.push_back("heap.liveOnEntry");
-          else
-            Start.push_back("heap." + getNameOrAsOperand(MD->getMemoryInst()));
-        }
-      }
-
-      for (auto &Phi : L->getHeader()->phis()) {
-        if (&Phi != IV) {
-          Start.push_back(getNameOrAsOperand(Phi.getIncomingValueForBlock(L->getLoopPreheader())));
-          Params.push_back(&Phi);
-        }
-      }
-      Params.push_back(IV);
-      // generate f
-      Executor E;
-      std::string f = "Abs([";
-      raw_string_ostream Abs(f);
-      ListSeparator LS(", ");
-      if (MemPhi) {
-        auto *LoopVal = MemPhi->getIncomingValueForBlock(L->getLoopLatch());
-        auto *MP = dyn_cast<MemoryPhi>(LoopVal);
-        auto *MD = dyn_cast<MemoryUseOrDef>(LoopVal);
-        if (MP)
-          Abs << LS << "heap." + std::to_string(MP->getID());
-        else {
-          auto *MI = MD->getMemoryInst();
-          Abs << LS << E.SExpr(getLoadStorePointerOperand(MI));
-        }
-      }
-      for (auto *P : Params) {
-        Abs << LS << getNameOrAsOperand(P);
-      }
-      f += "] ";
-      if (MemPhi) {
-        auto *LoopVal = MemPhi->getIncomingValueForBlock(L->getLoopLatch());
-//        auto *Clob = MSSA.getWalker()->getClobberingMemoryAccess(LoopVal);
-        auto *MP = dyn_cast<MemoryPhi>(LoopVal);
-        auto *MD = dyn_cast<MemoryUseOrDef>(LoopVal);
-        if (MP)
-          f += "heap." + std::to_string(MP->getID());
-        else {
-          auto *MI = MD->getMemoryInst();
-          f += E.SExpr(MI) + " ";
-        }
-      }
-      for (auto *P : Params) {
-        if (P == IV)
-          continue;
-        f += E.SExpr(P->getIncomingValueForBlock(L->getLoopLatch()));
-        f += " ";
-      }
-
-      LLVM_DEBUG({
-        dbgs() << L->getName() << ": \n";
-        dbgs() << "fold (";
-        ListSeparator LS(", ");
-        for (auto &V : Start) dbgs() << LS << V;
-        dbgs() << ") ";
-        dbgs() << f << ")";
-        auto B = L->getBounds(SE);
-        dbgs() << " Range(" << getNameOrAsOperand(&B->getInitialIVValue())
-               << ", " << getNameOrAsOperand(&B->getFinalIVValue()) << ")\n";
-      });
-    }
-    return PreservedAnalyses::all();
-
-    makeLevelBounds(&LN, &SE, Levels);
-    DenseMap<Value *, LevelBounds> LevelMap;
-    for (auto &Level : Levels)
-      LevelMap[Level.Iterator] = Level;
-
-    // get all liveouts
-    DenseMap<Loop *, Value *> LiveOutMap;
-
-    DenseMap<Loop *, SmallPtrSet<Value *, 5>> Loop2Loads;
-    for (auto *Loop : LN.getLoops()) {
-      // collect live out (store or scalar live-out)
-      Value *LiveOut = findLiveOut(Loop, &LI);
-      if (LiveOut == nullptr) {
-        LLVM_DEBUG(dbgs() << "no liveouts.\n");
-        continue;
-      }
-      LLVM_DEBUG(dbgs() << "live out = " << *LiveOut << "\n");
-      LiveOutMap[Loop] = LiveOut;
-      SmallPtrSet<Value *, 5> TopLevelInputs;
-      makeTopLevelInputs(LiveOut, TopLevelInputs);
-      Loop2Loads[Loop] = TopLevelInputs;
-    }
-
-    SmallVector<LoadInst *> TopLevelLoads;
-    for (auto &E : Loop2Loads) {
-      for (auto *Input : E.second)
-        if (auto *Load = dyn_cast<LoadInst>(Input))
-          TopLevelLoads.push_back(Load);
-    }
-
-    LLVM_DEBUG({
-      dbgs() << "Top level loads ------------\n";
-      for (auto *In : TopLevelLoads)
-        dbgs() << *In << "\n";
-      dbgs() << "----------------------------\n";
-    });
-
-    SmallPtrSet<LoadInst *, 5> Leftover;
-    DenseMap<Value *, Tensor *> TensorMap;
-    auto AllCovered =
-        coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap, Leftover, TensorMap);
-    LLVM_DEBUG({
-      if (AllCovered)
-        dbgs() << "all loads covered.\n";
-      else {
-        dbgs() << "remaining loads:\n";
-        for (auto *L : Leftover)
-          dbgs() << *L << "\n";
-      }
-    });
-
-    AssumptionCache AC(F);
-    DemandedBits DB(F, AC, DT);
-
-    std::error_code EC;
-    raw_fd_ostream SExpOut(AnalysisOutputPath + ".sexp", EC);
-    for (int Depth = LN.getNestDepth(); Depth > 0; Depth--) {
-      for (auto *Loop : LN.getLoopsAtDepth(Depth)) {
-        // get liveout for loop
-        Value *LiveOut = LiveOutMap[Loop];
-        if (LiveOut == nullptr)
-          continue;
-
-        RecurrenceDescriptor RD;
-        if (any_of(Loop->getHeader()->phis(), [&](PHINode &Phi) {
-              return RecurrenceDescriptor::isReductionPHI(&Phi, Loop, RD, &DB,
-                                                          &AC, &DT, &SE) &&
-                     RD.getLoopExitInstr() == LiveOut;
-            })) {
-          LLVM_DEBUG(dbgs() << *LiveOut << " is a reduction.\n");
-          // candidate for fold
-          emitFold(SExpOut, Loop, LiveOut, Loop->getInductionVariable(SE), RD, LevelMap,
-                   TensorMap);
-          continue;
-        }
-        // is it a map?
-        if (auto *Store = dyn_cast<StoreInst>(LiveOut)) {
-          emitMap(SExpOut, Loop, &LI, Store->getValueOperand(), Loop->getInductionVariable(SE), RD, LevelMap,
-                  TensorMap);
-        }
-      }
-    }
-
-    //    for (int Depth = LN.getNestDepth(); Depth > 0; Depth--) {
-    //      for (auto *Loop : LN.getLoopsAtDepth(Depth)) {
-    //        LLVM_DEBUG(dbgs() << "-----------------------\n");
-    //        LLVM_DEBUG(dbgs() << "Loop at depth " << Depth << ":\n");
-    //        // collect all inputs (loads only) in the current scope
-    //        SmallPtrSet<LoadInst*, 4> Loads;
-    //        allLoadsInCurrentScope(Loop, Loads);
-    //
-    //        // collect live out (store or scalar live-out)
-    //        Value *LiveOut = findLiveOut(Loop, &LI);
-    //        if (LiveOut == nullptr) {
-    //          LLVM_DEBUG(dbgs() << "no liveouts.\n");
-    //          continue;
-    //        }
-    //        LLVM_DEBUG(dbgs() << "live out = " << *LiveOut << "\n");
-    //
-    //        // make top-level dependences (value arrays + scalar inputs)
-    //        SmallVector<Value*> TopLevelInputs;
-    //        LLVM_DEBUG(dbgs() << "Inputs ------------\n");
-    //        makeTopLevelInputs(LiveOut, TopLevelInputs);
-    //        LLVM_DEBUG(dbgs() << "-------------------\n");
-    //        SmallVector<LoadInst*> InputLoads;
-    //        for (auto *V : TopLevelInputs)
-    //          if (auto *Load = dyn_cast<LoadInst>(V))
-    //            InputLoads.push_back(Load);
-    //
-    ////        for (auto *Load : Loads)
-    ////          LLVM_DEBUG(dbgs() << *Load << "\n");
-    //        coverAllLoads(&LI, Loop, &SE, InputLoads, LevelMap);
-    //        LLVM_DEBUG(dbgs() << "-----------------------\n");
-    //      }
-    //    }
-
-    //    bool IsCSR = detectCSR(Levels, &CSR);
-    //    LLVM_DEBUG(dbgs() << "iscsr = " << IsCSR << "\n");
-
-    SmallPtrSet<Value *, 4> LiveOuts;
-    GetLiveOuts(&LN.getOutermostLoop(), LiveOuts);
-
-    Instruction *LiveOut = dyn_cast<Instruction>(*LiveOuts.begin());
-    LO = new Node(LiveOut);
-
-    raw_fd_ostream OutputFile(AnalysisOutputPath + ".yaml", EC);
-    Output Yout(OutputFile);
-
-    SmallPtrSet<Value *, 4> LiveIns;
-    GetLiveIns(&F, LiveIns);
-    std::vector<Atom> LiveInList;
-    for (auto *LiveIn : LiveIns)
-      LiveInList.push_back(
-          {getNameOrAsOperand(LiveIn), Type2String(LiveIn), ""});
-
-    //  std::vector<Value *> WorkList;
-    //  WorkList.insert(WorkList.begin(), LiveIns.begin(), LiveIns.end());
-    //  SmallPtrSet<Value *, 4> Dense;
-    //  while(!WorkList.empty()) {
-    //    Value *Head = WorkList.back();
-    //    if (Head == CSR.I.UpperBound ||
-    //        Head == CSR.Crd ||
-    //        Head == CSR.Pos) {
-    //      WorkList.pop_back();
-    //    }
-    //  }
-
-    std::vector<Tensor *> AllTensors;
-    for (auto &E : TensorMap)
-      AllTensors.push_back(E.second);
-
-    std::vector<BBNode> AllBBs;
-    for (auto &BB : F) {
-      BBNode BN;
-      BN.Name = BB.getName();
-      for (auto &I : BB) {
-        BN.Nodes.push_back(Node(&I));
-      }
-      AllBBs.push_back(BN);
-    }
-    Yout << AllBBs;
-    Yout << *LO;
-    Yout << LiveInList;
-    Yout << AllTensors;
-
-    for (auto &E : TensorMap) {
-      delete E.second; // TODO use smart pointers
-    }
-  }
   return PreservedAnalyses::all();
 }
