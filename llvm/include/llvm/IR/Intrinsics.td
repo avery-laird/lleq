@@ -2518,6 +2518,12 @@ def int_ptrauth_sign_generic :
 
 //===----------------------------------------------------------------------===//
 
+def int_symbolic_memory_load :
+  DefaultAttrsIntrinsic<[llvm_any_ty], [llvm_vararg_ty]>;
+
+def int_fresh_scalar :
+  DefaultAttrsIntrinsic<[llvm_any_ty], []>;
+
 //===----------------------------------------------------------------------===//
 // Target-specific intrinsics
 //===----------------------------------------------------------------------===//
