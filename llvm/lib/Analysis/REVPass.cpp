@@ -3,6 +3,7 @@
 //
 
 #include "llvm/ADT/SCCIterator.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/Analysis/REVPass.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/DDG.h"
@@ -1383,16 +1384,90 @@ public:
     collectInsts<ChainTy>(Root, Chain);
   }
 
-  void mkDenseChain(std::vector<Value*> &Chain, std::vector<Value*> &DenseChain, DenseMap<Value*, Tensor*> &TensorMap) {
-    for (auto *V : Chain) {
-        // looking for values in the tensormap
-        Tensor *T = TensorMap[V];
-        if (!T) {
-            DenseChain.push_back(V);
-            return;
-        }
-        dbgs() << "found tensor " << getNameOrAsOperand(V) << " in chain.\n";
+  // return the instruction to replace so that the load
+  // becomes affine, or nullptr
+  Instruction *indirectLoad(Value *I) {
+    auto *Load = dyn_cast<LoadInst>(I);
+    if (!Load) return nullptr;
+    auto *GEP = dyn_cast<GEPOperator>(Load->getPointerOperand());
+    if (!GEP) return nullptr;
+    auto *Idx = GEP->getOperand(1);
+    while (auto *Cast = dyn_cast<CastInst>(Idx))
+        Idx = Cast->getOperand(0);
+    return dyn_cast<LoadInst>(Idx);
+  }
+
+  Value *traverseDenseChain(Value *V, PHINode *IV, std::vector<Value *> &Chain, SmallPtrSetImpl<Value*> &Indirect) {
+    if (none_of(Chain.begin(), Chain.end(), [&](Value* E){ return E == V; }))
+        return V; // ignore insts not in the chain
+    // cut indirect loads
+    auto *Load = dyn_cast<LoadInst>(V);
+    if (Indirect.contains(Load)) {
+        return IV;
     }
+    // inst or memphi?
+    if (auto *I = dyn_cast<Instruction>(V)) {
+        auto *NewI = I->clone();
+        if (!NewI->getType()->isVoidTy())
+            NewI->setName((getNameOrAsOperand(I) + ".dense").erase(0));
+        for (size_t Op = 0; Op < I->getNumOperands(); ++Op) {
+            NewI->setOperand(Op, traverseDenseChain(I->getOperand(Op), IV, Chain, Indirect));
+        }
+        return NewI;
+    } else if (auto *M = dyn_cast<MemoryAccess>(V)) {
+        // TODO not sure right now
+        dbgs() << "skipping memory access: " << *M << "\n";
+        return nullptr;
+    }
+    // don't clone values! like args
+  }
+
+  void mkDenseChain(std::vector<Value *> &Chain,
+                    std::vector<Value *> &DenseChain,
+                    DenseMap<Value *, Tensor *> &TensorMap) {
+    auto &Context = L->getHeader()->getParent()->getContext();
+    BasicBlock *DenseBlock =
+        BasicBlock::Create(Context, L->getName() + ".dense");
+    IRBuilder Builder(DenseBlock);
+    PHINode *NewIV = PHINode::Create(Type::getInt64Ty(Context), 2, "iv.dense");
+    SmallPtrSet<Value*, 4> IndirectLoads;
+    for (auto *V : Chain)
+        if (auto *Load = indirectLoad(V))
+            IndirectLoads.insert(Load);
+    Value *NewOut = traverseDenseChain(Chain[0], NewIV, Chain, IndirectLoads);
+    if (NewOut)
+        NewOut->dump();
+    for (auto *V : Chain) {
+        if (auto *I = dyn_cast<Instruction>(V))
+          dbgs() << *I << "\n";
+        else if (auto *M = dyn_cast<MemoryAccess>(V))
+          dbgs() << "  " << *M << "\n";
+    }
+//    for (auto *V : Chain) {
+//        // looking for values in the tensormap
+//        //        Tensor *T = TensorMap[V];
+//        //        if (!T) {
+//        //            DenseChain.push_back(V);
+//        //            return;
+//        //        }
+//        //        dbgs() << "found tensor " << getNameOrAsOperand(V) << " in
+//        //        chain.\n";
+//
+//        if (auto *I = dyn_cast<Instruction>(V)) {
+//        auto *NewI = I->clone();
+//        if (!NewI->getType()->isVoidTy()) {
+//          auto Name = getNameOrAsOperand(I);
+//          NewI->setName(Name.substr(1, Name.size()-1));
+//        }
+//        if (!DenseBlock->empty())
+//          NewI->insertBefore(DenseBlock->getFirstNonPHI());
+//        else
+//          NewI->insertInto(DenseBlock, DenseBlock->getFirstInsertionPt());
+//        }
+//    }
+//    DenseBlock->dump();
+    delete DenseBlock;
+    delete NewIV;
   }
 };
 
