@@ -1281,16 +1281,18 @@ class Fold {
   LoopInfo *LI;
   DominatorTree *DT;
   ScalarEvolution *SE;
+  MemorySSA *MSSA;
 public:
-  Fold(Loop *L, LoopInfo *LI, ScalarEvolution *SE, DominatorTree *DT, std::vector<MemoryPhi*> MI, std::vector<PHINode*> I, std::vector<MemoryAccess*> MO, std::vector<Value*> C)
-      : MemInputs(MI), Inputs(I), MemOutputs(MO), Outputs(C), L(L), LI(LI), DT(DT), SE(SE) {}
+  Fold(Loop *L, LoopInfo *LI, ScalarEvolution *SE, DominatorTree *DT, MemorySSA *MSSA, std::vector<MemoryPhi*> MI, std::vector<PHINode*> I, std::vector<MemoryAccess*> MO, std::vector<Value*> C)
+      : MemInputs(MI), Inputs(I), MemOutputs(MO), Outputs(C), L(L), LI(LI), DT(DT), MSSA(MSSA), SE(SE) {}
 
   Value *getChain(std::vector<Value*> &Chain) {
     Value *Out = nullptr;
     if (!Outputs.empty()) {
       auto *PN = dyn_cast<PHINode>(Outputs[0]);
       auto *Inst = dyn_cast<Instruction>(PN->getIncomingValue(0));
-      Out = Inst;
+//      Out = Inst;
+      Out = Outputs[0];
       opChain<Instruction>(Inst, Chain);
     } else if (!MemOutputs.empty()) {
       Out = MemOutputs[0];
@@ -1305,32 +1307,84 @@ public:
     for (auto *V : Ins) OS << LS << *V->getType() << " " << getNameOrAsOperand(V);
   }
 
+  template <class PHITy>
+  void printPhi(raw_ostream &OS, PHITy *Phi, Value *MemPtr) {
+    std::string LeftName = "";
+    if (auto *M = dyn_cast<MemoryPhi>(Phi))
+      LeftName = getNameOrAsOperand(MemPtr) + std::to_string(M->getID());
+    else
+      LeftName = getNameOrAsOperand(Phi);
+
+    if (Phi->getNumIncomingValues() == 1) {
+      // TODO I don't think memory phis will have this
+      if (auto *M = dyn_cast<MemoryPhi>(Phi))
+        llvm_unreachable("weird.");
+      OS << "  " << LeftName << " = " << getNameOrAsOperand(Phi->getIncomingValue(0)) << "\n";
+      return;
+    }
+    auto *BB1 = Phi->getIncomingBlock(0);
+    auto *BB2 = Phi->getIncomingBlock(1);
+    auto *Denom = DT->findNearestCommonDominator(BB1, BB2);
+    auto *Br = dyn_cast<BranchInst>(Denom->getTerminator());
+    BasicBlock *Then, *Else;
+    if (DT->dominates(cast<BasicBlock>(Br->getOperand(2)), BB1)) {
+        // true branch dominates BB1
+        Then = BB1;
+        Else = BB2;
+    } else {
+        Then = BB2;
+        Else = BB1;
+    }
+    OS << "  " << LeftName << " = if " << getNameOrAsOperand(Br->getCondition()) << " then ";
+    if (auto *MP = dyn_cast<MemoryPhi>(Phi)) {
+        auto MemName = getNameOrAsOperand(MemPtr);
+       OS << MemName << "." << MP->getIncomingValueForBlock(Then)->getID();
+       OS << " else ";
+       OS << MemName << "." << MP->getIncomingValueForBlock(Else)->getID();
+    } else if (auto *P = dyn_cast<PHINode>(Phi)) {
+       OS << getNameOrAsOperand(P->getIncomingValueForBlock(Then));
+       OS << " else ";
+       OS << getNameOrAsOperand(P->getIncomingValueForBlock(Else));
+    }
+    OS << "\n";
+  }
+
   void printChain(raw_ostream &OS, Value *MemPtr, std::vector<Value*> &Chain) {
     for (auto I = Chain.rbegin(), E = Chain.rend(); I != E; ++I) {
-      if (auto *MA = dyn_cast<MemoryAccess>(*I)) {
-        if (auto *MP = dyn_cast<MemoryPhi>(MA)) {
-          auto *BB1 = MP->getIncomingBlock(0);
-          auto *BB2 = MP->getIncomingBlock(1);
-          auto *Denom = DT->findNearestCommonDominator(BB1, BB2);
-          auto *Br = dyn_cast<BranchInst>(Denom->getTerminator());
-          auto MemName = getNameOrAsOperand(MemPtr);
-          auto LeftName = MemName + "." + std::to_string(MP->getID());
-          OS << "  " << LeftName << " = if " << getNameOrAsOperand(Br->getCondition()) << " then ";
-          if (BB1 == L->getHeader())
-            OS << MemName;
-          else
-            OS << MemName << "." << MP->getIncomingValue(0)->getID();
-          OS << " else ";
-          if (BB2 == L->getHeader())
-            OS << MemName;
-          else
-            OS << MemName << "." << MP->getIncomingValue(1)->getID();
-          OS << "\n";
-        } else {
-          OS << *MA << "\n"; // TODO should never happen now?
-        }
-      } else
+       if (auto *P = dyn_cast<PHINode>(*I)) {
+        printPhi(OS, P, MemPtr);
+       } else if (auto *MP = dyn_cast<MemoryPhi>(*I)) {
+        printPhi(OS, MP, MemPtr);
+       } else if (auto *S = dyn_cast<StoreInst>(*I)) {
+        auto *Def = dyn_cast<MemoryDef>(MSSA->getMemoryAccess(S));
+        assert(Def != nullptr && "must be a def here.");
+        OS << "  " << getNameOrAsOperand(MemPtr) << "." << Def->getID() << " = " << **I << "\n";
+       } else {
         OS << **I << "\n";
+       }
+//      if (auto *MA = dyn_cast<MemoryAccess>(*I)) {
+//        if (auto *MP = dyn_cast<MemoryPhi>(MA)) {
+//          auto *BB1 = MP->getIncomingBlock(0);
+//          auto *BB2 = MP->getIncomingBlock(1);
+//          auto *Denom = DT->findNearestCommonDominator(BB1, BB2);
+//          auto *Br = dyn_cast<BranchInst>(Denom->getTerminator());
+//          auto MemName = getNameOrAsOperand(MemPtr);
+//          auto LeftName = MemName + "." + std::to_string(MP->getID());
+//          OS << "  " << LeftName << " = if " << getNameOrAsOperand(Br->getCondition()) << " then ";
+//          if (BB1 == L->getHeader())
+//            OS << MemName;
+//          else
+//            OS << MemName << "." << MP->getIncomingValue(0)->getID();
+//          OS << " else ";
+//          if (BB2 == L->getHeader())
+//            OS << MemName;
+//          else
+//            OS << MemName << "." << MP->getIncomingValue(1)->getID();
+//          OS << "\n";
+//        } else {
+//          OS << *MA << "\n"; // TODO should never happen now?
+//        }
+//      }
     }
   }
 
@@ -1415,13 +1469,13 @@ public:
 
 
       for (auto *Arr : LevelMap[IV].CoordArrays) {
-        dbgs() << getNameOrAsOperand(Arr) << " = " << getNameOrAsOperand(NewIV) << "\n";
+        dbgs() << "crd: " << getNameOrAsOperand(Arr) << " = " << getNameOrAsOperand(NewIV) << "\n";
       }
       auto ChainsInTM = make_filter_range(Chain, [&](Value *V) { return TM.count(V); });
       for (auto *P : ChainsInTM) {
         if (!TM[P] || TM[P]->Kind == Tensor::CONTIGUOUS)
           continue;
-        dbgs() << getNameOrAsOperand(P) << " = " << getNameOrAsOperand(TM[P]->Root) << ".dense.elem\n";
+        dbgs() << "val: " << getNameOrAsOperand(P) << " = " << getNameOrAsOperand(TM[P]->Root) << ".dense.elem\n";
       }
 //      static_cast<Constant*>(NewStart)->destroyConstant();
 //      Func->deleteValue();
@@ -1593,7 +1647,7 @@ public:
         }
         Inputs.push_back(IV);
 
-        Fold Fl(Loop, &LI, &SE, &DT, MemInputs, Inputs, MemOutputs, Outputs);
+        Fold Fl(Loop, &LI, &SE, &DT, &MSSA, MemInputs, Inputs, MemOutputs, Outputs);
         Fl.dump(SE, MemPtr, MSSA, TensorMap, LevelMap);
       }
     }
