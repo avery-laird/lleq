@@ -1413,6 +1413,16 @@ public:
 
       printFold(dbgs(), MSSA, IV, NewStart, NewEnd, NewOut, MemPtr);
 
+
+      for (auto *Arr : LevelMap[IV].CoordArrays) {
+        dbgs() << getNameOrAsOperand(Arr) << " = " << getNameOrAsOperand(NewIV) << "\n";
+      }
+      auto ChainsInTM = make_filter_range(Chain, [&](Value *V) { return TM.count(V); });
+      for (auto *P : ChainsInTM) {
+        if (!TM[P] || TM[P]->Kind == Tensor::CONTIGUOUS)
+          continue;
+        dbgs() << getNameOrAsOperand(P) << " = " << getNameOrAsOperand(TM[P]->Root) << ".dense.elem\n";
+      }
 //      static_cast<Constant*>(NewStart)->destroyConstant();
 //      Func->deleteValue();
 //      NewEnd->deleteValue();
@@ -1501,6 +1511,8 @@ public:
         return IV;
     // cut indirect loads
     if (auto *T = TensorMap[V]) {
+//        auto *N = MDNode::get(IV->getContext(), MDString::get(IV->getContext(), getNameOrAsOperand(IV)));
+//        dyn_cast<Instruction>(V)->setMetadata("as.affine", N);
         return T->toDense(DenseChain, L->getInductionVariable(*SE), IV);
     }
     // inst or memphi?
@@ -1535,7 +1547,7 @@ public:
     for (auto *V : Chain)
         if (auto *Load = indirectLoad(V))
             IndirectLoads.insert(Load);
-    Value *NewOut = traverseDenseChain(Chain[0], *NewIV, Chain, DenseChain,IndirectLoads, TensorMap);
+    Value *NewOut = traverseDenseChain(Chain[0], *NewIV, Chain, DenseChain, IndirectLoads, TensorMap);
     std::reverse(DenseChain.begin(), DenseChain.end());
     return NewOut;
   }
