@@ -634,16 +634,16 @@ bool findCrd(Value *Inst, Value **Crd) {
   return DFS(Inst, nullptr, 0, {});
 }
 
-
-void makeLevelBounds(LoopNest *LN, ScalarEvolution *SE,
+void makeLevelBounds(LoopInfo &LI, ScalarEvolution *SE,
                      std::vector<LevelBounds> &Levels) {
+
   DataLayout DL = SE->getDataLayout();
-  //  PHINode *PrevLevel = nullptr;
-  for (auto *Loop : LN->getLoops()) {
-    auto Bounds = Loop->getBounds(*SE);
+
+  for (auto *L : LI.getLoopsInPreorder()) {
+    auto Bounds = L->getBounds(*SE);
     if (!Bounds.has_value())
       continue;
-    auto *IndVar = Loop->getInductionVariable(*SE);
+    auto *IndVar = L->getInductionVariable(*SE);
     LLVM_DEBUG(dbgs() << getNameOrAsOperand(IndVar) << " = ["
                       << Bounds->getInitialIVValue() << ", "
                       << Bounds->getFinalIVValue() << ") -> \n");
@@ -1099,6 +1099,12 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
     return false;
 
   if (auto *GEP = dyn_cast<GEPOperator>(Next)) {
+    if (GEP->getSourceElementType()->isArrayTy() && GEP->getNumIndices() == 2) {
+      *A = GEP->getPointerOperand();
+      *Pk_1 = skipCasts(GEP->getOperand(1));
+      *Ik = skipCasts(GEP->getOperand(2));
+      return true;
+    }
     if (GEP->getNumIndices() != 1)
       return false;
     *A = GEP->getPointerOperand();
@@ -1196,6 +1202,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
         auto *TensorCSR = new CSR({I, J}, Load->getType(), Val, Row, Col);
         //        CSR TensorCSR({Rows, nullptr}, Val, Row, Col);
         TensorMap[Load] = TensorCSR;
+        // find all the memory users of the pos (row) iterator and mark them?
         LLVM_DEBUG({
           dbgs() << "detected CSR:\n";
           dbgs() << "val = " << *Val << "\n";
@@ -1222,7 +1229,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
           dbgs() << "detected dense 2d\n";
           dbgs() << "A = " << *A << "\n";
           dbgs() << "p_{k-1} = " << *Pk_1 << "\n";
-          dbgs() << "N_k = " << *Nk << "\n";
+//          dbgs() << "N_k = " << *Nk << "\n";
           dbgs() << "i_k = " << *Ik << "\n";
           dbgs() << *Dense2D << "\n";
         });
@@ -1373,14 +1380,16 @@ public:
         printPhi(OS, P, MemPtr);
        } else if (auto *MP = dyn_cast<MemoryPhi>(I)) {
         printPhi(OS, MP, MemPtr);
-       } else if (auto *S = dyn_cast<StoreInst>(I)) {
-        auto *Store = S;
-        if (OrigChain)
-          Store = dyn_cast<StoreInst>(OrigChain->operator[](i));
-        auto *Def = dyn_cast<MemoryDef>(MSSA->getMemoryAccess(Store));
-        assert(Def != nullptr && "must be a def here.");
-        OS << "  " << getNameOrAsOperand(MemPtr) << "." << Def->getID() << " = " << *I << "\n";
-       } else {
+       }
+//       else if (auto *S = dyn_cast<StoreInst>(I)) {
+//        auto *Store = S;
+//        if (OrigChain)
+//          Store = dyn_cast<StoreInst>(OrigChain->operator[](i));
+//        auto *Def = dyn_cast<MemoryDef>(MSSA->getMemoryAccess(Store));
+//        assert(Def != nullptr && "must be a def here.");
+//        OS << "  " << getNameOrAsOperand(MemPtr) << "." << Def->getID() << " = " << *I << "\n";
+//       }
+       else {
         OS << *I << "\n";
        }
 //      if (auto *MA = dyn_cast<MemoryAccess>(*I)) {
@@ -1724,7 +1733,7 @@ private:
   }
 };
 
-Value *findLiveOut(Loop *L, LoopInfo *LI) {
+Value *findLiveOut(const Loop *L, LoopInfo &LI) {
   auto *ExitBB = L->getExitBlock();
   assert(ExitBB && "only one exit block allowed.");
   Value *MemoryLO = nullptr;
@@ -1737,7 +1746,7 @@ Value *findLiveOut(Loop *L, LoopInfo *LI) {
   SmallVector<Value *> StoreInsts;
   for (auto *BB : L->blocks())
     for (auto &I : *BB) {
-      auto *ParentLoop = LI->getLoopFor(I.getParent());
+      auto *ParentLoop = LI.getLoopFor(I.getParent());
       if (ParentLoop != L)
         break;
       if (isa<StoreInst>(&I))
@@ -1755,6 +1764,7 @@ Value *findLiveOut(Loop *L, LoopInfo *LI) {
   return StoreInsts[0];
 }
 
+
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   outs() << F.getName() << "\n";
   for (auto &A : F.args()) {
@@ -1770,9 +1780,9 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   MSSA.ensureOptimizedUses();
   auto *Walker = MSSA.getWalker();
 
-  LoopNest LN(*LI.getTopLevelLoops()[0], SE);
+//  LoopNest LN(*LI.getTopLevelLoops()[0], SE);
   std::vector<LevelBounds> Levels;
-  makeLevelBounds(&LN, &SE, Levels);
+  makeLevelBounds(LI, &SE, Levels);
   DenseMap<Value *, LevelBounds> LevelMap;
   for (auto &Level : Levels)
     LevelMap[Level.Iterator] = Level;
@@ -1781,18 +1791,18 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   DenseMap<Loop *, Value *> LiveOutMap;
 
   DenseMap<Loop *, SmallPtrSet<Value *, 5>> Loop2Loads;
-  for (auto *Loop : LN.getLoops()) {
+  for (auto *L : LI.getLoopsInPreorder()) {
     // collect live out (store or scalar live-out)
-    Value *LiveOut = findLiveOut(Loop, &LI);
+    Value *LiveOut = findLiveOut(L, LI);
     if (LiveOut == nullptr) {
       LLVM_DEBUG(dbgs() << "no liveouts.\n");
       continue;
     }
     LLVM_DEBUG(dbgs() << "live out = " << *LiveOut << "\n");
-    LiveOutMap[Loop] = LiveOut;
+    LiveOutMap[L] = LiveOut;
     SmallPtrSet<Value *, 5> TopLevelInputs;
     makeTopLevelInputs(LiveOut, TopLevelInputs);
-    Loop2Loads[Loop] = TopLevelInputs;
+    Loop2Loads[L] = TopLevelInputs;
   }
 
   SmallVector<LoadInst *> TopLevelLoads;
@@ -1813,6 +1823,9 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   DenseMap<Value *, Tensor *> TensorMap;
   auto AllCovered =
       coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap, Leftover, TensorMap);
+  // TODO change this later, but right now the fold assumes at least some loads
+  if (TopLevelLoads.size() == 0)
+    return PreservedAnalyses::all();
   LLVM_DEBUG({
     if (AllCovered)
       dbgs() << "all loads covered.\n";
