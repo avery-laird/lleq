@@ -61,8 +61,13 @@ using namespace llvm;
 
 static cl::opt<std::string>
     DotCFGMSSA("dot-cfg-mssa",
-               cl::value_desc("file name for generated dot file"),
-               cl::desc("file name for generated dot file"), cl::init(""));
+                     cl::value_desc("file name for generated dot file"),
+                     cl::desc("file name for generated dot file"), cl::init(""));
+
+static cl::opt<std::string>
+    DotCFGMSSAPrefix("dot-cfg-mssa-prefix",
+               cl::value_desc("prefix generated dot file"),
+               cl::desc("prefix for generated dot file"), cl::init(""));
 
 INITIALIZE_PASS_BEGIN(MemorySSAWrapperPass, "memoryssa", "Memory SSA", false,
                       true)
@@ -2319,14 +2324,17 @@ PreservedAnalyses MemorySSAPrinterPass::run(Function &F,
                                             FunctionAnalysisManager &AM) {
   auto &MSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
   MSSA.ensureOptimizedUses();
-  if (DotCFGMSSA != "") {
-    DOTFuncMSSAInfo CFGInfo(F, MSSA);
-    WriteGraph(&CFGInfo, "", false, "MSSA", DotCFGMSSA);
-  } else {
-    OS << "MemorySSA for function: " << F.getName() << "\n";
-    MSSA.print(OS);
-  }
-
+  std::string FileName =
+      (DotCFGMSSAPrefix + "." + F.getName() + ".mssa.dot").str();
+  DOTFuncMSSAInfo CFGInfo(F, MSSA);
+  WriteGraph(&CFGInfo, "", false, "MSSA", FileName);
+//  if (DotCFGMSSA != "") {
+//    DOTFuncMSSAInfo CFGInfo(F, MSSA);
+//    WriteGraph(&CFGInfo, "", false, "MSSA", DotCFGMSSA);
+//  } else {
+//    OS << "MemorySSA for function: " << F.getName() << "\n";
+//    MSSA.print(OS);
+//  }
   return PreservedAnalyses::all();
 }
 
