@@ -2,25 +2,24 @@
 // Created by avery on 27/06/23.
 //
 
-#include "llvm/ADT/SCCIterator.h"
-#include "llvm/IR/IRBuilder.h"
 #include "llvm/Analysis/REVPass.h"
+#include "llvm/ADT/SCCIterator.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/BasicAliasAnalysis.h"
 #include "llvm/Analysis/DDG.h"
-#include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/Delinearization.h"
 #include "llvm/Analysis/DemandedBits.h"
 #include "llvm/Analysis/IVDescriptors.h"
 #include "llvm/Analysis/LoopInfo.h"
-#include "llvm/Analysis/DDG.h"
 #include "llvm/Analysis/LoopNestAnalysis.h"
+#include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
-#include "llvm/Analysis/BasicAliasAnalysis.h"
 #include "llvm/IR/Argument.h"
-#include "llvm/IR/Function.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Operator.h"
@@ -39,7 +38,6 @@ using namespace PatternMatch;
 using llvm::yaml::IO;
 using llvm::yaml::MappingTraits;
 using llvm::yaml::Output;
-
 
 void makeTopLevelInputs(Value *LiveOut, SmallPtrSetImpl<Value *> &Inputs);
 
@@ -119,8 +117,7 @@ public:
   std::string toString() {
     std::string Comp = (Kind == CSR || Kind == CSC) ? "sparse " : "dense ";
     std::string TType = Type2String(ElemType) + " ";
-    std::string Str =
-        "(tensor " + Comp + TType + getNameOrAsOperand(Root);
+    std::string Str = "(tensor " + Comp + TType + getNameOrAsOperand(Root);
     if (Comp == "sparse ")
       Str += ".Dense";
     Str += " ";
@@ -138,9 +135,9 @@ public:
     Str += " " + getNameOrAsOperand(Root);
   }
 
-  Value *toDense(std::vector<Value*> &Insts, PHINode *OldIV, PHINode *NewIV) {
-    std::vector<Value*> IdxList;
-    std::vector<Type*> IdxTypes;
+  Value *toDense(std::vector<Value *> &Insts, PHINode *OldIV, PHINode *NewIV) {
+    std::vector<Value *> IdxList;
+    std::vector<Type *> IdxTypes;
     std::string Name = getNameOrAsOperand(Root);
     Name = Name.substr(1, Name.size());
     if (Kind == CONTIGUOUS) {
@@ -148,23 +145,28 @@ public:
       IdxTypes.push_back(Root->getType());
     } else {
       Name += ".dense";
-      Argument *Arg = new Argument(PointerType::get(OldIV->getParent()->getParent()->getContext(), 0), Name);
+      Argument *Arg = new Argument(
+          PointerType::get(OldIV->getParent()->getParent()->getContext(), 0),
+          Name);
       IdxList.push_back(Arg);
       IdxTypes.push_back(Arg->getType());
     }
 
     for (auto *V : Shape) {
       Value *Index = V == OldIV ? NewIV : V;
-//      Index = CastInst::CreateIntegerCast(Index, Type::getInt64Ty(OldIV->getParent()->getContext()), true);
+      //      Index = CastInst::CreateIntegerCast(Index,
+      //      Type::getInt64Ty(OldIV->getParent()->getContext()), true);
       IdxList.push_back(Index);
       IdxTypes.push_back(Index->getType());
     }
     // generate a dense load from IV
     auto *FType = FunctionType::get(ElemType, IdxTypes, true);
     unsigned AddrSpace = OldIV->getParent()->getParent()->getAddressSpace();
-    auto *Func = Function::Create(FType, OldIV->getParent()->getParent()->getLinkage(), AddrSpace, "llvm.load.ptr");
+    auto *Func =
+        Function::Create(FType, OldIV->getParent()->getParent()->getLinkage(),
+                         AddrSpace, "llvm.load.ptr");
 
-//    auto *Call = CallInst::Create(FType, Func, IdxList, Name);
+    //    auto *Call = CallInst::Create(FType, Func, IdxList, Name);
     auto *Load = IntrinsicInst::Create(Func, IdxList, Name + ".elem");
 
     Insts.push_back(Load);
@@ -172,18 +174,24 @@ public:
   }
 };
 
-
 class Exp {
 public:
   enum ExpKind {
-      EK_Var, EK_Abs, EK_Apply,
-      EK_Builtin, EK_IfThen, EK_Let,
-      EK_Tuple, EK_MemLoad, EK_MemStore
+    EK_Var,
+    EK_Abs,
+    EK_Apply,
+    EK_Builtin,
+    EK_IfThen,
+    EK_Let,
+    EK_Tuple,
+    EK_MemLoad,
+    EK_MemStore
   };
   Exp(ExpKind K) : Kind(K) {}
   virtual void print(raw_ostream &OS) const = 0;
   void dump() { print(dbgs()); }
   ExpKind getKind() const { return Kind; }
+
 private:
   const ExpKind Kind;
 };
@@ -193,10 +201,11 @@ raw_ostream &operator<<(raw_ostream &OS, Exp const &E) {
 }
 
 class Var : public Exp {
-  std::vector<Value*> Elems;
+  std::vector<Value *> Elems;
+
 public:
-  Var(Value* V) : Exp(EK_Var) { Elems.push_back(V); }
-  Var(std::vector<Value*> &Elems) : Exp(EK_Var), Elems(Elems) {}
+  Var(Value *V) : Exp(EK_Var) { Elems.push_back(V); }
+  Var(std::vector<Value *> &Elems) : Exp(EK_Var), Elems(Elems) {}
   Var(iterator_range<Function::arg_iterator> Args) : Exp(EK_Var) {
     for (auto &A : Args)
       Elems.push_back(&A);
@@ -212,11 +221,10 @@ public:
 class Abs : public Exp {
   Var *Params = nullptr;
   Exp *Body = nullptr;
+
 public:
   Abs(Var *P, Exp *B) : Exp(EK_Abs), Params(P), Body(B) {}
-  void print(raw_ostream &OS) const {
-    OS << "λ" << *Params << ". " << *Body;
-  }
+  void print(raw_ostream &OS) const { OS << "λ" << *Params << ". " << *Body; }
 };
 class Apply : public Exp {};
 class Builtin : public Exp {
@@ -249,21 +257,19 @@ class Builtin : public Exp {
       return "not";
     }
   }
+
 public:
-  enum SupportedOps {
-    Add, Mult, LT, GT, Not
-  };
+  enum SupportedOps { Add, Mult, LT, GT, Not };
   SupportedOps Op;
 
-  Builtin(Instruction *Op, Exp *L, Exp *R) : Exp(EK_Builtin), InstOp(Op), Es({L, R}) {
+  Builtin(Instruction *Op, Exp *L, Exp *R)
+      : Exp(EK_Builtin), InstOp(Op), Es({L, R}) {
     makeOp();
   }
   Builtin(SupportedOps Op, Exp *E) : Exp(EK_Builtin), Op(Op), Es({E}) {}
-  static Builtin *mkNot(Exp *E) {
-    return new Builtin(Not, E);
-  }
+  static Builtin *mkNot(Exp *E) { return new Builtin(Not, E); }
   void print(raw_ostream &OS) const {
-    OS << "("  << op2String() << " ";
+    OS << "(" << op2String() << " ";
     ListSeparator LS(" ");
     for (auto *Operand : Es) {
       OS << LS;
@@ -271,14 +277,13 @@ public:
     }
     OS << ")";
   }
-
-
 };
 
 class IfThen : public Exp {
   Exp *C;
   Exp *Then;
   Exp *Else;
+
 public:
   IfThen(Exp *C, Exp *T, Exp *E) : Exp(EK_IfThen), C(C), Then(T), Else(E) {}
   void print(raw_ostream &OS) const {
@@ -289,6 +294,7 @@ class Let : public Exp {
   Var *L;
   Exp *V;
   Exp *B;
+
 public:
   Let(Var *L, Exp *V, Exp *B) : Exp(EK_Let), L(L), V(V), B(B) {}
   Let() : Exp(EK_Let), L(nullptr), V(nullptr), B(nullptr) {}
@@ -301,35 +307,33 @@ public:
     } else if (auto *Chain = dyn_cast<Let>(B)) {
       Chain->insert(E);
     } else
-        llvm_unreachable("something weird");
+      llvm_unreachable("something weird");
   }
-  static bool classof(const Exp *E) {
-    return E->getKind() == EK_Let;
-  }
+  static bool classof(const Exp *E) { return E->getKind() == EK_Let; }
 };
 class Tuple : public Exp {};
 class MemLoad : public Exp {
   Exp *Ptr;
   Exp *Idx;
   LoadInst *L = nullptr;
+
 public:
-  MemLoad(Exp *Ptr, Exp *Idx, LoadInst *L) : Exp(EK_MemLoad), Ptr(Ptr), Idx(Idx), L(L) {}
-  void print(raw_ostream &OS) const {
-    OS << *Ptr << "[" << *Idx << "]";
-  }
+  MemLoad(Exp *Ptr, Exp *Idx, LoadInst *L)
+      : Exp(EK_MemLoad), Ptr(Ptr), Idx(Idx), L(L) {}
+  void print(raw_ostream &OS) const { OS << *Ptr << "[" << *Idx << "]"; }
 };
 class MemStore : public Exp {};
 
 // inline everything except for loads
-class Inline : public InstVisitor<Inline, Exp*> {
+class Inline : public InstVisitor<Inline, Exp *> {
 public:
   Inline(DominatorTree &DT) : DT(DT) {}
 
   Exp *run(Value *V) {
     if (auto *I = dyn_cast<Instruction>(V)) {
-        Exp *Result = visit(I);
-        Var *Left = new Var(I);
-        return new Let(Left, Result, {});
+      Exp *Result = visit(I);
+      Var *Left = new Var(I);
+      return new Let(Left, Result, {});
     }
     return new Var(V);
   }
@@ -432,7 +436,6 @@ public:
     return "(update " + StoreType + " " + Ptr + " " + Idx + " " + Val + ")";
   }
 
-
   std::string visitGetElementPtrInst(GetElementPtrInst &I) {
     if (auto *Ptr = dyn_cast<Argument>(I.getPointerOperand()))
       return getNameOrAsOperand(Ptr);
@@ -453,7 +456,7 @@ public:
   }
 
   std::string instToOp(Instruction &Op) {
-    switch(Op.getOpcode()) {
+    switch (Op.getOpcode()) {
     default:
       llvm_unreachable("unknown opcode.");
     case Instruction::Add:
@@ -488,13 +491,12 @@ public:
   std::string visitIntrinsicInst(IntrinsicInst &I) {
     switch (I.getIntrinsicID()) {
     default:
-    llvm_unreachable("unsupported intrinsic.");
+      llvm_unreachable("unsupported intrinsic.");
     case Intrinsic::fmuladd:
       auto A = SExpr(I.getOperand(0));
       auto B = SExpr(I.getOperand(1));
       auto C = SExpr(I.getOperand(2));
       return "(+ (* " + A + " " + B + ") " + C + ")";
-
     }
   }
 
@@ -511,23 +513,24 @@ public:
 class ExecutorDense : public Executor {
 public:
   DenseMap<Value *, Tensor *> &TensorMap;
-  ExecutorDense(DenseMap<Value *, Tensor *> &TensorMap) : TensorMap(TensorMap) {}
+  ExecutorDense(DenseMap<Value *, Tensor *> &TensorMap)
+      : TensorMap(TensorMap) {}
 
   std::string visitLoadInst(LoadInst &I) {
     Tensor *T = TensorMap[&I];
     assert(T != nullptr && "all loads must be covered.");
     return T->toString();
-//    // try to construct tensors optimistically
-//    auto *GEP = dyn_cast<GetElementPtrInst>(I.getPointerOperand());
-//    assert(GEP->getNumIndices() == 1);
-//    std::string Ptr = visit(GEP);
-//    std::string Idx;
-//    if (auto *Index = dyn_cast<Instruction>(GEP->getOperand(1)))
-//      Idx = visit(Index);
-//    else
-//      Idx = getNameOrAsOperand(GEP->getOperand(1));
-//    auto LoadType = Type2String(I.getType());
-//    return "(tensor dense " + LoadType + " " + Ptr + " " + Idx + ")";
+    //    // try to construct tensors optimistically
+    //    auto *GEP = dyn_cast<GetElementPtrInst>(I.getPointerOperand());
+    //    assert(GEP->getNumIndices() == 1);
+    //    std::string Ptr = visit(GEP);
+    //    std::string Idx;
+    //    if (auto *Index = dyn_cast<Instruction>(GEP->getOperand(1)))
+    //      Idx = visit(Index);
+    //    else
+    //      Idx = getNameOrAsOperand(GEP->getOperand(1));
+    //    auto LoadType = Type2String(I.getType());
+    //    return "(tensor dense " + LoadType + " " + Ptr + " " + Idx + ")";
   }
 };
 
@@ -605,8 +608,8 @@ struct LevelBounds {
   Value *UpperBound = nullptr;
   Value *IndexExpr = nullptr;
   Value *BasePtr = nullptr;
-  std::vector<Value*> CoordArrays;
-  std::vector<Value*> PosArrays;
+  std::vector<Value *> CoordArrays;
+  std::vector<Value *> PosArrays;
 };
 
 bool findCrd(Value *Inst, Value **Crd) {
@@ -713,7 +716,6 @@ struct CSRLevels {
   Value *Val = nullptr;
 };
 
-
 void allLoadsInCurrentScope(Loop *L, SmallPtrSet<LoadInst *, 4> &Loads) {
   for (auto *BB : L->blocks()) {
     for (auto &I : *BB) {
@@ -788,25 +790,27 @@ std::string makeDense(LevelBounds &LB) {
   return Map + ")";
 }
 
-void emitFold(raw_fd_ostream &FS, Loop *L, Value *LiveOut, PHINode *Iterator, RecurrenceDescriptor &RD,
+void emitFold(raw_fd_ostream &FS, Loop *L, Value *LiveOut, PHINode *Iterator,
+              RecurrenceDescriptor &RD,
               DenseMap<Value *, LevelBounds> &LevelMap,
               DenseMap<Value *, Tensor *> &TensorMap) {
   std::string Total;
   Total += "(loop \"" + L->getHeader()->getName().str() + "\"\n\t";
   // Name map
-  std::string Names = "(table (" + Val2Sexp(Iterator) + " " + Val2Sexp(Iterator, ".d") + "))";
-//  LLVM_DEBUG(dbgs() << Names << "\n");
+  std::string Names =
+      "(table (" + Val2Sexp(Iterator) + " " + Val2Sexp(Iterator, ".d") + "))";
+  //  LLVM_DEBUG(dbgs() << Names << "\n");
   Total += "(namemap \n\t\t" + Names + ")\n\t";
   // Coordinate map
   std::string CrdMap = makeDense(LevelMap[Iterator]);
-//  LLVM_DEBUG(dbgs() << CrdMap << "\n");
+  //  LLVM_DEBUG(dbgs() << CrdMap << "\n");
   Total += "(crdmap \n\t\t" + CrdMap + ")\n\t";
   // Val map
   // 1. find all the sparse inputs
   // 2. map to a dense version
   std::string ValMap = "(table ";
   Executor E;
-  SmallPtrSet<Value*, 4> Loads;
+  SmallPtrSet<Value *, 4> Loads;
   makeTopLevelInputs(LiveOut, Loads);
   for (auto *V : Loads) {
     auto *T = TensorMap[V];
@@ -817,31 +821,31 @@ void emitFold(raw_fd_ostream &FS, Loop *L, Value *LiveOut, PHINode *Iterator, Re
     }
   }
   ValMap += ")";
-//  LLVM_DEBUG(dbgs() << ValMap << "\n");
+  //  LLVM_DEBUG(dbgs() << ValMap << "\n");
   Total += "(valmap \n\t\t" + ValMap + ")\n\t";
   std::string End;
   auto *StartVal = RD.getRecurrenceStartValue().getValPtr();
   LevelBounds &Bounds = LevelMap[Iterator];
   // emit sync
-//  std::string Sync = "(and ";
-//  for (auto *Crd : Bounds.CoordArrays) {
-//    std::string Left = E.SExpr(Crd);
-//    std::string Right = E.SExpr(Bounds.Iterator);
-//    Sync += "(= " + Left + " " + Right + ")";
-//  }
-//  Sync += " ";
-//  SmallPtrSet<Value*, 4> Loads;
-//  makeTopLevelInputs(LiveOut, Loads);
-//  for (auto *V : Loads) {
-//    auto *T = TensorMap[V];
-//    if (T != nullptr && isa<CSR>(T)) {
-//      std::string Left = E.SExpr(V);
-//      std::string Right = T->toString();
-//      Sync += "(= " + Left + " " + Right + ")";
-//    }
-//  }
-//  Sync += ")";
-//  LLVM_DEBUG(dbgs() << Sync << "\n");
+  //  std::string Sync = "(and ";
+  //  for (auto *Crd : Bounds.CoordArrays) {
+  //    std::string Left = E.SExpr(Crd);
+  //    std::string Right = E.SExpr(Bounds.Iterator);
+  //    Sync += "(= " + Left + " " + Right + ")";
+  //  }
+  //  Sync += " ";
+  //  SmallPtrSet<Value*, 4> Loads;
+  //  makeTopLevelInputs(LiveOut, Loads);
+  //  for (auto *V : Loads) {
+  //    auto *T = TensorMap[V];
+  //    if (T != nullptr && isa<CSR>(T)) {
+  //      std::string Left = E.SExpr(V);
+  //      std::string Right = T->toString();
+  //      Sync += "(= " + Left + " " + Right + ")";
+  //    }
+  //  }
+  //  Sync += ")";
+  //  LLVM_DEBUG(dbgs() << Sync << "\n");
   auto *LowerBound = Bounds.LowerBound;
   auto *IndVar = Iterator;
   auto *UpperBound = Bounds.UpperBound;
@@ -852,7 +856,7 @@ void emitFold(raw_fd_ostream &FS, Loop *L, Value *LiveOut, PHINode *Iterator, Re
   Expr += Val2Sexp(UpperBound) + " ";
   Expr += buildExpression(LiveOut, Iterator, RD, LevelMap, TensorMap);
   Expr += ")";
-//  LLVM_DEBUG({ dbgs() << Expr << "\n"; });
+  //  LLVM_DEBUG({ dbgs() << Expr << "\n"; });
   Total += "(src \n\t\t" + Expr + ")\n\t";
   // now the dense version
   std::string DenseExpr = "(fold ";
@@ -871,26 +875,28 @@ void emitFold(raw_fd_ostream &FS, Loop *L, Value *LiveOut, PHINode *Iterator, Re
   DenseExpr += Val2Sexp(IndVar) + " ";
   DenseExpr += DenseUpperBound + " ";
   std::string Inputs;
-  DenseExpr += buildDenseExpression(LiveOut, Iterator, RD, LevelMap, TensorMap, Inputs);
+  DenseExpr +=
+      buildDenseExpression(LiveOut, Iterator, RD, LevelMap, TensorMap, Inputs);
   DenseExpr += ")";
-//  LLVM_DEBUG({ dbgs() << DenseExpr << "\n"; });
+  //  LLVM_DEBUG({ dbgs() << DenseExpr << "\n"; });
   Total += "(target \n\t\t" + DenseExpr + "))\n";
-  LLVM_DEBUG({
-      dbgs() << Total << "\n";
-  });
+  LLVM_DEBUG({ dbgs() << Total << "\n"; });
   FS << Total;
 }
 
-std::string nameMap(PHINode *Iterator, DenseMap<Value *, LevelBounds> &LevelMap) {
+std::string nameMap(PHINode *Iterator,
+                    DenseMap<Value *, LevelBounds> &LevelMap) {
   if (LevelMap[Iterator].LevelType == COMPRESSED)
-    return "(table (" + Val2Sexp(Iterator) + " " + Val2Sexp(Iterator, ".d") + "))";
+    return "(table (" + Val2Sexp(Iterator) + " " + Val2Sexp(Iterator, ".d") +
+           "))";
   return "(table )";
 }
 
-std::string valMap(Value *LiveOut, LoopInfo *LI, Loop *L, DenseMap<Value *, Tensor *> &TensorMap) {
+std::string valMap(Value *LiveOut, LoopInfo *LI, Loop *L,
+                   DenseMap<Value *, Tensor *> &TensorMap) {
   std::string ValMap = "(table ";
   Executor E;
-  SmallPtrSet<Value*, 4> Loads;
+  SmallPtrSet<Value *, 4> Loads;
   makeTopLevelInputs(LiveOut, Loads);
   for (auto *V : Loads) {
     if (LI->getLoopFor(cast<LoadInst>(V)->getParent()) != L)
@@ -905,8 +911,6 @@ std::string valMap(Value *LiveOut, LoopInfo *LI, Loop *L, DenseMap<Value *, Tens
   ValMap += ")";
   return ValMap;
 }
-
-
 
 enum Property { FULL, ORDERED, UNIQUE, BRANCHLESS, COMPACT };
 
@@ -1147,7 +1151,6 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
 
   return true;
 
-
   return false;
 }
 
@@ -1229,7 +1232,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
           dbgs() << "detected dense 2d\n";
           dbgs() << "A = " << *A << "\n";
           dbgs() << "p_{k-1} = " << *Pk_1 << "\n";
-//          dbgs() << "N_k = " << *Nk << "\n";
+          //          dbgs() << "N_k = " << *Nk << "\n";
           dbgs() << "i_k = " << *Ik << "\n";
           dbgs() << *Dense2D << "\n";
         });
@@ -1280,28 +1283,32 @@ void makeTopLevelInputs(Value *LiveOut, SmallPtrSetImpl<Value *> &Inputs) {
   }
 }
 
-
 class Fold {
-  std::vector<MemoryPhi*> MemInputs;
-  std::vector<PHINode*> Inputs;
-  std::vector<MemoryAccess*> MemOutputs;
-  std::vector<Value*> Outputs;
+  std::vector<MemoryPhi *> MemInputs;
+  std::vector<PHINode *> Inputs;
+  std::vector<MemoryAccess *> MemOutputs;
+  std::vector<Value *> Outputs;
   Loop *L;
   LoopInfo *LI;
   DominatorTree *DT;
   ScalarEvolution *SE;
   MemorySSA *MSSA;
-  DenseMap<Value*, Tensor*> &TM;
-public:
-  Fold(Loop *L, LoopInfo *LI, ScalarEvolution *SE, DominatorTree *DT, MemorySSA *MSSA, DenseMap<Value*, Tensor*> &TM, std::vector<MemoryPhi*> MI, std::vector<PHINode*> I, std::vector<MemoryAccess*> MO, std::vector<Value*> C)
-      : MemInputs(MI), Inputs(I), MemOutputs(MO), Outputs(C), L(L), LI(LI), DT(DT), SE(SE), MSSA(MSSA), TM(TM) {}
+  DenseMap<Value *, Tensor *> &TM;
 
-  Value *getChain(std::vector<Value*> &Chain) {
+public:
+  Fold(Loop *L, LoopInfo *LI, ScalarEvolution *SE, DominatorTree *DT,
+       MemorySSA *MSSA, DenseMap<Value *, Tensor *> &TM,
+       std::vector<MemoryPhi *> MI, std::vector<PHINode *> I,
+       std::vector<MemoryAccess *> MO, std::vector<Value *> C)
+      : MemInputs(MI), Inputs(I), MemOutputs(MO), Outputs(C), L(L), LI(LI),
+        DT(DT), SE(SE), MSSA(MSSA), TM(TM) {}
+
+  Value *getChain(std::vector<Value *> &Chain) {
     Value *Out = nullptr;
     if (!Outputs.empty()) {
       auto *PN = dyn_cast<PHINode>(Outputs[0]);
       auto *Inst = dyn_cast<Instruction>(PN->getIncomingValue(0));
-//      Out = Inst;
+      //      Out = Inst;
       Out = Outputs[0];
       opChain<Instruction>(Inst, Chain);
     } else if (!MemOutputs.empty()) {
@@ -1325,10 +1332,13 @@ public:
     llvm_unreachable("val doesn't exist in tensor map.");
   }
 
-  void printParams(raw_ostream &OS, std::vector<MemoryPhi*> &MI, std::vector<PHINode*> &Ins, Value *MemPtr) {
+  void printParams(raw_ostream &OS, std::vector<MemoryPhi *> &MI,
+                   std::vector<PHINode *> &Ins, Value *MemPtr) {
     ListSeparator LS(", ");
-    for (auto *V : MI) OS << LS << arrayType(MemPtr) << " " << getNameOrAsOperand(MemPtr);
-    for (auto *V : Ins) OS << LS << *V->getType() << " " << getNameOrAsOperand(V);
+    for (auto *V : MI)
+      OS << LS << arrayType(MemPtr) << " " << getNameOrAsOperand(MemPtr);
+    for (auto *V : Ins)
+      OS << LS << *V->getType() << " " << getNameOrAsOperand(V);
   }
 
   template <class PHITy>
@@ -1343,7 +1353,8 @@ public:
       // TODO I don't think memory phis will have this
       if (auto *M = dyn_cast<MemoryPhi>(Phi))
         llvm_unreachable("weird.");
-      OS << "  " << LeftName << " = " << getNameOrAsOperand(Phi->getIncomingValue(0)) << "\n";
+      OS << "  " << LeftName << " = "
+         << getNameOrAsOperand(Phi->getIncomingValue(0)) << "\n";
       return;
     }
     auto *BB1 = Phi->getIncomingBlock(0);
@@ -1352,73 +1363,78 @@ public:
     auto *Br = dyn_cast<BranchInst>(Denom->getTerminator());
     BasicBlock *Then, *Else;
     if (DT->dominates(cast<BasicBlock>(Br->getOperand(2)), BB1)) {
-        // true branch dominates BB1
-        Then = BB1;
-        Else = BB2;
+      // true branch dominates BB1
+      Then = BB1;
+      Else = BB2;
     } else {
-        Then = BB2;
-        Else = BB1;
+      Then = BB2;
+      Else = BB1;
     }
-    OS << "  " << LeftName << " = if " << getNameOrAsOperand(Br->getCondition()) << " then ";
+    OS << "  " << LeftName << " = if " << getNameOrAsOperand(Br->getCondition())
+       << " then ";
     if (auto *MP = dyn_cast<MemoryPhi>(Phi)) {
-        auto MemName = getNameOrAsOperand(MemPtr);
-       OS << MemName << "." << MP->getIncomingValueForBlock(Then)->getID();
-       OS << " else ";
-       OS << MemName << "." << MP->getIncomingValueForBlock(Else)->getID();
+      auto MemName = getNameOrAsOperand(MemPtr);
+      OS << MemName << "." << MP->getIncomingValueForBlock(Then)->getID();
+      OS << " else ";
+      OS << MemName << "." << MP->getIncomingValueForBlock(Else)->getID();
     } else if (auto *P = dyn_cast<PHINode>(Phi)) {
-       OS << getNameOrAsOperand(P->getIncomingValueForBlock(Then));
-       OS << " else ";
-       OS << getNameOrAsOperand(P->getIncomingValueForBlock(Else));
+      OS << getNameOrAsOperand(P->getIncomingValueForBlock(Then));
+      OS << " else ";
+      OS << getNameOrAsOperand(P->getIncomingValueForBlock(Else));
     }
     OS << "\n";
   }
 
-  void printChain(raw_ostream &OS, Value *MemPtr, std::vector<Value*> &Chain, std::vector<Value*> *OrigChain) {
-    for (int i = Chain.size()-1; i >= 0; --i) {
-       Value *I = Chain[i];
-       if (auto *P = dyn_cast<PHINode>(I)) {
+  void printChain(raw_ostream &OS, Value *MemPtr, std::vector<Value *> &Chain,
+                  std::vector<Value *> *OrigChain) {
+    for (int i = Chain.size() - 1; i >= 0; --i) {
+      Value *I = Chain[i];
+      if (auto *P = dyn_cast<PHINode>(I)) {
         printPhi(OS, P, MemPtr);
-       } else if (auto *MP = dyn_cast<MemoryPhi>(I)) {
+      } else if (auto *MP = dyn_cast<MemoryPhi>(I)) {
         printPhi(OS, MP, MemPtr);
-       }
-//       else if (auto *S = dyn_cast<StoreInst>(I)) {
-//        auto *Store = S;
-//        if (OrigChain)
-//          Store = dyn_cast<StoreInst>(OrigChain->operator[](i));
-//        auto *Def = dyn_cast<MemoryDef>(MSSA->getMemoryAccess(Store));
-//        assert(Def != nullptr && "must be a def here.");
-//        OS << "  " << getNameOrAsOperand(MemPtr) << "." << Def->getID() << " = " << *I << "\n";
-//       }
-       else {
+      }
+      //       else if (auto *S = dyn_cast<StoreInst>(I)) {
+      //        auto *Store = S;
+      //        if (OrigChain)
+      //          Store = dyn_cast<StoreInst>(OrigChain->operator[](i));
+      //        auto *Def = dyn_cast<MemoryDef>(MSSA->getMemoryAccess(Store));
+      //        assert(Def != nullptr && "must be a def here.");
+      //        OS << "  " << getNameOrAsOperand(MemPtr) << "." << Def->getID()
+      //        << " = " << *I << "\n";
+      //       }
+      else {
         OS << *I << "\n";
-       }
-//      if (auto *MA = dyn_cast<MemoryAccess>(*I)) {
-//        if (auto *MP = dyn_cast<MemoryPhi>(MA)) {
-//          auto *BB1 = MP->getIncomingBlock(0);
-//          auto *BB2 = MP->getIncomingBlock(1);
-//          auto *Denom = DT->findNearestCommonDominator(BB1, BB2);
-//          auto *Br = dyn_cast<BranchInst>(Denom->getTerminator());
-//          auto MemName = getNameOrAsOperand(MemPtr);
-//          auto LeftName = MemName + "." + std::to_string(MP->getID());
-//          OS << "  " << LeftName << " = if " << getNameOrAsOperand(Br->getCondition()) << " then ";
-//          if (BB1 == L->getHeader())
-//            OS << MemName;
-//          else
-//            OS << MemName << "." << MP->getIncomingValue(0)->getID();
-//          OS << " else ";
-//          if (BB2 == L->getHeader())
-//            OS << MemName;
-//          else
-//            OS << MemName << "." << MP->getIncomingValue(1)->getID();
-//          OS << "\n";
-//        } else {
-//          OS << *MA << "\n"; // TODO should never happen now?
-//        }
-//      }
+      }
+      //      if (auto *MA = dyn_cast<MemoryAccess>(*I)) {
+      //        if (auto *MP = dyn_cast<MemoryPhi>(MA)) {
+      //          auto *BB1 = MP->getIncomingBlock(0);
+      //          auto *BB2 = MP->getIncomingBlock(1);
+      //          auto *Denom = DT->findNearestCommonDominator(BB1, BB2);
+      //          auto *Br = dyn_cast<BranchInst>(Denom->getTerminator());
+      //          auto MemName = getNameOrAsOperand(MemPtr);
+      //          auto LeftName = MemName + "." + std::to_string(MP->getID());
+      //          OS << "  " << LeftName << " = if " <<
+      //          getNameOrAsOperand(Br->getCondition()) << " then "; if (BB1 ==
+      //          L->getHeader())
+      //            OS << MemName;
+      //          else
+      //            OS << MemName << "." << MP->getIncomingValue(0)->getID();
+      //          OS << " else ";
+      //          if (BB2 == L->getHeader())
+      //            OS << MemName;
+      //          else
+      //            OS << MemName << "." << MP->getIncomingValue(1)->getID();
+      //          OS << "\n";
+      //        } else {
+      //          OS << *MA << "\n"; // TODO should never happen now?
+      //        }
+      //      }
     }
   }
 
-  void printFold(raw_ostream &OS, PHINode *IV, Value *Start, Value *End, Value *Out, Value *MemPtr) {
+  void printFold(raw_ostream &OS, PHINode *IV, Value *Start, Value *End,
+                 Value *Out, Value *MemPtr) {
     std::string OutputName = "";
     if (auto *M = dyn_cast<MemoryAccess>(Out))
       OutputName =
@@ -1442,20 +1458,22 @@ public:
       auto *Incoming = V->getIncomingValueForBlock(L->getLoopPreheader());
       OS << LS << *Incoming->getType() << " " << getNameOrAsOperand(Incoming);
     }
-    OS << ") " << "%" << L->getName() << " ";
-    OS << "Range(" << *Start->getType() << " " << getNameOrAsOperand(Start) << ", "
-           << *End->getType() << " " << getNameOrAsOperand(End) << ")\n";
+    OS << ") "
+       << "%" << L->getName() << " ";
+    OS << "Range(" << *Start->getType() << " " << getNameOrAsOperand(Start)
+       << ", " << *End->getType() << " " << getNameOrAsOperand(End) << ")\n";
   }
 
   // init is generated by incoming val for all input phis
   // combiner is generated by translating the output phis/stores
-  void dump(ScalarEvolution &SE, Value *MemPtr, MemorySSA &MSSA, DenseMap<Value *, LevelBounds> &LevelMap) {
+  void dump(ScalarEvolution &SE, Value *MemPtr, MemorySSA &MSSA,
+            DenseMap<Value *, LevelBounds> &LevelMap) {
     // TODO I really need to clean this up !!!! but make it work first.
     auto B = L->getBounds(SE);
     auto &Start = B->getInitialIVValue();
     auto &End = B->getFinalIVValue();
 
-    std::vector<Value*> Chain;
+    std::vector<Value *> Chain;
     // collect the list of instructions that generate the output
     Value *Out = getChain(Chain);
 
@@ -1537,21 +1555,21 @@ public:
       delete NewIV;
   }
 
-  template<typename PHITy>
-  void visitPHI(PHITy *V, std::vector<Value*> &Chain) {
+  template <typename PHITy>
+  void visitPHI(PHITy *V, std::vector<Value *> &Chain) {
     const BasicBlock *Parent;
     if (auto *M = dyn_cast<MemoryPhi>(V))
-        Parent = M->getBlock();
+      Parent = M->getBlock();
     else if (auto *P = dyn_cast<PHINode>(V))
-        Parent = P->getParent();
+      Parent = P->getParent();
     if (LI->isLoopHeader(Parent))
-        return; // avoid cycles
+      return; // avoid cycles
     if (LI->getLoopFor(Parent)->getExitBlock() == Parent)
-        return; // cut at liveouts of other loops
+      return; // cut at liveouts of other loops
     Chain.push_back(V);
     if (V->getNumIncomingValues() == 1) {
-        collectInsts(V->getIncomingValue(0), Chain);
-        return;
+      collectInsts(V->getIncomingValue(0), Chain);
+      return;
     }
     assert(V->getNumIncomingValues() == 2 && "assumption violated");
     auto *In1 = V->getIncomingBlock(0);
@@ -1565,29 +1583,29 @@ public:
 
   template <class ChainTy>
   void collectInsts(ChainTy *V, std::vector<Value *> &Chain) {
-    if (any_of(Chain.begin(), Chain.end(), [&](Value *E) {return V == E; }))
-        return; // TODO make this O(1) instead of O(n)
+    if (any_of(Chain.begin(), Chain.end(), [&](Value *E) { return V == E; }))
+      return; // TODO make this O(1) instead of O(n)
 
     if (auto *PN = dyn_cast<PHINode>(V)) {
-        visitPHI(PN, Chain);
+      visitPHI(PN, Chain);
     } else if (auto *MP = dyn_cast<MemoryPhi>(V)) {
-        visitPHI(MP, Chain);
+      visitPHI(MP, Chain);
     } else {
-        if (auto *I = dyn_cast<Instruction>(V)) {
+      if (auto *I = dyn_cast<Instruction>(V)) {
         Chain.push_back(V);
         for (auto &Use : I->operands())
           collectInsts(dyn_cast<Value>(&Use), Chain);
-        } else if (auto *MA = dyn_cast<MemoryUseOrDef>(V)) {
+      } else if (auto *MA = dyn_cast<MemoryUseOrDef>(V)) {
         // already checked above if it's a memory phi, so can't be here
         Chain.push_back(MA->getMemoryInst());
         for (auto &Use : MA->getMemoryInst()->operands())
           collectInsts(dyn_cast<Value>(&Use), Chain);
-        }
+      }
     }
   }
 
   template <class ChainTy>
-  void opChain(ChainTy *Root, std::vector<Value*> &Chain) {
+  void opChain(ChainTy *Root, std::vector<Value *> &Chain) {
     // collect instructions from exit val up to leaves:
     // function arguments or block args (phis in header)
     // phis elsewhere, like latch, need to be followed within the same loop,
@@ -1599,59 +1617,67 @@ public:
   // becomes affine, or nullptr
   Instruction *indirectLoad(Value *I) {
     auto *Load = dyn_cast<LoadInst>(I);
-    if (!Load) return nullptr;
+    if (!Load)
+      return nullptr;
     auto *GEP = dyn_cast<GEPOperator>(Load->getPointerOperand());
-    if (!GEP) return nullptr;
+    if (!GEP)
+      return nullptr;
     auto *Idx = GEP->getOperand(1);
     while (auto *Cast = dyn_cast<CastInst>(Idx))
-        Idx = Cast->getOperand(0);
+      Idx = Cast->getOperand(0);
     return dyn_cast<LoadInst>(Idx);
   }
 
-  Value *traverseDenseChain(Value *V, PHINode *IV, std::vector<Value *> &Chain, std::vector<Value *> &DenseChain, SmallPtrSetImpl<Value*> &Indirect, DenseMap<Value*, Tensor*> &TensorMap) {
-    if (none_of(Chain.begin(), Chain.end(), [&](Value* E){ return E == V; }))
-        return V; // ignore insts not in the chain
+  Value *traverseDenseChain(Value *V, PHINode *IV, std::vector<Value *> &Chain,
+                            std::vector<Value *> &DenseChain,
+                            SmallPtrSetImpl<Value *> &Indirect,
+                            DenseMap<Value *, Tensor *> &TensorMap) {
+    if (none_of(Chain.begin(), Chain.end(), [&](Value *E) { return E == V; }))
+      return V; // ignore insts not in the chain
     if (L->getInductionVariable(*SE) == V)
-        return IV;
+      return IV;
     // cut indirect loads
     if (auto *T = TensorMap[V]) {
-//        auto *N = MDNode::get(IV->getContext(), MDString::get(IV->getContext(), getNameOrAsOperand(IV)));
-//        dyn_cast<Instruction>(V)->setMetadata("as.affine", N);
-        return T->toDense(DenseChain, L->getInductionVariable(*SE), IV);
+      //        auto *N = MDNode::get(IV->getContext(),
+      //        MDString::get(IV->getContext(), getNameOrAsOperand(IV)));
+      //        dyn_cast<Instruction>(V)->setMetadata("as.affine", N);
+      return T->toDense(DenseChain, L->getInductionVariable(*SE), IV);
     }
     // inst or memphi?
     if (auto *I = dyn_cast<Instruction>(V)) {
-        auto *NewI = I->clone();
-        if (!NewI->getType()->isVoidTy()) {
-            auto NewName = getNameOrAsOperand(I) + ".dense";
-            NewI->setName(NewName.substr(1, NewName.size()));
-        }
-        for (size_t Op = 0; Op < I->getNumOperands(); ++Op) {
-            NewI->setOperand(Op, traverseDenseChain(I->getOperand(Op), IV, Chain, DenseChain, Indirect, TensorMap));
-        }
-        DenseChain.push_back(NewI);
-        return NewI;
+      auto *NewI = I->clone();
+      if (!NewI->getType()->isVoidTy()) {
+        auto NewName = getNameOrAsOperand(I) + ".dense";
+        NewI->setName(NewName.substr(1, NewName.size()));
+      }
+      for (size_t Op = 0; Op < I->getNumOperands(); ++Op) {
+        NewI->setOperand(Op,
+                         traverseDenseChain(I->getOperand(Op), IV, Chain,
+                                            DenseChain, Indirect, TensorMap));
+      }
+      DenseChain.push_back(NewI);
+      return NewI;
     } else if (auto *M = dyn_cast<MemoryAccess>(V)) {
-        // TODO not sure right now
-        dbgs() << "skipping memory access: " << *M << "\n";
-        return M;
+      // TODO not sure right now
+      dbgs() << "skipping memory access: " << *M << "\n";
+      return M;
     }
     // don't clone values! like args
     return V;
   }
 
   Value *mkDenseChain(std::vector<Value *> &Chain,
-                    std::vector<Value *> &DenseChain,
-                    DenseMap<Value *, Tensor *> &TensorMap,
-                    PHINode **NewIV) {
+                      std::vector<Value *> &DenseChain,
+                      DenseMap<Value *, Tensor *> &TensorMap, PHINode **NewIV) {
     auto &Context = L->getHeader()->getParent()->getContext();
 
     *NewIV = PHINode::Create(Type::getInt64Ty(Context), 2, "iv.dense");
-    SmallPtrSet<Value*, 4> IndirectLoads;
+    SmallPtrSet<Value *, 4> IndirectLoads;
     for (auto *V : Chain)
-        if (auto *Load = indirectLoad(V))
-            IndirectLoads.insert(Load);
-    Value *NewOut = traverseDenseChain(Chain[0], *NewIV, Chain, DenseChain, IndirectLoads, TensorMap);
+      if (auto *Load = indirectLoad(V))
+        IndirectLoads.insert(Load);
+    Value *NewOut = traverseDenseChain(Chain[0], *NewIV, Chain, DenseChain,
+                                       IndirectLoads, TensorMap);
     std::reverse(DenseChain.begin(), DenseChain.end());
     return NewOut;
   }
@@ -1659,9 +1685,57 @@ public:
 
 class Lambda {
 public:
-  Lambda(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA, DenseMap<Value*, Tensor*> &TM)
+  Lambda(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA,
+         DenseMap<Value *, Tensor *> &TM)
       : LI(LI), SE(SE), MSSA(MSSA), DT(MSSA.getDomTree()), TensorMap(TM) {}
 
+  void getLoopLiveOuts(Loop &L, SmallPtrSetImpl<Value *> &LiveOuts) {
+    // all scalar LOs are in exit block
+    auto Phis = L.getExitBlock()->phis();
+    for (auto &P : Phis)
+      LiveOuts.insert(&P);
+    // all memory defs are also liveouts
+  }
+  // a loop has a header/latch/exit blocks,
+  // and series of BBs/instructions in the body
+  // visit each BB in the loop body, there are
+  // two possibilities:
+  // (1) block is the header for a loop (subloop)
+  //      then, mkFold(header, ..., latch, loop-exit)
+  //      loop-exit has phis (scalar liveouts)
+  //      and/or contains memory-defs with outside users
+  // (2) block is part of the body
+  //      emit the instructions (phis -> deduce br cond)
+  //      skip branches
+  void translateLoop(Loop &L) {
+    dbgs() << "mkFold: ";
+    BasicBlock *Header = L.getHeader();
+    PHINode *IV = L.getInductionVariable(SE);
+    auto NonIVs =
+        make_filter_range(Header->phis(), [&](PHINode &P) { return &P != IV; });
+    for (auto &P : NonIVs)
+      dbgs() << P << " ";
+    dbgs() << *IV << "\n";
+    //    dbgs() << "LiveOuts: ";
+    for (BasicBlock *BB : L.getBlocks()) {
+      if (LI.getLoopFor(BB) != &L)
+        continue;
+      for (auto I = BB->getFirstInsertionPt(), E = BB->end(); I != E; ++I) {
+        if (dyn_cast<BranchInst>(&*I) || &*I == BB->getTerminator())
+          continue;
+        dbgs() << *I << "\n";
+      }
+    }
+  }
+  void translateLoopsRecursively(Loop &L) {
+    for (Loop *SubLoop : L.getSubLoops())
+      translateLoopsRecursively(*SubLoop);
+    translateLoop(L);
+  }
+  void translateAllLoops() {
+    for (const auto &L : LI)
+      translateLoopsRecursively(*L);
+  }
 
   void translate(Function &F, DenseMap<Value *, LevelBounds> &LevelMap) {
     analyzeMemory(&F);
@@ -1673,13 +1747,14 @@ public:
         auto *Exit = Loop->getExitBlock();
         auto *Latch = Loop->getLoopLatch();
         auto *IV = Loop->getInductionVariable(SE);
-        std::vector<MemoryAccess*> MemOutputs;
-        std::vector<Value*> Outputs;
+        std::vector<MemoryAccess *> MemOutputs;
+        std::vector<Value *> Outputs;
         if (MSSA.getBlockDefs(Latch))
-          MemOutputs.push_back(const_cast<MemoryAccess*>(&*MSSA.getBlockDefs(Latch)->rbegin()));
-        else if (auto *P = dyn_cast_or_null<MemoryPhi>(MSSA.getMemoryAccess(Latch)))
+          MemOutputs.push_back(
+              const_cast<MemoryAccess *>(&*MSSA.getBlockDefs(Latch)->rbegin()));
+        else if (auto *P =
+                     dyn_cast_or_null<MemoryPhi>(MSSA.getMemoryAccess(Latch)))
           MemOutputs.push_back(P);
-
 
         for (auto &P : Exit->phis())
           Outputs.push_back(&P);
@@ -1687,17 +1762,19 @@ public:
         // a phi in the latch means the loop body is somehow modifiying memory
         // (might be in a subloop)
 
-        std::vector<MemoryPhi*> MemInputs;
-        std::vector<PHINode*> Inputs;
+        std::vector<MemoryPhi *> MemInputs;
+        std::vector<PHINode *> Inputs;
         if (auto *P = MSSA.getMemoryAccess(Header))
           MemInputs.push_back(P);
         for (auto &P : Header->phis()) {
-          if (&P == IV) continue;
+          if (&P == IV)
+            continue;
           Inputs.push_back(&P);
         }
         Inputs.push_back(IV);
 
-        Fold Fl(Loop, &LI, &SE, &DT, &MSSA, TensorMap, MemInputs, Inputs, MemOutputs, Outputs);
+        Fold Fl(Loop, &LI, &SE, &DT, &MSSA, TensorMap, MemInputs, Inputs,
+                MemOutputs, Outputs);
         Fl.dump(SE, MemPtr, MSSA, LevelMap);
       }
     }
@@ -1710,7 +1787,7 @@ private:
   const MemoryDef *MemInst = nullptr;
   Value *MemPtr = nullptr;
   DominatorTree &DT;
-  DenseMap<Value*, Tensor*> &TensorMap;
+  DenseMap<Value *, Tensor *> &TensorMap;
 
   void analyzeMemory(Function *F) {
     for (auto &BB : *F) {
@@ -1764,7 +1841,6 @@ Value *findLiveOut(const Loop *L, LoopInfo &LI) {
   return StoreInsts[0];
 }
 
-
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   outs() << F.getName() << "\n";
   for (auto &A : F.args()) {
@@ -1780,7 +1856,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   MSSA.ensureOptimizedUses();
   auto *Walker = MSSA.getWalker();
 
-//  LoopNest LN(*LI.getTopLevelLoops()[0], SE);
+  //  LoopNest LN(*LI.getTopLevelLoops()[0], SE);
   std::vector<LevelBounds> Levels;
   makeLevelBounds(LI, &SE, Levels);
   DenseMap<Value *, LevelBounds> LevelMap;
@@ -1837,7 +1913,8 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   });
 
   Lambda Lam(LI, SE, MSSA, TensorMap);
-  Lam.translate(F, LevelMap);
+  //  Lam.translate(F, LevelMap);
+  Lam.translateAllLoops();
 
   return PreservedAnalyses::all();
 }
