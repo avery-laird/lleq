@@ -72,7 +72,7 @@ static void GetLiveOuts(Loop *L, SmallPtrSet<Value *, 4> &LiveOuts) {
 //
 // }
 
-std::string getNameOrAsOperand(Value *V) {
+std::string getNameOrAsOperand(const Value *V) {
   //  if (!V->getName().empty())
   //    return std::string(V->getName());
   std::string BBName;
@@ -135,7 +135,7 @@ public:
     Str += " " + getNameOrAsOperand(Root);
   }
 
-  Value *toDense(std::vector<Value *> &Insts, PHINode *OldIV, PHINode *NewIV) {
+  Instruction *toDense(PHINode *OldIV, PHINode *NewIV) {
     std::vector<Value *> IdxList;
     std::vector<Type *> IdxTypes;
     std::string Name = getNameOrAsOperand(Root);
@@ -168,8 +168,6 @@ public:
 
     //    auto *Call = CallInst::Create(FType, Func, IdxList, Name);
     auto *Load = IntrinsicInst::Create(Func, IdxList, Name + ".elem");
-
-    Insts.push_back(Load);
     return Load;
   }
 };
@@ -1641,7 +1639,8 @@ public:
       //        auto *N = MDNode::get(IV->getContext(),
       //        MDString::get(IV->getContext(), getNameOrAsOperand(IV)));
       //        dyn_cast<Instruction>(V)->setMetadata("as.affine", N);
-      return T->toDense(DenseChain, L->getInductionVariable(*SE), IV);
+      auto *Load = T->toDense(L->getInductionVariable(*SE), IV);
+      return Load;
     }
     // inst or memphi?
     if (auto *I = dyn_cast<Instruction>(V)) {
@@ -1686,15 +1685,23 @@ public:
 class Lambda {
 public:
   Lambda(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA,
-         DenseMap<Value *, Tensor *> &TM)
-      : LI(LI), SE(SE), MSSA(MSSA), DT(MSSA.getDomTree()), TensorMap(TM) {}
+         DenseMap<Value *, Tensor *> &TM, DenseMap<Value *, LevelBounds> &LM)
+      : LI(LI), SE(SE), MSSA(MSSA), DT(MSSA.getDomTree()), TensorMap(TM),
+        LevelMap(LM) {}
 
-  void getLoopLiveOuts(Loop &L, SmallPtrSetImpl<Value *> &LiveOuts) {
-    // all scalar LOs are in exit block
-    auto Phis = L.getExitBlock()->phis();
-    for (auto &P : Phis)
-      LiveOuts.insert(&P);
-    // all memory defs are also liveouts
+  template <class PHITy>
+  BranchInst *getPhiBr(PHITy *Phi, BasicBlock **Then, BasicBlock **Else) {
+    if (Phi->getNumIncomingValues() != 2)
+      return nullptr;
+    auto *BB1 = Phi->getIncomingBlock(0);
+    auto *BB2 = Phi->getIncomingBlock(1);
+    BasicBlock *CommonDenom = DT.findNearestCommonDominator(BB1, BB2);
+    BranchInst *Br = dyn_cast<BranchInst>(CommonDenom->getTerminator());
+    if (Br == nullptr)
+      return Br;
+    bool IsTrueBr = DT.dominates(cast<BasicBlock>(Br->getOperand(2)), BB1);
+    IsTrueBr ? (*Then = BB1, *Else = BB2) : (*Then = BB2, *Else = BB1);
+    return Br;
   }
   // a loop has a header/latch/exit blocks,
   // and series of BBs/instructions in the body
@@ -1707,32 +1714,193 @@ public:
   // (2) block is part of the body
   //      emit the instructions (phis -> deduce br cond)
   //      skip branches
-  void translateLoop(Loop &L) {
-    dbgs() << "mkFold: ";
-    BasicBlock *Header = L.getHeader();
-    PHINode *IV = L.getInductionVariable(SE);
-    auto NonIVs =
-        make_filter_range(Header->phis(), [&](PHINode &P) { return &P != IV; });
-    for (auto &P : NonIVs)
-      dbgs() << P << " ";
-    dbgs() << *IV << "\n";
-    //    dbgs() << "LiveOuts: ";
+  template <class PHITy> void translatePhi(Loop &L, PHITy *Phi) {
+    if (Phi->getNumIncomingValues() == 1) {
+      dbgs() << "  " << getNameOrAsOperand(Phi) << " = ";
+      dbgs() << getNameOrAsOperand(Phi->getIncomingValue(0)) << "\n";
+      return;
+    }
+    BasicBlock *Then, *Else;
+    BranchInst *Br = getPhiBr(Phi, &Then, &Else);
+    auto *TrueVal = Phi->getIncomingValueForBlock(Then);
+    auto *FalseVal = Phi->getIncomingValueForBlock(Else);
+
+    std::string Target, True, False;
+    if (auto *MemPhi = dyn_cast<MemoryPhi>(Phi)) {
+      std::string MemName = getNameOrAsOperand(MemPtr);
+      Target = MemName + "." + std::to_string(MemPhi->getID());
+      auto *InputMem = MSSA.getMemoryAccess(L.getHeader());
+      True = TrueVal == InputMem ? MemName :
+          MemName + "." + std::to_string(cast<MemoryAccess>(TrueVal)->getID());
+      False = FalseVal == InputMem ? MemName :
+          MemName + "." + std::to_string(cast<MemoryAccess>(FalseVal)->getID());
+    } else {
+      Target = getNameOrAsOperand(Phi);
+      True = getNameOrAsOperand(TrueVal);
+      False = getNameOrAsOperand(FalseVal);
+    }
+
+    dbgs() << "  " << Target << " = ";
+    dbgs() << "if " << getNameOrAsOperand(Br->getCondition()) << " ";
+    dbgs() << "then " << True << " ";
+    dbgs() << "else " << False << "\n";
+  }
+
+  Instruction *makeDenseBodyRecursively(Loop &L, SmallVector<Instruction*> &Body, PHINode *NewIV, Instruction *I) {
+    if (!L.contains(I)) {
+      Body.push_back(I);
+      return I;
+    }
+    if (auto *T = TensorMap[I]) {
+      auto *NewLoad = T->toDense(L.getInductionVariable(SE), NewIV);
+      Body.push_back(NewLoad);
+      return NewLoad;
+    }
+
+    auto *NewI = I->clone();
+    if (!NewI->getType()->isVoidTy())
+      NewI->setName(getNameOrAsOperand(I).substr(1) + ".dense");
+    for (size_t Op = 0; Op < I->getNumOperands(); ++Op) {
+      auto *IOp = I->getOperand(Op);
+      if (auto *Phi = dyn_cast<PHINode>(IOp)) {
+        if (Phi == NewIV)
+          NewI->setOperand(Op, NewIV);
+        // skip header phis
+        if (any_of(L.getHeader()->phis(), [&](auto &P) { return &P == Phi; }))
+          continue;
+      }
+      if (auto *ToVisit = dyn_cast<Instruction>(IOp))
+        NewI->setOperand(Op, makeDenseBodyRecursively(L, Body, NewIV, ToVisit));
+    }
+    Body.push_back(NewI);
+    return NewI;
+  }
+
+  void makeDenseBody(Loop &L, PHINode *NewIV, SmallVector<Instruction*> &DenseBody, SmallVector<Instruction*> &LoopBody, SmallVector<const MemoryAccess *> &MemDefs) {
+    // TODO reverse this
+    for (auto &Phi : L.getExitBlock()->phis())
+      makeDenseBodyRecursively(L, DenseBody, NewIV, cast<Instruction>(Phi.getIncomingValue(0)));
+    for (auto *MA : MemDefs)
+      if (auto *Def = dyn_cast<MemoryDef>(MA))
+        makeDenseBodyRecursively(L, DenseBody, NewIV, Def->getMemoryInst());
+  }
+
+  void translateLoopBody(Loop &L, SmallVector<const MemoryAccess *> &MemDefs,
+                         SmallVector<Instruction *> &LoopBody) {
+    auto *Header = L.getHeader();
     for (BasicBlock *BB : L.getBlocks()) {
       if (LI.getLoopFor(BB) != &L)
         continue;
-      for (auto I = BB->getFirstInsertionPt(), E = BB->end(); I != E; ++I) {
+      // All defs are also outputs
+      if (auto *Defs = MSSA.getBlockDefs(BB))
+        for (const MemoryAccess &MA : *Defs) {
+          if (auto *Phi = dyn_cast<MemoryPhi>(&MA)) {
+            // skip memory phis unless they appear outside the header
+            if (BB == Header)
+              continue;
+            translatePhi(L, Phi);
+          }
+          // are any of the MAs used outside this loop
+          BasicBlock *InstBB = MA.getBlock();
+          if (any_of(MA.uses(), [&](const Use &U) {
+                auto *User = cast<MemoryAccess>(U.getUser());
+                auto *UserBB = User->getBlock();
+                if (auto *MemPhi = dyn_cast<MemoryPhi>(User))
+                  UserBB = MemPhi->getIncomingBlock(U);
+                return InstBB != UserBB && !L.contains(UserBB);
+              })) {
+            MemDefs.push_back(&MA);
+          }
+        }
+      BasicBlock::iterator I =
+          BB == Header ? BB->getFirstInsertionPt() : BB->begin();
+      BasicBlock::iterator E = BB->end();
+      for (; I != E; ++I) {
         if (dyn_cast<BranchInst>(&*I) || &*I == BB->getTerminator())
           continue;
+        LoopBody.push_back(&*I);
+        if (auto *Phi = dyn_cast<PHINode>(&*I)) {
+          translatePhi(L, Phi);
+          continue;
+        }
         dbgs() << *I << "\n";
       }
     }
+    // now loopbody has all the instructions in the loop body
+    // memdef has all the defining mem access, basically we
+    // only need this for writing the output vals
+    auto *IV = L.getInductionVariable(SE);
+    if (LevelMap[IV].LevelType == DENSE)
+      return; // skip already dense levels
+
+    // we only need the instructions related to outputs
+    // vals in MemDef + exit block phis
+
+    auto &Context = L.getHeader()->getParent()->getContext();
+    SmallVector<Instruction*> DenseBody;
+
+    auto *NewIV = PHINode::Create(Type::getInt64Ty(Context), 2, "iv.dense");
+    makeDenseBody(L, NewIV, DenseBody, LoopBody, MemDefs);
+//    for (auto *I : LoopBody) {
+//      // replace indirect loads
+//      if (auto *T = TensorMap[I]) {
+//        Builder.Insert(T->toDense(IV, NewIV));
+//        continue;
+//      }
+//
+//      auto *NewI = I->clone();
+//      if (!NewI->getType()->isVoidTy())
+//        NewI->setName(getNameOrAsOperand(I).substr(1) + ".ivdense");
+//      // replace uses of old IV with new one
+//      for (auto &Use : make_early_inc_range(NewI->operands()))
+//        if (Use.get() == IV)
+//          Use.set(NewIV);
+//      Builder.Insert(NewI);
+//    }
+    // print dense version
+    dbgs() << "DENSE VERSION:\n";
+    for (auto *V : DenseBody) {
+      dbgs() << *V << "\n";
+    }
+    for (auto *V : reverse(DenseBody))
+      V->deleteValue();
+    delete NewIV;
+  }
+
+  void translateLoop(Loop &L) {
+    // translate header
+    BasicBlock *Header = L.getHeader();
+    dbgs() << "%" << Header->getName() << " = λ ";
+    PHINode *IV = L.getInductionVariable(SE);
+    auto NonIVs =
+        make_filter_range(Header->phis(), [&](PHINode &P) { return &P != IV; });
+    ListSeparator LS(", ");
+    if (MemoryPhi *BlockPhi = MSSA.getMemoryAccess(Header))
+      dbgs() << LS << getNameOrAsOperand(MemPtr);
+    for (auto &P : NonIVs)
+      dbgs() << LS << *P.getType() << " " << getNameOrAsOperand(&P);
+    dbgs() << LS << *IV->getType() << " " << getNameOrAsOperand(IV) << " .\n";
+
+    // translate loop body
+    SmallVector<const MemoryAccess *> MemDefs;
+    SmallVector<Instruction *> LoopBody;
+    translateLoopBody(L, MemDefs, LoopBody);
+
+    dbgs() << "  return (";
+    LS = ListSeparator(", ");
+    for (auto &P : L.getExitBlock()->phis())
+      dbgs() << LS << getNameOrAsOperand(P.getIncomingValue(0));
+    for (auto *D : MemDefs)
+      dbgs() << LS << getNameOrAsOperand(MemPtr) << "." << D->getID();
+    dbgs() << ")\n";
   }
   void translateLoopsRecursively(Loop &L) {
     for (Loop *SubLoop : L.getSubLoops())
       translateLoopsRecursively(*SubLoop);
     translateLoop(L);
   }
-  void translateAllLoops() {
+  void translateAllLoops(Function &F) {
+    analyzeMemory(&F);
     for (const auto &L : LI)
       translateLoopsRecursively(*L);
   }
@@ -1788,6 +1956,7 @@ private:
   Value *MemPtr = nullptr;
   DominatorTree &DT;
   DenseMap<Value *, Tensor *> &TensorMap;
+  DenseMap<Value *, LevelBounds> &LevelMap;
 
   void analyzeMemory(Function *F) {
     for (auto &BB : *F) {
@@ -1912,9 +2081,9 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     }
   });
 
-  Lambda Lam(LI, SE, MSSA, TensorMap);
+  Lambda Lam(LI, SE, MSSA, TensorMap, LevelMap);
   //  Lam.translate(F, LevelMap);
-  Lam.translateAllLoops();
+  Lam.translateAllLoops(F);
 
   return PreservedAnalyses::all();
 }
