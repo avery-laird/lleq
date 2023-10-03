@@ -1689,6 +1689,20 @@ public:
       : LI(LI), SE(SE), MSSA(MSSA), DT(MSSA.getDomTree()), TensorMap(TM),
         LevelMap(LM) {}
 
+  std::string arrayType(Value *I) {
+    // TODO don't do reverse lookup
+    for (auto &E : TensorMap) {
+      if (E.getSecond() && E.getSecond()->Root == I) {
+        Tensor *T = E.getSecond();
+        std::string Out;
+        raw_string_ostream O(Out);
+        O << "ptr " << T->DimOrder.size() << " " << *T->ElemType;
+        return Out;
+      }
+    }
+    llvm_unreachable("val doesn't exist in tensor map.");
+  }
+
   template <class PHITy>
   BranchInst *getPhiBr(PHITy *Phi, BasicBlock **Then, BasicBlock **Else) {
     if (Phi->getNumIncomingValues() != 2)
@@ -1730,10 +1744,14 @@ public:
       std::string MemName = getNameOrAsOperand(MemPtr);
       Target = MemName + "." + std::to_string(MemPhi->getID());
       auto *InputMem = MSSA.getMemoryAccess(L.getHeader());
-      True = TrueVal == InputMem ? MemName :
-          MemName + "." + std::to_string(cast<MemoryAccess>(TrueVal)->getID());
-      False = FalseVal == InputMem ? MemName :
-          MemName + "." + std::to_string(cast<MemoryAccess>(FalseVal)->getID());
+      True = TrueVal == InputMem
+                 ? MemName
+                 : MemName + "." +
+                       std::to_string(cast<MemoryAccess>(TrueVal)->getID());
+      False = FalseVal == InputMem
+                  ? MemName
+                  : MemName + "." +
+                        std::to_string(cast<MemoryAccess>(FalseVal)->getID());
     } else {
       Target = getNameOrAsOperand(Phi);
       True = getNameOrAsOperand(TrueVal);
@@ -1746,7 +1764,9 @@ public:
     dbgs() << "else " << False << "\n";
   }
 
-  Instruction *makeDenseBodyRecursively(Loop &L, SmallVector<Instruction*> &Body, PHINode *NewIV, Instruction *I) {
+  Instruction *makeDenseBodyRecursively(Loop &L,
+                                        SmallVector<Instruction *> &Body,
+                                        PHINode *NewIV, Instruction *I) {
     if (!L.contains(I)) {
       Body.push_back(I);
       return I;
@@ -1776,17 +1796,22 @@ public:
     return NewI;
   }
 
-  void makeDenseBody(Loop &L, PHINode *NewIV, SmallVector<Instruction*> &DenseBody, SmallVector<Instruction*> &LoopBody, SmallVector<const MemoryAccess *> &MemDefs) {
+  void makeDenseBody(Loop &L, PHINode *NewIV,
+                     SmallVector<Instruction *> &DenseBody,
+                     SmallVector<Instruction *> &LoopBody,
+                     SmallVector<const MemoryAccess *> &MemDefs) {
     // TODO reverse this
     for (auto &Phi : L.getExitBlock()->phis())
-      makeDenseBodyRecursively(L, DenseBody, NewIV, cast<Instruction>(Phi.getIncomingValue(0)));
+      makeDenseBodyRecursively(L, DenseBody, NewIV,
+                               cast<Instruction>(Phi.getIncomingValue(0)));
     for (auto *MA : MemDefs)
       if (auto *Def = dyn_cast<MemoryDef>(MA))
         makeDenseBodyRecursively(L, DenseBody, NewIV, Def->getMemoryInst());
   }
 
   void translateLoopBody(Loop &L, SmallVector<const MemoryAccess *> &MemDefs,
-                         SmallVector<Instruction *> &LoopBody) {
+                         SmallVector<Instruction *> &LoopBody,
+                         SmallVector<Instruction *> &DenseBody) {
     auto *Header = L.getHeader();
     for (BasicBlock *BB : L.getBlocks()) {
       if (LI.getLoopFor(BB) != &L)
@@ -1823,6 +1848,12 @@ public:
           translatePhi(L, Phi);
           continue;
         }
+        if (auto *Store = dyn_cast<StoreInst>(&*I)) {
+            auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
+            dbgs() << "  " << getNameOrAsOperand(MemPtr);
+            dbgs() << "." << Def->getID() << " =" << *I << "\n";
+            continue;
+        }
         dbgs() << *I << "\n";
       }
     }
@@ -1837,34 +1868,10 @@ public:
     // vals in MemDef + exit block phis
 
     auto &Context = L.getHeader()->getParent()->getContext();
-    SmallVector<Instruction*> DenseBody;
-
     auto *NewIV = PHINode::Create(Type::getInt64Ty(Context), 2, "iv.dense");
+
+    DenseBody.push_back(NewIV);
     makeDenseBody(L, NewIV, DenseBody, LoopBody, MemDefs);
-//    for (auto *I : LoopBody) {
-//      // replace indirect loads
-//      if (auto *T = TensorMap[I]) {
-//        Builder.Insert(T->toDense(IV, NewIV));
-//        continue;
-//      }
-//
-//      auto *NewI = I->clone();
-//      if (!NewI->getType()->isVoidTy())
-//        NewI->setName(getNameOrAsOperand(I).substr(1) + ".ivdense");
-//      // replace uses of old IV with new one
-//      for (auto &Use : make_early_inc_range(NewI->operands()))
-//        if (Use.get() == IV)
-//          Use.set(NewIV);
-//      Builder.Insert(NewI);
-//    }
-    // print dense version
-    dbgs() << "DENSE VERSION:\n";
-    for (auto *V : DenseBody) {
-      dbgs() << *V << "\n";
-    }
-    for (auto *V : reverse(DenseBody))
-      V->deleteValue();
-    delete NewIV;
   }
 
   void translateLoop(Loop &L) {
@@ -1876,7 +1883,7 @@ public:
         make_filter_range(Header->phis(), [&](PHINode &P) { return &P != IV; });
     ListSeparator LS(", ");
     if (MemoryPhi *BlockPhi = MSSA.getMemoryAccess(Header))
-      dbgs() << LS << getNameOrAsOperand(MemPtr);
+      dbgs() << LS << arrayType(MemPtr) << " " << getNameOrAsOperand(MemPtr);// << "." << BlockPhi->getID();
     for (auto &P : NonIVs)
       dbgs() << LS << *P.getType() << " " << getNameOrAsOperand(&P);
     dbgs() << LS << *IV->getType() << " " << getNameOrAsOperand(IV) << " .\n";
@@ -1884,15 +1891,30 @@ public:
     // translate loop body
     SmallVector<const MemoryAccess *> MemDefs;
     SmallVector<Instruction *> LoopBody;
-    translateLoopBody(L, MemDefs, LoopBody);
+    SmallVector<Instruction *> DenseBody;
+    translateLoopBody(L, MemDefs, LoopBody, DenseBody);
 
-    dbgs() << "  return (";
+    dbgs() << "(";
     LS = ListSeparator(", ");
     for (auto &P : L.getExitBlock()->phis())
       dbgs() << LS << getNameOrAsOperand(P.getIncomingValue(0));
     for (auto *D : MemDefs)
-      dbgs() << LS << getNameOrAsOperand(MemPtr) << "." << D->getID();
+      dbgs() << LS << arrayType(MemPtr) << " " << getNameOrAsOperand(MemPtr)
+             << "." << D->getID();
+    dbgs() << ") = fold (";
+    LS = ListSeparator(", ");
+    if (MemoryPhi *BlockPhi = MSSA.getMemoryAccess(Header)) {
+      dbgs() << LS << arrayType(MemPtr) << " " << getNameOrAsOperand(MemPtr);
+      auto *Incoming = BlockPhi->getIncomingValueForBlock(L.getLoopPreheader());
+      if (!MSSA.isLiveOnEntryDef(Incoming))
+        dbgs() << "." << Incoming->getID();
+    }
+    for (auto &P : L.getExitBlock()->phis())
+      dbgs() << LS << getNameOrAsOperand(P.getIncomingValueForBlock(L.getLoopPreheader()));
     dbgs() << ")\n";
+
+    for (auto *V : reverse(DenseBody))
+      V->deleteValue();
   }
   void translateLoopsRecursively(Loop &L) {
     for (Loop *SubLoop : L.getSubLoops())
@@ -2011,7 +2033,7 @@ Value *findLiveOut(const Loop *L, LoopInfo &LI) {
 }
 
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
-  outs() << F.getName() << "\n";
+//  outs() << F.getName() << "\n";
   for (auto &A : F.args()) {
     if (A.getType()->isPointerTy())
       A.addAttr(Attribute::NoAlias);
