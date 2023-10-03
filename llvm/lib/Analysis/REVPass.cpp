@@ -1849,10 +1849,10 @@ public:
           continue;
         }
         if (auto *Store = dyn_cast<StoreInst>(&*I)) {
-            auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
-            dbgs() << "  " << getNameOrAsOperand(MemPtr);
-            dbgs() << "." << Def->getID() << " =" << *I << "\n";
-            continue;
+          auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
+          dbgs() << "  " << getNameOrAsOperand(MemPtr);
+          dbgs() << "." << Def->getID() << " =" << *I << "\n";
+          continue;
         }
         dbgs() << *I << "\n";
       }
@@ -1883,7 +1883,8 @@ public:
         make_filter_range(Header->phis(), [&](PHINode &P) { return &P != IV; });
     ListSeparator LS(", ");
     if (MemoryPhi *BlockPhi = MSSA.getMemoryAccess(Header))
-      dbgs() << LS << arrayType(MemPtr) << " " << getNameOrAsOperand(MemPtr);// << "." << BlockPhi->getID();
+      dbgs() << LS << arrayType(MemPtr) << " "
+             << getNameOrAsOperand(MemPtr); // << "." << BlockPhi->getID();
     for (auto &P : NonIVs)
       dbgs() << LS << *P.getType() << " " << getNameOrAsOperand(&P);
     dbgs() << LS << *IV->getType() << " " << getNameOrAsOperand(IV) << " .\n";
@@ -1906,12 +1907,22 @@ public:
     if (MemoryPhi *BlockPhi = MSSA.getMemoryAccess(Header)) {
       dbgs() << LS << arrayType(MemPtr) << " " << getNameOrAsOperand(MemPtr);
       auto *Incoming = BlockPhi->getIncomingValueForBlock(L.getLoopPreheader());
-      if (!MSSA.isLiveOnEntryDef(Incoming))
+      bool IsInLoopHeader = false;
+      if (auto *Lp = LI.getLoopFor(Incoming->getBlock()))
+        IsInLoopHeader = Lp->getHeader() == Incoming->getBlock();
+      if (!MSSA.isLiveOnEntryDef(Incoming) && !IsInLoopHeader)
         dbgs() << "." << Incoming->getID();
     }
     for (auto &P : L.getExitBlock()->phis())
-      dbgs() << LS << getNameOrAsOperand(P.getIncomingValueForBlock(L.getLoopPreheader()));
-    dbgs() << ")\n";
+      dbgs() << LS
+             << getNameOrAsOperand(
+                    P.getIncomingValueForBlock(L.getLoopPreheader()));
+    dbgs() << ") ";
+    dbgs() << "%" << Header->getName() << " ";
+    auto Bounds = L.getBounds(SE);
+    std::string Start = getNameOrAsOperand(&Bounds->getInitialIVValue());
+    std::string End = getNameOrAsOperand(&Bounds->getFinalIVValue());
+    dbgs() << "Range(" << Start << ", " << End << ")\n";
 
     for (auto *V : reverse(DenseBody))
       V->deleteValue();
@@ -2033,7 +2044,7 @@ Value *findLiveOut(const Loop *L, LoopInfo &LI) {
 }
 
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
-//  outs() << F.getName() << "\n";
+  //  outs() << F.getName() << "\n";
   for (auto &A : F.args()) {
     if (A.getType()->isPointerTy())
       A.addAttr(Attribute::NoAlias);
