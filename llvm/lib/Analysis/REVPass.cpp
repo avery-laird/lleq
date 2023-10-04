@@ -1900,8 +1900,7 @@ public:
     for (auto &P : L.getExitBlock()->phis())
       dbgs() << LS << getNameOrAsOperand(P.getIncomingValue(0));
     for (auto *D : MemDefs)
-      dbgs() << LS << arrayType(MemPtr) << " " << getNameOrAsOperand(MemPtr)
-             << "." << D->getID();
+      dbgs() << LS << getNameOrAsOperand(MemPtr) << "." << D->getID();
     dbgs() << ") = fold (";
     LS = ListSeparator(", ");
     if (MemoryPhi *BlockPhi = MSSA.getMemoryAccess(Header)) {
@@ -1913,16 +1912,18 @@ public:
       if (!MSSA.isLiveOnEntryDef(Incoming) && !IsInLoopHeader)
         dbgs() << "." << Incoming->getID();
     }
-    for (auto &P : L.getExitBlock()->phis())
-      dbgs() << LS
-             << getNameOrAsOperand(
-                    P.getIncomingValueForBlock(L.getLoopPreheader()));
+    for (auto &P : NonIVs) {
+      auto *InitialArg = P.getIncomingValueForBlock(L.getLoopPreheader());
+      dbgs() << LS << *InitialArg->getType() << getNameOrAsOperand(InitialArg);
+    }
     dbgs() << ") ";
     dbgs() << "%" << Header->getName() << " ";
     auto Bounds = L.getBounds(SE);
-    std::string Start = getNameOrAsOperand(&Bounds->getInitialIVValue());
-    std::string End = getNameOrAsOperand(&Bounds->getFinalIVValue());
-    dbgs() << "Range(" << Start << ", " << End << ")\n";
+    auto *Start = &Bounds->getInitialIVValue();
+    auto *End = &Bounds->getFinalIVValue();
+    dbgs() << "Range(" << *Start->getType() << " " << getNameOrAsOperand(Start)
+           << ", " << *End->getType() << " " << getNameOrAsOperand(End)
+           << ")\n";
 
     for (auto *V : reverse(DenseBody))
       V->deleteValue();
