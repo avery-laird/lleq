@@ -1088,7 +1088,7 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
   return true;
 }
 
-bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
+bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, Value *Root, Value **A,
                    Value **Pk_1, Value **Nk, Value **Ik,
                    DenseMap<Value *, LevelBounds> &LevelMap) {
   Instruction *I, *J;
@@ -1152,13 +1152,13 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **A,
   return false;
 }
 
-bool detectDense1D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **x,
+bool detectDense1D(LoopInfo *LI, ScalarEvolution *SE, Value *Root, Value **x,
                    Value **Ik, DenseMap<Value *, LevelBounds> &LevelMap) {
   *x = *Ik = nullptr;
 
   Value *Next = nullptr;
-  if (auto *Load = dyn_cast<LoadInst>(Root))
-    Next = skipCasts(Load->getPointerOperand());
+  if (auto *Mem = getPointerOperand(Root))
+    Next = skipCasts(Mem);
   else
     return false;
 
@@ -1181,20 +1181,20 @@ bool detectDense1D(LoopInfo *LI, ScalarEvolution *SE, LoadInst *Root, Value **x,
 }
 
 bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
-                   SmallVector<LoadInst *> &Loads,
+                   SmallVector<Value *> &Loads,
                    DenseMap<Value *, LevelBounds> &LevelMap,
-                   SmallPtrSetImpl<LoadInst *> &Leftover,
+                   SmallPtrSetImpl<Value *> &Leftover,
                    DenseMap<Value *, Tensor *> &TensorMap) {
   // 1. how the load is indexed? eg by dense or compressed level iterator
   // 2. how the load is used? eg as ptr (to index other array) or in
   // computation?
   bool Change = true;
-  SmallPtrSet<LoadInst *, 5> WorkList;
+  SmallPtrSet<Value *, 5> WorkList;
   for (auto *L : Loads)
     WorkList.insert(L);
   while (Change) {
     Change = false;
-    SmallVector<LoadInst *> ToRemove;
+    SmallVector<Value *> ToRemove;
     for (auto *Load :
          WorkList) { // TODO figure out how to undo LevelMap mutations
       Value *Row, *Col, *Val, *I, *J;
@@ -1266,8 +1266,10 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
 }
 
 void makeTopLevelInputs(Value *LiveOut, SmallPtrSetImpl<Value *> &Inputs) {
-  if (auto *Store = dyn_cast<StoreInst>(LiveOut))
+  if (auto *Store = dyn_cast<StoreInst>(LiveOut)) {
+    Inputs.insert(Store);
     LiveOut = Store->getValueOperand();
+  }
   auto *Inst = dyn_cast<Instruction>(LiveOut);
   if (Inst == nullptr)
     return; // no inputs, some constant value
@@ -1914,7 +1916,7 @@ public:
     }
     for (auto &P : NonIVs) {
       auto *InitialArg = P.getIncomingValueForBlock(L.getLoopPreheader());
-      dbgs() << LS << *InitialArg->getType() << getNameOrAsOperand(InitialArg);
+      dbgs() << LS << *InitialArg->getType() << " " << getNameOrAsOperand(InitialArg);
     }
     dbgs() << ") ";
     dbgs() << "%" << Header->getName() << " ";
@@ -2084,11 +2086,11 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     Loop2Loads[L] = TopLevelInputs;
   }
 
-  SmallVector<LoadInst *> TopLevelLoads;
+  SmallVector<Value *> TopLevelLoads;
   for (auto &E : Loop2Loads) {
     for (auto *Input : E.second)
-      if (auto *Load = dyn_cast<LoadInst>(Input))
-        TopLevelLoads.push_back(Load);
+      if (isa<LoadInst>(Input) || isa<StoreInst>(Input))
+        TopLevelLoads.push_back(Input);
   }
 
   LLVM_DEBUG({
@@ -2098,7 +2100,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     dbgs() << "----------------------------\n";
   });
 
-  SmallPtrSet<LoadInst *, 5> Leftover;
+  SmallPtrSet<Value *, 5> Leftover;
   DenseMap<Value *, Tensor *> TensorMap;
   auto AllCovered =
       coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap, Leftover, TensorMap);
