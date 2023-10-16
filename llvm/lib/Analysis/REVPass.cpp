@@ -1242,7 +1242,12 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       auto IsDense1D = detectDense1D(LI, SE, Load, &x, &Ik, LevelMap);
       if (IsDense1D) {
         auto *D1 = LevelMap[Ik].UpperBound;
-        auto *Dense1D = new Vector({Ik}, Load->getType(), x);
+        Type *Ty;
+        if (auto *S = dyn_cast<StoreInst>(Load))
+          Ty = S->getValueOperand()->getType();
+        else
+          Ty = Load->getType();
+        auto *Dense1D = new Vector({Ik}, Ty, x);
         //        Vector Dense1D({D1}, x);
         TensorMap[Load] = Dense1D;
         LLVM_DEBUG({
@@ -1929,6 +1934,8 @@ public:
 
     for (auto *V : reverse(DenseBody))
       V->deleteValue();
+
+
   }
   void translateLoopsRecursively(Loop &L) {
     for (Loop *SubLoop : L.getSubLoops())
