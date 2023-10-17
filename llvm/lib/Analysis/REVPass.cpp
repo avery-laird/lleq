@@ -135,12 +135,12 @@ public:
     Str += " " + getNameOrAsOperand(Root);
   }
 
-  Instruction *toDense(PHINode *OldIV, PHINode *NewIV) {
+  Instruction *toDense(PHINode *OldIV, PHINode *NewIV, bool DelinearOnly = false) {
     std::vector<Value *> IdxList;
     std::vector<Type *> IdxTypes;
     std::string Name = getNameOrAsOperand(Root);
     Name = Name.substr(1, Name.size());
-    if (Kind == CONTIGUOUS) {
+    if (Kind == CONTIGUOUS || DelinearOnly) {
       IdxList.push_back(Root);
       IdxTypes.push_back(Root->getType());
     } else {
@@ -1203,6 +1203,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
         auto *TensorCSR = new CSR({I, J}, Load->getType(), Val, Row, Col);
         //        CSR TensorCSR({Rows, nullptr}, Val, Row, Col);
         TensorMap[Load] = TensorCSR;
+        TensorMap[getLoadStorePointerOperand(Load)] = TensorCSR;
         // find all the memory users of the pos (row) iterator and mark them?
         LLVM_DEBUG({
           dbgs() << "detected CSR:\n";
@@ -1226,7 +1227,8 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
         auto *Dense2D = new Vector({Pk_1, Ik}, Load->getType(), A);
         //        Vector Dense2D({D1, D2}, A);
         TensorMap[Load] = Dense2D;
-        LLVM_DEBUG({
+        TensorMap[getLoadStorePointerOperand(Load)] = Dense2D;
+            LLVM_DEBUG({
           dbgs() << "detected dense 2d\n";
           dbgs() << "A = " << *A << "\n";
           dbgs() << "p_{k-1} = " << *Pk_1 << "\n";
@@ -1250,7 +1252,8 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
         auto *Dense1D = new Vector({Ik}, Ty, x);
         //        Vector Dense1D({D1}, x);
         TensorMap[Load] = Dense1D;
-        LLVM_DEBUG({
+        TensorMap[getLoadStorePointerOperand(Load)] = Dense1D;
+            LLVM_DEBUG({
           dbgs() << "detected dense 1d\n";
           dbgs() << "x = " << *x << "\n";
           dbgs() << "i_k = " << *Ik << "\n";
@@ -1766,7 +1769,7 @@ public:
     }
 
     dbgs() << "  " << Target << " = ";
-    dbgs() << "if " << getNameOrAsOperand(Br->getCondition()) << " ";
+    dbgs() << "if " << *TrueVal->getType() << " " << getNameOrAsOperand(Br->getCondition()) << " ";
     dbgs() << "then " << True << " ";
     dbgs() << "else " << False << "\n";
   }
@@ -1853,15 +1856,46 @@ public:
         LoopBody.push_back(&*I);
         if (auto *Phi = dyn_cast<PHINode>(&*I)) {
           translatePhi(L, Phi);
-          continue;
-        }
-        if (auto *Store = dyn_cast<StoreInst>(&*I)) {
+        } else if (auto *Store = dyn_cast<StoreInst>(&*I)) {
           auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
           dbgs() << "  " << getNameOrAsOperand(MemPtr);
           dbgs() << "." << Def->getID() << " =" << *I << "\n";
-          continue;
+        } else if (auto *Load = dyn_cast<LoadInst>(&*I)) {
+          if (TensorMap.contains(Load)) {
+            auto *T = TensorMap[Load];
+            auto *IV = L.getInductionVariable(SE);
+            auto *Delinear = T->toDense(IV, IV, true);
+            Delinear->setName(getNameOrAsOperand(Load).substr(1));
+            dbgs() << *Delinear << "\n";
+            Delinear->deleteValue();
+          } else {
+            dbgs() << *I << "\n";
+          }
         }
-        dbgs() << *I << "\n";
+//        else if (auto *GEP = dyn_cast<GEPOperator>(&*I)) {
+//          if (TensorMap.contains(GEP)) {
+//            auto *T = TensorMap[GEP];
+//            std::vector<Value*> Indices;
+//            auto &Ctx = L.getHeader()->getContext();
+//            for (auto *V : T->Shape) {
+//              auto *C = ZExtInst::CreateIntegerCast(V, Type::getInt64Ty(Ctx), true, "cast." + getNameOrAsOperand(V));
+//              Indices.push_back(C);
+//            }
+//            ArrayType::get(GEP->getResultElementType(), )
+//            auto *NewGep = GetElementPtrInst::Create(
+//                GEP->getResultElementType(),
+//                GEP->getPointerOperand(),
+//                Indices, getNameOrAsOperand(GEP));
+//            dbgs() << *NewGep << "\n";
+//            NewGep->deleteValue();
+//            for (auto *V : Indices) V->deleteValue();
+//          } else {
+//            dbgs() << *I << "\n";
+//          }
+//        }
+        else {
+          dbgs() << *I << "\n";
+        }
       }
     }
     // now loopbody has all the instructions in the loop body
