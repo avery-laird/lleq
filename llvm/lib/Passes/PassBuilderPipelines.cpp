@@ -23,6 +23,7 @@
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/ScopedNoAliasAA.h"
 #include "llvm/Analysis/TypeBasedAliasAnalysis.h"
+#include "llvm/Analysis/REVPass.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -1263,6 +1264,18 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
                                              ThinOrFullLTOPhase LTOPhase) {
   const bool LTOPreLink = isLTOPreLink(LTOPhase);
   ModulePassManager MPM;
+//  ModulePassManager MPM = build(OptimizationLevel::O0, LTOPreLink);
+//  FunctionPassManager OptimizePM;
+//  OptimizePM.addPass(PromotePass());
+//  OptimizePM.addPass(createFunctionToLoopPassAdaptor(LoopRotatePass()));
+//  OptimizePM.addPass(InstCombinePass());
+//  OptimizePM.addPass(SimplifyCFGPass());
+//  OptimizePM.addPass(LoopSimplifyPass());
+//  OptimizePM.addPass(LCSSAPass());
+//
+//  MPM.addPass(createModuleToFunctionPassAdaptor(std::move(OptimizePM),
+//                                                PTO.EagerlyInvalidateAnalyses));
+//  return MPM;
 
   // Run partial inlining pass to partially inline functions that have
   // large bodies.
@@ -1349,6 +1362,8 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
   LPM.addPass(LoopDeletionPass());
   OptimizePM.addPass(createFunctionToLoopPassAdaptor(
       std::move(LPM), /*UseMemorySSA=*/false, /*UseBlockFrequencyInfo=*/false));
+
+  OptimizePM.addPass(REVPass());
 
   // Distribute loops to allow partial vectorization.  I.e. isolate dependences
   // into separate loop that would otherwise inhibit vectorization.  This is

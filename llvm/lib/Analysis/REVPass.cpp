@@ -671,6 +671,10 @@ void makeLevelBounds(LoopInfo &LI, ScalarEvolution *SE,
     }
 
     // Detect Compressed Form: pos[i] ==> pos[i+1]
+    while (auto *PCast = dyn_cast<CastInst>(LowerBound))
+      LowerBound = PCast->getOperand(0);
+    while (auto *PCast = dyn_cast<CastInst>(UpperBound))
+      UpperBound = PCast->getOperand(0);
     LoadInst *LowInstr = dyn_cast<LoadInst>(LowerBound);
     LoadInst *UpInstr = dyn_cast<LoadInst>(UpperBound);
     if (LowInstr && UpInstr) {
@@ -1769,7 +1773,16 @@ public:
     }
 
     dbgs() << "  " << Target << " = ";
-    dbgs() << "if " << *TrueVal->getType() << " " << getNameOrAsOperand(Br->getCondition()) << " ";
+    std::string RetTy;
+    if (auto *MDef = dyn_cast<MemoryDef>(TrueVal)) {
+      auto *GEP = cast<GEPOperator>(getLoadStorePointerOperand(MDef->getMemoryInst()));
+      RetTy = arrayType(GEP->getPointerOperand());
+    } else {
+      raw_string_ostream OS(RetTy);
+      OS << *TrueVal->getType();
+    }
+
+    dbgs() << "if " << RetTy << " " << getNameOrAsOperand(Br->getCondition()) << " ";
     dbgs() << "then " << True << " ";
     dbgs() << "else " << False << "\n";
   }
@@ -1915,7 +1928,10 @@ public:
     makeDenseBody(L, NewIV, DenseBody, LoopBody, MemDefs);
   }
 
-  void translateLoop(Loop &L) {
+  bool translateLoop(Loop &L) {
+    MemInst = nullptr;
+    if (!analyzeMemory(L))
+      return false;
     // translate header
     BasicBlock *Header = L.getHeader();
     dbgs() << "%" << Header->getName() << " = λ ";
@@ -1969,21 +1985,25 @@ public:
     for (auto *V : reverse(DenseBody))
       V->deleteValue();
 
-
+    return true;
   }
-  void translateLoopsRecursively(Loop &L) {
+  bool translateLoopsRecursively(Loop &L, DenseMap<Loop*, bool> &LegalLoops) {
+    bool Safe = true;
     for (Loop *SubLoop : L.getSubLoops())
-      translateLoopsRecursively(*SubLoop);
-    translateLoop(L);
+      Safe &= translateLoopsRecursively(*SubLoop, LegalLoops);
+    if (!LegalLoops[&L] | !Safe)
+      return false;
+
+    return translateLoop(L);
   }
-  void translateAllLoops(Function &F) {
-    analyzeMemory(&F);
+  void translateAllLoops(Function &F, DenseMap<Loop*, bool> &LegalLoops) {
+//    analyzeMemory(&F);
     for (const auto &L : LI)
-      translateLoopsRecursively(*L);
+      translateLoopsRecursively(*L, LegalLoops);
   }
 
   void translate(Function &F, DenseMap<Value *, LevelBounds> &LevelMap) {
-    analyzeMemory(&F);
+//    analyzeMemory(&F);
 
     for (auto *TopLoop : LI.getTopLevelLoops()) {
       LoopNest LN(*TopLoop, SE);
@@ -2035,18 +2055,23 @@ private:
   DenseMap<Value *, Tensor *> &TensorMap;
   DenseMap<Value *, LevelBounds> &LevelMap;
 
-  void analyzeMemory(Function *F) {
-    for (auto &BB : *F) {
-      const auto *Defs = MSSA.getBlockDefs(&BB);
+  bool analyzeMemory(Loop &L) {
+    for (auto *BB : L.getBlocks()) {
+      if (LI.getLoopFor(BB) != &L)
+        continue;
+      const auto *Defs = MSSA.getBlockDefs(BB);
       if (Defs) {
         for (const auto &MA : *Defs) {
           if (auto *D = dyn_cast<MemoryDef>(&MA)) {
-            assert(!MemPtr && "only 1 stored ptr supported right now");
+            if (MemInst)
+              return false; // only 1 stored ptr supported right now
             MemInst = D;
           }
         }
       }
     }
+    if (!isa<StoreInst>(MemInst->getMemoryInst()) && !isa<LoadInst>(MemInst->getMemoryInst()))
+      return false; // don't allow this rn
     if (MemInst) {
       auto *Ptr = SE.getSCEV(MemInst->getMemoryInst()->getOperand(1));
       auto *Base = dyn_cast<SCEVUnknown>(SE.getPointerBase(Ptr));
@@ -2056,9 +2081,11 @@ private:
   }
 };
 
-Value *findLiveOut(const Loop *L, LoopInfo &LI) {
+bool findLiveOut(const Loop *L, LoopInfo &LI, Value **LiveOut) {
   auto *ExitBB = L->getExitBlock();
-  assert(ExitBB && "only one exit block allowed.");
+  if (ExitBB == nullptr)
+    return false; // "only one exit block allowed."
+
   Value *MemoryLO = nullptr;
   PHINode *ScalarLO = nullptr;
   int NumPhis = 0;
@@ -2075,24 +2102,29 @@ Value *findLiveOut(const Loop *L, LoopInfo &LI) {
       if (isa<StoreInst>(&I))
         StoreInsts.push_back(&I);
     }
-  if (NumPhis == 0 && StoreInsts.empty())
-    return nullptr;
-  bool Legal = (NumPhis == 1) != (StoreInsts.size() == 1);
-  assert(Legal && "only one live out allowed.");
-  if (NumPhis == 1) {
-    assert(ScalarLO->getNumIncomingValues() == 1 &&
-           "only one incoming value allowed.");
-    return ScalarLO->getOperand(0);
+  if (NumPhis == 0 && StoreInsts.empty()) {
+    *LiveOut = nullptr;
+    return true;
   }
-  return StoreInsts[0];
+  bool Legal = (NumPhis == 1) != (StoreInsts.size() == 1);
+  if (!Legal)
+    return false; // only one live out allowed.
+  if (NumPhis == 1) {
+    if (ScalarLO->getNumIncomingValues() != 1)
+      return false; // only one incoming value allowed.
+    *LiveOut = ScalarLO->getOperand(0);
+    return true;
+  }
+  *LiveOut = StoreInsts[0];
+  return true;
 }
 
 PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   //  outs() << F.getName() << "\n";
-  for (auto &A : F.args()) {
-    if (A.getType()->isPointerTy())
-      A.addAttr(Attribute::NoAlias);
-  }
+//  for (auto &A : F.args()) {
+//    if (A.getType()->isPointerTy())
+//      A.addAttr(Attribute::NoAlias);
+//  }
 
   LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
@@ -2111,11 +2143,13 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
 
   // get all liveouts
   DenseMap<Loop *, Value *> LiveOutMap;
+  DenseMap<Loop *, bool> LegalLoops;
 
   DenseMap<Loop *, SmallPtrSet<Value *, 5>> Loop2Loads;
   for (auto *L : LI.getLoopsInPreorder()) {
     // collect live out (store or scalar live-out)
-    Value *LiveOut = findLiveOut(L, LI);
+    Value *LiveOut = nullptr;
+    LegalLoops[L] = findLiveOut(L, LI, &LiveOut);
     if (LiveOut == nullptr) {
       LLVM_DEBUG(dbgs() << "no liveouts.\n");
       continue;
@@ -2146,8 +2180,8 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   auto AllCovered =
       coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap, Leftover, TensorMap);
   // TODO change this later, but right now the fold assumes at least some loads
-  if (TopLevelLoads.size() == 0)
-    return PreservedAnalyses::all();
+//  if (TopLevelLoads.size() == 0)
+//    return PreservedAnalyses::all();
   LLVM_DEBUG({
     if (AllCovered)
       dbgs() << "all loads covered.\n";
@@ -2157,10 +2191,13 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
         dbgs() << *L << "\n";
     }
   });
+  if (!Leftover.empty())
+    return PreservedAnalyses::all();
+
 
   Lambda Lam(LI, SE, MSSA, TensorMap, LevelMap);
   //  Lam.translate(F, LevelMap);
-  Lam.translateAllLoops(F);
+  Lam.translateAllLoops(F, LegalLoops);
 
   return PreservedAnalyses::all();
 }
