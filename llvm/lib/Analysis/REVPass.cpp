@@ -619,6 +619,8 @@ bool findCrd(Value *Inst, Value **Crd) {
       if (!Visited.contains(U)) {
         if (auto *L = dyn_cast<LoadInst>(V)) {
           if (Loads == 1) {
+            if (*Crd != nullptr)
+              return false; // no multiples allowed
             *Crd = PrevLoad;
             return true;
           } else {
@@ -627,10 +629,10 @@ bool findCrd(Value *Inst, Value **Crd) {
           }
         }
         if (DFS(U, PrevLoad, Loads, Visited))
-          return true;
+          return true; // only fire return when positive
       }
     }
-    return false;
+    return *Crd != nullptr;
   };
   return DFS(Inst, nullptr, 0, {});
 }
@@ -1095,8 +1097,8 @@ bool detectDense2D(LoopInfo *LI, ScalarEvolution *SE, Value *Root, Value **A,
   *A = *Pk_1 = *Nk = *Ik = nullptr;
 
   Value *Next = nullptr;
-  if (auto *Load = dyn_cast<LoadInst>(Root))
-    Next = skipCasts(Load->getPointerOperand());
+  if (auto *Mem = getPointerOperand(Root))
+    Next = skipCasts(Mem);
   else
     return false;
 
@@ -2157,10 +2159,13 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
         dbgs() << *L << "\n";
     }
   });
+  if (!Leftover.empty())
+    return PreservedAnalyses::all();
 
   Lambda Lam(LI, SE, MSSA, TensorMap, LevelMap);
   //  Lam.translate(F, LevelMap);
   Lam.translateAllLoops(F);
 
+  dbgs() << "\nREV: Translation done.\n";
   return PreservedAnalyses::all();
 }
