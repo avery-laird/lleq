@@ -135,6 +135,23 @@ public:
     Str += " " + getNameOrAsOperand(Root);
   }
 
+
+
+  std::string toDense2() {
+    std::string Output;
+    raw_string_ostream OS(Output);
+    OS << "ptr " << DimOrder.size() << " " << *ElemType << " ";
+    OS << getNameOrAsOperand(Root);
+    if (Kind != CONTIGUOUS)
+      OS << ".dense";
+    OS << "[";
+    ListSeparator LS(", ");
+    for (auto *I : Shape)
+      OS << LS << *I->getType() << " " << getNameOrAsOperand(I);
+    OS << "]";
+    return Output;
+  }
+
   Instruction *toDense(PHINode *OldIV, PHINode *NewIV, bool DelinearOnly = false) {
     std::vector<Value *> IdxList;
     std::vector<Type *> IdxTypes;
@@ -1074,7 +1091,7 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
 
   if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
     *I = dyn_cast<Instruction>(Next);
-    LevelMap[*I].PosArrays.push_back(*Row);
+    LevelMap[*J].PosArrays.push_back(*Row);
     //    *Rows = LevelMap[Next].UpperBound;
   } else {
     return false;
@@ -1205,7 +1222,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
         auto *TensorCSR = new CSR({I, J}, Load->getType(), Val, Row, Col);
         //        CSR TensorCSR({Rows, nullptr}, Val, Row, Col);
         TensorMap[Load] = TensorCSR;
-        TensorMap[getLoadStorePointerOperand(Load)] = TensorCSR;
+//        TensorMap[getLoadStorePointerOperand(Load)] = TensorCSR;
         // find all the memory users of the pos (row) iterator and mark them?
         LLVM_DEBUG({
           dbgs() << "detected CSR:\n";
@@ -1863,38 +1880,37 @@ public:
           dbgs() << "  " << getNameOrAsOperand(MemPtr);
           dbgs() << "." << Def->getID() << " =" << *I << "\n";
         } else if (auto *Load = dyn_cast<LoadInst>(&*I)) {
-//          if (TensorMap.contains(Load)) {
-//            auto *T = TensorMap[Load];
-//            auto *IV = L.getInductionVariable(SE);
-//            auto *Delinear = T->toDense(IV, IV, true);
-//            Delinear->setName(getNameOrAsOperand(Load).substr(1));
-//            dbgs() << *Delinear << "\n";
-//            Delinear->deleteValue();
-//          } else {
-            dbgs() << *I << "\n";
-//          }
+          //          if (TensorMap.contains(Load)) {
+          //            auto *T = TensorMap[Load];
+          //            auto *IV = L.getInductionVariable(SE);
+          //            auto *Delinear = T->toDense(IV, IV, true);
+          //            Delinear->setName(getNameOrAsOperand(Load).substr(1));
+          //            dbgs() << *Delinear << "\n";
+          //            Delinear->deleteValue();
+          //          } else {
+          dbgs() << *I << "\n";
+          //          }
         }
-//        else if (auto *GEP = dyn_cast<GEPOperator>(&*I)) {
-//          if (TensorMap.contains(GEP)) {
-//            auto *T = TensorMap[GEP];
-//            std::vector<Value*> Indices;
-//            auto &Ctx = L.getHeader()->getContext();
-//            for (auto *V : T->Shape) {
-//              auto *C = ZExtInst::CreateIntegerCast(V, Type::getInt64Ty(Ctx), true, "cast." + getNameOrAsOperand(V));
-//              Indices.push_back(C);
-//            }
-//            ArrayType::get(GEP->getResultElementType(), )
-//            auto *NewGep = GetElementPtrInst::Create(
-//                GEP->getResultElementType(),
-//                GEP->getPointerOperand(),
-//                Indices, getNameOrAsOperand(GEP));
-//            dbgs() << *NewGep << "\n";
-//            NewGep->deleteValue();
-//            for (auto *V : Indices) V->deleteValue();
-//          } else {
-//            dbgs() << *I << "\n";
-//          }
-//        }
+        //        else if (auto *GEP = dyn_cast<GEPOperator>(&*I)) {
+        //          if (TensorMap.contains(GEP)) {
+        //            auto *T = TensorMap[GEP];
+        //            std::vector<Value*> Indices;
+        //            auto &Ctx = L.getHeader()->getContext();
+        //            for (auto *V : T->Shape) {
+        //              auto *C = ZExtInst::CreateIntegerCast(V, Type::getInt64Ty(Ctx), true, "cast." + getNameOrAsOperand(V)); Indices.push_back(C);
+        //            }
+        //            ArrayType::get(GEP->getResultElementType(), )
+        //            auto *NewGep = GetElementPtrInst::Create(
+        //                GEP->getResultElementType(),
+        //                GEP->getPointerOperand(),
+        //                Indices, getNameOrAsOperand(GEP));
+        //            dbgs() << *NewGep << "\n";
+        //            NewGep->deleteValue();
+        //            for (auto *V : Indices) V->deleteValue();
+        //          } else {
+        //            dbgs() << *I << "\n";
+        //          }
+        //        }
         else {
           dbgs() << *I << "\n";
         }
@@ -1903,38 +1919,10 @@ public:
     // now loopbody has all the instructions in the loop body
     // memdef has all the defining mem access, basically we
     // only need this for writing the output vals
-    auto *IV = L.getInductionVariable(SE);
-    if (LevelMap[IV].LevelType == DENSE)
-      return; // skip already dense levels
 
     // we only need the instructions related to outputs
     // vals in MemDef + exit block phis
 
-    auto &Context = L.getHeader()->getParent()->getContext();
-    auto *NewIV = PHINode::Create(Type::getInt64Ty(Context), 2, "iv.dense");
-
-    std::string DenseString;
-    raw_string_ostream OS(DenseString);
-    for (auto I : LoopBody) {
-      if (auto *Phi = dyn_cast<PHINode>(&*I)) {
-        translatePhi(L, Phi);
-      } else if (auto *Store = dyn_cast<StoreInst>(&*I)) {
-        auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
-        dbgs() << "  " << getNameOrAsOperand(MemPtr);
-        dbgs() << "." << Def->getID() << " =" << *I << "\n";
-      } else if (auto *Load = dyn_cast<LoadInst>(&*I)) {
-        if (TensorMap.contains(Load)) {
-          auto *T = TensorMap[Load];
-          auto *IV = L.getInductionVariable(SE);
-          auto *Delinear = T->toDense(IV, IV, true);
-          Delinear->setName(getNameOrAsOperand(Load).substr(1));
-          dbgs() << *Delinear << "\n";
-          Delinear->deleteValue();
-        } else {
-          dbgs() << *I << "\n";
-        }
-      }
-    }
   }
 
   void translateLoop(Loop &L) {
@@ -1988,10 +1976,68 @@ public:
            << ", " << *End->getType() << " " << getNameOrAsOperand(End)
            << ")\n";
 
+    // emit dense
+    if (LevelMap[IV].LevelType == DENSE)
+      return; // skip already dense levels
+
+
+    auto &Context = L.getHeader()->getParent()->getContext();
+    auto *NewIV = PHINode::Create(Type::getInt64Ty(Context), 2, "iv.dense");
+
+    dbgs() << "pos: (";
+    ListSeparator LS1(", ");
+    for (auto *Arr : LevelMap[IV].PosArrays) {
+      dbgs() << LS1 << getNameOrAsOperand(Arr) << " = "
+             << getNameOrAsOperand(NewIV);
+    }
+    dbgs() << ")\n";
+    dbgs() << "crd: (";
+    ListSeparator LS2(", ");
+    for (auto *Arr : LevelMap[IV].CoordArrays) {
+      dbgs() << LS2 << getNameOrAsOperand(Arr) << " = "
+             << getNameOrAsOperand(NewIV);
+    }
+    dbgs() << ")\n";
+    auto ChainsInTM =
+        make_filter_range(LoopBody, [&](Value *V) { return TensorMap.count(V); });
+    ListSeparator LS3(", ");
+    dbgs() << "val: (";
+    for (auto *P : ChainsInTM) {
+      if (!TensorMap[P] || TensorMap[P]->Kind == Tensor::CONTIGUOUS)
+        continue;
+      dbgs() << LS3 << getNameOrAsOperand(P) << " = "
+             << getNameOrAsOperand(TensorMap[P]->Root) << ".dense.elem";
+    }
+    dbgs() << ")\n";
+
+
+    for (auto *I : LoopBody) {
+      if (!isa<LoadInst>(I) && !isa<StoreInst>(I))
+        continue;
+
+      if (TensorMap.contains(I)) {
+        auto *T = TensorMap[I];
+//        auto *Delinear = T->toDense(IV, IV, true);
+//        Delinear->setName(getNameOrAsOperand(I).substr(1));
+//        dbgs() << *Delinear << "\n";
+//        Delinear->deleteValue();
+        if (auto *Store = dyn_cast<StoreInst>(I)) {
+          auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
+          dbgs() << getNameOrAsOperand(MemPtr);
+          dbgs() << "." << Def->getID() << " = store ";
+          dbgs() << T->toDense2() << ", ";
+          dbgs() << *Store->getValueOperand()->getType() << " " << getNameOrAsOperand(Store->getValueOperand()) << "\n";
+        } else {
+          dbgs() << getNameOrAsOperand(I) << " = load ";
+          dbgs() << T->toDense2() << "\n";
+        }
+      }
+    }
+
     for (auto *V : reverse(DenseBody))
       V->deleteValue();
-
-
+    if (NewIV != IV)
+      delete NewIV;
   }
   void translateLoopsRecursively(Loop &L) {
     for (Loop *SubLoop : L.getSubLoops())
@@ -2000,8 +2046,10 @@ public:
   }
   void translateAllLoops(Function &F) {
     analyzeMemory(&F);
+    dbgs() << "REV Start\n";
     for (const auto &L : LI)
       translateLoopsRecursively(*L);
+    dbgs() << "REV End\n";
   }
 
   void translate(Function &F, DenseMap<Value *, LevelBounds> &LevelMap) {
