@@ -159,7 +159,7 @@ public:
       IdxList.push_back(Index);
       IdxTypes.push_back(Index->getType());
     }
-    // generate a dense load from IV
+    // generate a dense load or store from IV
     auto *FType = FunctionType::get(ElemType, IdxTypes, true);
     unsigned AddrSpace = OldIV->getParent()->getParent()->getAddressSpace();
     auto *Func =
@@ -1023,8 +1023,8 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
   *Row = *Col = *Val = *I = *J = nullptr;
   // match 1st gep
   Value *Next = nullptr;
-  if (auto *Load = dyn_cast<LoadInst>(Root))
-    Next = skipCasts(Load->getPointerOperand());
+  if (auto *Mem = getPointerOperand(Root))
+    Next = skipCasts(Mem);
   else
     return false;
 
@@ -1863,16 +1863,16 @@ public:
           dbgs() << "  " << getNameOrAsOperand(MemPtr);
           dbgs() << "." << Def->getID() << " =" << *I << "\n";
         } else if (auto *Load = dyn_cast<LoadInst>(&*I)) {
-          if (TensorMap.contains(Load)) {
-            auto *T = TensorMap[Load];
-            auto *IV = L.getInductionVariable(SE);
-            auto *Delinear = T->toDense(IV, IV, true);
-            Delinear->setName(getNameOrAsOperand(Load).substr(1));
-            dbgs() << *Delinear << "\n";
-            Delinear->deleteValue();
-          } else {
+//          if (TensorMap.contains(Load)) {
+//            auto *T = TensorMap[Load];
+//            auto *IV = L.getInductionVariable(SE);
+//            auto *Delinear = T->toDense(IV, IV, true);
+//            Delinear->setName(getNameOrAsOperand(Load).substr(1));
+//            dbgs() << *Delinear << "\n";
+//            Delinear->deleteValue();
+//          } else {
             dbgs() << *I << "\n";
-          }
+//          }
         }
 //        else if (auto *GEP = dyn_cast<GEPOperator>(&*I)) {
 //          if (TensorMap.contains(GEP)) {
@@ -1913,8 +1913,28 @@ public:
     auto &Context = L.getHeader()->getParent()->getContext();
     auto *NewIV = PHINode::Create(Type::getInt64Ty(Context), 2, "iv.dense");
 
-    DenseBody.push_back(NewIV);
-    makeDenseBody(L, NewIV, DenseBody, LoopBody, MemDefs);
+    std::string DenseString;
+    raw_string_ostream OS(DenseString);
+    for (auto I : LoopBody) {
+      if (auto *Phi = dyn_cast<PHINode>(&*I)) {
+        translatePhi(L, Phi);
+      } else if (auto *Store = dyn_cast<StoreInst>(&*I)) {
+        auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
+        dbgs() << "  " << getNameOrAsOperand(MemPtr);
+        dbgs() << "." << Def->getID() << " =" << *I << "\n";
+      } else if (auto *Load = dyn_cast<LoadInst>(&*I)) {
+        if (TensorMap.contains(Load)) {
+          auto *T = TensorMap[Load];
+          auto *IV = L.getInductionVariable(SE);
+          auto *Delinear = T->toDense(IV, IV, true);
+          Delinear->setName(getNameOrAsOperand(Load).substr(1));
+          dbgs() << *Delinear << "\n";
+          Delinear->deleteValue();
+        } else {
+          dbgs() << *I << "\n";
+        }
+      }
+    }
   }
 
   void translateLoop(Loop &L) {
