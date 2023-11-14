@@ -1720,16 +1720,18 @@ public:
 
   std::string arrayType(Value *I) {
     // TODO don't do reverse lookup
+    std::string Out;
+    raw_string_ostream O(Out);
+    O << "ptr";
     for (auto &E : TensorMap) {
       if (E.getSecond() && E.getSecond()->Root == I) {
         Tensor *T = E.getSecond();
-        std::string Out;
-        raw_string_ostream O(Out);
-        O << "ptr " << T->DimOrder.size() << " " << *T->ElemType;
+        O << " " << T->DimOrder.size() << " " << *T->ElemType;
         return Out;
       }
     }
-    llvm_unreachable("val doesn't exist in tensor map.");
+    return Out;
+//    llvm_unreachable("val doesn't exist in tensor map.");
   }
 
   template <class PHITy>
@@ -2227,8 +2229,8 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
         dbgs() << *L << "\n";
     }
   });
-  if (!Leftover.empty())
-    return PreservedAnalyses::all();
+//  if (!Leftover.empty())
+//    return PreservedAnalyses::all();
 
   Lambda Lam(LI, SE, MSSA, TensorMap, LevelMap);
   //  Lam.translate(F, LevelMap);
