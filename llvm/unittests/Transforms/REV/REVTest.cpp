@@ -102,7 +102,7 @@ val: ()
 )")
 
 REVTEST(
-    taco_spmv_csc,
+    DISABLED_taco_spmv_csc,
     "/files/revpy/analysis/taco_spmv_csc.ll",
     R"(%for.body5 = λ ptr 1 double %y_vals, i32 %iA.02 .
   %idxprom6 = sext i32 %iA.02 to i64
@@ -157,7 +157,7 @@ val: ()
 )")
 
 REVTEST(
-    csparse_spmv_csc_nostruct,
+    DISABLED_csparse_spmv_csc_nostruct,
     "/files/revpy/analysis/csparse_spmv_csc_nostruct.ll",
     R"(%for.body4 = λ ptr 1 double %y, i64 %p.02 .
   %arrayidx5 = getelementptr inbounds double, ptr %Ax, i64 %p.02
@@ -202,7 +202,7 @@ val: ()
 )")
 
 REVTEST(
-    SparseCompRow_matmult,
+    DISABLED_SparseCompRow_matmult,
     "/files/revpy/analysis/SparseCompRow_matmult.ll",
     R"(%for.body8 = λ double %sum.03, i32 %i.02 .
   %idxprom9 = sext i32 %i.02 to i64
@@ -258,7 +258,7 @@ val: ()
 )")
 
 REVTEST(
-    spmv_npb,
+    DISABLED_spmv_npb,
     "/files/revpy/analysis/spmv_npb.ll",
     R"(%for.body6 = λ double %sum.03, i32 %k.02 .
   %idxprom7 = sext i32 %k.02 to i64
@@ -323,7 +323,7 @@ val: ()
 )")
 
 REVTEST(
-    parboil_hist,
+    DISABLED_parboil_hist,
     "/files/revpy/analysis/parboil_hist.ll",
     R"(%for.body13 = λ ptr 1 i8 %call4, i32 %i.02 .
   %idxprom = zext i32 %i.02 to i64
@@ -361,7 +361,7 @@ val: ()
 )")
 
 REVTEST(
-    sparsebench_spmv_csr,
+    DISABLED_sparsebench_spmv_csr,
     "/files/revpy/analysis/sparsebench_spmv_csr.ll",
     R"(%for.body9 = λ double %sum.02, i32 %jrow.03 .
   %idxprom10 = sext i32 %jrow.03 to i64

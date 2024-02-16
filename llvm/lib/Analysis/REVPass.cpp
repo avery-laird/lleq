@@ -1199,6 +1199,30 @@ bool detectDense1D(LoopInfo *LI, ScalarEvolution *SE, Value *Root, Value **x,
   return true;
 }
 
+bool detectDense1D_fallback(LoopInfo *LI, ScalarEvolution *SE, Value *Root, Value **x,
+                   Value **Ik, DenseMap<Value *, LevelBounds> &LevelMap) {
+  *x = *Ik = nullptr;
+
+  Value *Next = nullptr;
+  if (auto *Mem = getPointerOperand(Root))
+    Next = skipCasts(Mem);
+  else
+    return false;
+
+  if (auto *GEP = dyn_cast<GEPOperator>(Next)) {
+    if (GEP->getNumIndices() != 1)
+      return false;
+    *x = GEP->getPointerOperand();
+    Next = skipCasts(GEP->getOperand(1));
+  } else {
+    return false;
+  }
+
+  *Ik = LI->getLoopFor(dyn_cast<Instruction>(Next)->getParent())->getInductionVariable(*SE);
+
+  return true;
+}
+
 bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
                    SmallVector<Value *> &Loads,
                    DenseMap<Value *, LevelBounds> &LevelMap,
@@ -2243,6 +2267,31 @@ REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
         dbgs() << *L << "\n";
     }
   });
+
+  if (!Leftover.empty() && TensorMap.empty()) {
+    LLVM_DEBUG(dbgs() << "no sparse formats found, fall back to heaplet mode.\n");
+    for (auto *L : Leftover) {
+      Value *x, *Ik;
+      bool IsHeaplet = detectDense1D_fallback(&LI, &SE, L, &x, &Ik, LevelMap);
+      if (IsHeaplet) {
+        Type *Ty;
+        if (auto *S = dyn_cast<StoreInst>(L))
+          Ty = S->getValueOperand()->getType();
+        else
+          Ty = L->getType();
+        auto *Dense1D = new Vector({Ik}, Ty, x);
+        TensorMap[L] = Dense1D;
+        TensorMap[getLoadStorePointerOperand(L)] = Dense1D;
+        LLVM_DEBUG({
+          dbgs() << "detected dense 1d\n";
+          dbgs() << "x = " << *x << "\n";
+          dbgs() << "i_k = " << *Ik << "\n";
+          dbgs() << *Dense1D << "\n";
+        });
+      }
+    }
+  }
+
 //  if (!Leftover.empty())
 //    return PreservedAnalyses::all();
 
