@@ -1713,9 +1713,13 @@ public:
 
 class Lambda {
 public:
+
+  std::string OUTS_STR;
+  raw_string_ostream OUTS;
+
   Lambda(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA,
          DenseMap<Value *, Tensor *> &TM, DenseMap<Value *, LevelBounds> &LM)
-      : LI(LI), SE(SE), MSSA(MSSA), DT(MSSA.getDomTree()), TensorMap(TM),
+      : LI(LI), SE(SE), MSSA(MSSA), DT(MSSA.getDomTree()), TensorMap(TM), OUTS(OUTS_STR),
         LevelMap(LM) {}
 
   std::string arrayType(Value *I) {
@@ -1761,8 +1765,8 @@ public:
   //      skip branches
   template <class PHITy> void translatePhi(Loop &L, PHITy *Phi) {
     if (Phi->getNumIncomingValues() == 1) {
-      dbgs() << "  " << getNameOrAsOperand(Phi) << " = ";
-      dbgs() << getNameOrAsOperand(Phi->getIncomingValue(0)) << "\n";
+      OUTS << "  " << getNameOrAsOperand(Phi) << " = ";
+      OUTS << getNameOrAsOperand(Phi->getIncomingValue(0)) << "\n";
       return;
     }
     BasicBlock *Then, *Else;
@@ -1789,10 +1793,14 @@ public:
       False = getNameOrAsOperand(FalseVal);
     }
 
-    dbgs() << "  " << Target << " = ";
-    dbgs() << "if " << *TrueVal->getType() << " " << getNameOrAsOperand(Br->getCondition()) << " ";
-    dbgs() << "then " << True << " ";
-    dbgs() << "else " << False << "\n";
+    OUTS << "  " << Target << " = if ";
+    if (isa<MemoryPhi>(Phi))
+      OUTS << arrayType(MemPtr) << " ";
+    else
+      OUTS << *TrueVal->getType() << " ";
+    OUTS << getNameOrAsOperand(Br->getCondition()) << " ";
+    OUTS << "then " << True << " ";
+    OUTS << "else " << False << "\n";
   }
 
   Instruction *makeDenseBodyRecursively(Loop &L,
@@ -1879,18 +1887,18 @@ public:
           translatePhi(L, Phi);
         } else if (auto *Store = dyn_cast<StoreInst>(&*I)) {
           auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
-          dbgs() << "  " << getNameOrAsOperand(MemPtr);
-          dbgs() << "." << Def->getID() << " =" << *I << "\n";
+          OUTS << "  " << getNameOrAsOperand(MemPtr);
+          OUTS << "." << Def->getID() << " =" << *I << "\n";
         } else if (auto *Load = dyn_cast<LoadInst>(&*I)) {
           //          if (TensorMap.contains(Load)) {
           //            auto *T = TensorMap[Load];
           //            auto *IV = L.getInductionVariable(SE);
           //            auto *Delinear = T->toDense(IV, IV, true);
           //            Delinear->setName(getNameOrAsOperand(Load).substr(1));
-          //            dbgs() << *Delinear << "\n";
+          //            OUTS << *Delinear << "\n";
           //            Delinear->deleteValue();
           //          } else {
-          dbgs() << *I << "\n";
+          OUTS << *I << "\n";
           //          }
         }
         //        else if (auto *GEP = dyn_cast<GEPOperator>(&*I)) {
@@ -1906,15 +1914,15 @@ public:
         //                GEP->getResultElementType(),
         //                GEP->getPointerOperand(),
         //                Indices, getNameOrAsOperand(GEP));
-        //            dbgs() << *NewGep << "\n";
+        //            OUTS << *NewGep << "\n";
         //            NewGep->deleteValue();
         //            for (auto *V : Indices) V->deleteValue();
         //          } else {
-        //            dbgs() << *I << "\n";
+        //            OUTS << *I << "\n";
         //          }
         //        }
         else {
-          dbgs() << *I << "\n";
+          OUTS << *I << "\n";
         }
       }
     }
@@ -1930,17 +1938,17 @@ public:
   void translateLoop(Loop &L) {
     // translate header
     BasicBlock *Header = L.getHeader();
-    dbgs() << "%" << Header->getName() << " = λ ";
+    OUTS << "%" << Header->getName() << " = λ ";
     PHINode *IV = L.getInductionVariable(SE);
     auto NonIVs =
         make_filter_range(Header->phis(), [&](PHINode &P) { return &P != IV; });
     ListSeparator LS(", ");
     if (MemoryPhi *BlockPhi = MSSA.getMemoryAccess(Header))
-      dbgs() << LS << arrayType(MemPtr) << " "
+      OUTS << LS << arrayType(MemPtr) << " "
              << getNameOrAsOperand(MemPtr); // << "." << BlockPhi->getID();
     for (auto &P : NonIVs)
-      dbgs() << LS << *P.getType() << " " << getNameOrAsOperand(&P);
-    dbgs() << LS << *IV->getType() << " " << getNameOrAsOperand(IV) << " .\n";
+      OUTS << LS << *P.getType() << " " << getNameOrAsOperand(&P);
+    OUTS << LS << *IV->getType() << " " << getNameOrAsOperand(IV) << " .\n";
 
     // translate loop body
     SmallVector<const MemoryAccess *> MemDefs;
@@ -1948,70 +1956,70 @@ public:
     SmallVector<Instruction *> DenseBody;
     translateLoopBody(L, MemDefs, LoopBody, DenseBody);
 
-    dbgs() << "(";
+    OUTS << "(";
     LS = ListSeparator(", ");
     for (auto &P : L.getExitBlock()->phis())
-      dbgs() << LS << getNameOrAsOperand(P.getIncomingValue(0));
+      OUTS << LS << getNameOrAsOperand(P.getIncomingValue(0));
     for (auto *D : MemDefs)
-      dbgs() << LS << getNameOrAsOperand(MemPtr) << "." << D->getID();
-    dbgs() << ") = fold (";
+      OUTS << LS << getNameOrAsOperand(MemPtr) << "." << D->getID();
+    OUTS << ") = fold (";
     LS = ListSeparator(", ");
     if (MemoryPhi *BlockPhi = MSSA.getMemoryAccess(Header)) {
-      dbgs() << LS << arrayType(MemPtr) << " " << getNameOrAsOperand(MemPtr);
+      OUTS << LS << arrayType(MemPtr) << " " << getNameOrAsOperand(MemPtr);
       auto *Incoming = BlockPhi->getIncomingValueForBlock(L.getLoopPreheader());
       bool IsInLoopHeader = false;
       if (auto *Lp = LI.getLoopFor(Incoming->getBlock()))
         IsInLoopHeader = Lp->getHeader() == Incoming->getBlock();
       if (!MSSA.isLiveOnEntryDef(Incoming) && !IsInLoopHeader)
-        dbgs() << "." << Incoming->getID();
+        OUTS << "." << Incoming->getID();
     }
     for (auto &P : NonIVs) {
       auto *InitialArg = P.getIncomingValueForBlock(L.getLoopPreheader());
-      dbgs() << LS << *InitialArg->getType() << " " << getNameOrAsOperand(InitialArg);
+      OUTS << LS << *InitialArg->getType() << " " << getNameOrAsOperand(InitialArg);
     }
-    dbgs() << ") ";
-    dbgs() << "%" << Header->getName() << " ";
+    OUTS << ") ";
+    OUTS << "%" << Header->getName() << " ";
     auto Bounds = L.getBounds(SE);
     auto *Start = &Bounds->getInitialIVValue();
     auto *End = &Bounds->getFinalIVValue();
-    dbgs() << "Range(" << *Start->getType() << " " << getNameOrAsOperand(Start)
+    OUTS << "Range(" << *Start->getType() << " " << getNameOrAsOperand(Start)
            << ", " << *End->getType() << " " << getNameOrAsOperand(End)
            << ")\n";
 
     // emit dense
-    if (LevelMap[IV].LevelType == DENSE)
-      return; // skip already dense levels
 
 
     auto &Context = L.getHeader()->getParent()->getContext();
     auto *NewIV = PHINode::Create(Type::getInt64Ty(Context), 2, "iv.dense");
 
-    dbgs() << "pos: (";
+    OUTS << "pos: (";
     ListSeparator LS1(", ");
     for (auto *Arr : LevelMap[IV].PosArrays) {
-      dbgs() << LS1 << getNameOrAsOperand(Arr) << " = "
+      OUTS << LS1 << getNameOrAsOperand(Arr) << " = "
              << getNameOrAsOperand(NewIV);
     }
-    dbgs() << ")\n";
-    dbgs() << "crd: (";
+    OUTS << ")\n";
+    OUTS << "crd: (";
     ListSeparator LS2(", ");
     for (auto *Arr : LevelMap[IV].CoordArrays) {
-      dbgs() << LS2 << getNameOrAsOperand(Arr) << " = "
+      OUTS << LS2 << getNameOrAsOperand(Arr) << " = "
              << getNameOrAsOperand(NewIV);
     }
-    dbgs() << ")\n";
+    OUTS << ")\n";
     auto ChainsInTM =
         make_filter_range(LoopBody, [&](Value *V) { return TensorMap.count(V); });
     ListSeparator LS3(", ");
-    dbgs() << "val: (";
+    OUTS << "val: (";
     for (auto *P : ChainsInTM) {
       if (!TensorMap[P] || TensorMap[P]->Kind == Tensor::CONTIGUOUS)
         continue;
-      dbgs() << LS3 << getNameOrAsOperand(P) << " = "
+      OUTS << LS3 << getNameOrAsOperand(P) << " = "
              << getNameOrAsOperand(TensorMap[P]->Root) << ".dense.elem";
     }
-    dbgs() << ")\n";
+    OUTS << ")\n";
 
+    if (LevelMap[IV].LevelType == DENSE)
+      return; // skip already dense levels
 
     for (auto *I : LoopBody) {
       if (!isa<LoadInst>(I) && !isa<StoreInst>(I))
@@ -2021,17 +2029,17 @@ public:
         auto *T = TensorMap[I];
 //        auto *Delinear = T->toDense(IV, IV, true);
 //        Delinear->setName(getNameOrAsOperand(I).substr(1));
-//        dbgs() << *Delinear << "\n";
+//        OUTS << *Delinear << "\n";
 //        Delinear->deleteValue();
         if (auto *Store = dyn_cast<StoreInst>(I)) {
           auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
-          dbgs() << getNameOrAsOperand(MemPtr);
-          dbgs() << "." << Def->getID() << " = store ";
-          dbgs() << T->toDense2() << ", ";
-          dbgs() << *Store->getValueOperand()->getType() << " " << getNameOrAsOperand(Store->getValueOperand()) << "\n";
+          OUTS << getNameOrAsOperand(MemPtr);
+          OUTS << "." << Def->getID() << " = store ";
+          OUTS << T->toDense2() << ", ";
+          OUTS << *Store->getValueOperand()->getType() << " " << getNameOrAsOperand(Store->getValueOperand()) << "\n";
         } else {
-          dbgs() << getNameOrAsOperand(I) << " = load ";
-          dbgs() << T->toDense2() << "\n";
+          OUTS << getNameOrAsOperand(I) << " = load ";
+          OUTS << T->toDense2() << "\n";
         }
       }
     }
@@ -2048,10 +2056,8 @@ public:
   }
   void translateAllLoops(Function &F) {
     analyzeMemory(&F);
-    dbgs() << "REV Start\n";
     for (const auto &L : LI)
       translateLoopsRecursively(*L);
-    dbgs() << "REV End\n";
   }
 
   void translate(Function &F, DenseMap<Value *, LevelBounds> &LevelMap) {
@@ -2159,7 +2165,10 @@ Value *findLiveOut(const Loop *L, LoopInfo &LI) {
   return StoreInsts[0];
 }
 
-PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
+
+AnalysisKey REVPass::Key;
+
+REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   //  outs() << F.getName() << "\n";
   for (auto &A : F.args()) {
     if (A.getType()->isPointerTy())
@@ -2219,7 +2228,7 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
       coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap, Leftover, TensorMap);
   // TODO change this later, but right now the fold assumes at least some loads
   if (TopLevelLoads.size() == 0)
-    return PreservedAnalyses::all();
+    return {};
   LLVM_DEBUG({
     if (AllCovered)
       dbgs() << "all loads covered.\n";
@@ -2236,6 +2245,10 @@ PreservedAnalyses REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   //  Lam.translate(F, LevelMap);
   Lam.translateAllLoops(F);
 
-  dbgs() << "\nREV: Translation done.\n";
-  return PreservedAnalyses::all();
+//  dbgs() << "REV Start\n";
+//  dbgs() << Lam.OUTS_STR;
+//  dbgs() << "REV End\n";
+//
+//  dbgs() << "\nREV: Translation done.\n";
+  return {Lam.OUTS_STR};
 }

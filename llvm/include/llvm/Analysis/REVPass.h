@@ -9,9 +9,16 @@
 
 namespace llvm {
 
-class REVPass : public PassInfoMixin<REVPass> {
+struct REVInfo {
+  std::string OutStr;
+};
+
+class REVPass : public AnalysisInfoMixin<REVPass> {
+  friend AnalysisInfoMixin<REVPass>;
+  static AnalysisKey Key;
 public:
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+  typedef REVInfo Result;
+  REVInfo run(Function &F, FunctionAnalysisManager &AM);
 };
 
 } // namespace llvm
