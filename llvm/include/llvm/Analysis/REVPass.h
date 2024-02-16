@@ -21,6 +21,14 @@ public:
   REVInfo run(Function &F, FunctionAnalysisManager &AM);
 };
 
+class REVPrinterPass : public PassInfoMixin<REVPrinterPass> {
+  raw_ostream &OS;
+
+public:
+  explicit REVPrinterPass(raw_ostream &OS) : OS(OS) {}
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+};
+
 } // namespace llvm
 
 #endif // LLVM_REVPASS_H

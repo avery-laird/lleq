@@ -1243,7 +1243,12 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       if (IsDense2D) {
         auto *D1 = LevelMap[Pk_1].UpperBound;
         auto *D2 = LevelMap[Ik].UpperBound;
-        auto *Dense2D = new Vector({Pk_1, Ik}, Load->getType(), A);
+        Type *Ty;
+        if (auto *S = dyn_cast<StoreInst>(Load))
+          Ty = S->getValueOperand()->getType();
+        else
+          Ty = Load->getType();
+        auto *Dense2D = new Vector({Pk_1, Ik}, Ty, A);
         //        Vector Dense2D({D1, D2}, A);
         TensorMap[Load] = Dense2D;
         TensorMap[getLoadStorePointerOperand(Load)] = Dense2D;
@@ -1719,7 +1724,7 @@ public:
 
   Lambda(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA,
          DenseMap<Value *, Tensor *> &TM, DenseMap<Value *, LevelBounds> &LM)
-      : LI(LI), SE(SE), MSSA(MSSA), DT(MSSA.getDomTree()), TensorMap(TM), OUTS(OUTS_STR),
+      : OUTS(OUTS_STR), LI(LI), SE(SE), MSSA(MSSA), DT(MSSA.getDomTree()), TensorMap(TM),
         LevelMap(LM) {}
 
   std::string arrayType(Value *I) {
@@ -2129,7 +2134,7 @@ private:
       auto *Ptr = SE.getSCEV(MemInst->getMemoryInst()->getOperand(1));
       auto *Base = dyn_cast<SCEVUnknown>(SE.getPointerBase(Ptr));
       MemPtr = Base->getValue();
-      dbgs() << getNameOrAsOperand(MemPtr) << " is modified\n";
+      LLVM_DEBUG(dbgs() << getNameOrAsOperand(MemPtr) << " is modified\n");
     }
   }
 };
@@ -2245,10 +2250,18 @@ REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   //  Lam.translate(F, LevelMap);
   Lam.translateAllLoops(F);
 
-//  dbgs() << "REV Start\n";
-//  dbgs() << Lam.OUTS_STR;
-//  dbgs() << "REV End\n";
-//
-//  dbgs() << "\nREV: Translation done.\n";
+  LLVM_DEBUG({
+    dbgs() << "REV Start\n";
+    dbgs() << Lam.OUTS_STR;
+    dbgs() << "REV End\n";
+  });
+
   return {Lam.OUTS_STR};
+}
+
+PreservedAnalyses REVPrinterPass::run(Function &F,
+                                       FunctionAnalysisManager &AM) {
+  auto &Res = AM.getResult<REVPass>(F);
+  OS << "REV Start\n" << Res.OutStr << "REV End\n";
+  return PreservedAnalyses::all();
 }
