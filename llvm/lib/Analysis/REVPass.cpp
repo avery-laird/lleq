@@ -1914,8 +1914,8 @@ public:
         LoopBody.push_back(&*I);
         if (auto *Phi = dyn_cast<PHINode>(&*I)) {
           translatePhi(L, Phi);
-        } else if (auto *Store = dyn_cast<StoreInst>(&*I)) {
-          auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
+        } else if (I->mayWriteToMemory()) {
+          auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(&*I));
           OUTS << "  " << getNameOrAsOperand(MemPtr);
           OUTS << "." << Def->getID() << " =" << *I << "\n";
         } else if (auto *Load = dyn_cast<LoadInst>(&*I)) {
@@ -2179,7 +2179,7 @@ Value *findLiveOut(const Loop *L, LoopInfo &LI) {
       auto *ParentLoop = LI.getLoopFor(I.getParent());
       if (ParentLoop != L)
         break;
-      if (isa<StoreInst>(&I))
+      if (isa<StoreInst>(&I) || I.mayWriteToMemory())
         StoreInsts.push_back(&I);
     }
   if (NumPhis == 0 && StoreInsts.empty())
@@ -2227,10 +2227,10 @@ REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     // collect live out (store or scalar live-out)
     Value *LiveOut = findLiveOut(L, LI);
     if (LiveOut == nullptr) {
-      LLVM_DEBUG(dbgs() << "no liveouts.\n");
+      LLVM_DEBUG(dbgs() << L->getName() << " has no liveouts.\n");
       continue;
     }
-    LLVM_DEBUG(dbgs() << "live out = " << *LiveOut << "\n");
+    LLVM_DEBUG(dbgs() << L->getName() << " live out = " << *LiveOut << "\n");
     LiveOutMap[L] = LiveOut;
     SmallPtrSet<Value *, 5> TopLevelInputs;
     makeTopLevelInputs(LiveOut, TopLevelInputs);
