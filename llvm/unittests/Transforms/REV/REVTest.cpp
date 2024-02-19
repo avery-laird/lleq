@@ -348,7 +348,7 @@ val: ()
 %for.body = λ ptr 1 i8 %call4, i32 %iter.04 .
   %mul6 = mul nsw i32 %histo_height, %histo_width
   %conv7 = sext i32 %mul6 to i64
-  %call4 = call void @llvm.memset.p0.i64(ptr align 1 %call4, i8 0, i64 %conv7, i1 false)
+  %call4.3 =  call void @llvm.memset.p0.i64(ptr align 1 %call4, i8 0, i64 %conv7, i1 false)
   %mul10 = mul nsw i32 %img_width, %img_height
   %cmp111.not = icmp eq i32 %mul10, 0
   %call4.7 = if ptr 1 i8 %cmp111.not then %call4.5 else %call4.3
