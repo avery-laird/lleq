@@ -258,27 +258,28 @@ val: ()
 )")
 
 REVTEST(
-    DISABLED_spmv_npb,
+    spmv_npb,
     "/files/revpy/analysis/spmv_npb.ll",
     R"(%for.body6 = λ double %sum.03, i32 %k.02 .
   %idxprom7 = sext i32 %k.02 to i64
   %arrayidx8 = getelementptr inbounds double, ptr %a, i64 %idxprom7
   %2 = load double, ptr %arrayidx8, align 8
-  %idxprom9 = sext i32 %k.02 to i64
-  %arrayidx10 = getelementptr inbounds i32, ptr %colidx, i64 %idxprom9
+  %arrayidx10 = getelementptr inbounds i32, ptr %colidx, i64 %idxprom7
   %3 = load i32, ptr %arrayidx10, align 4
   %idxprom11 = sext i32 %3 to i64
   %arrayidx12 = getelementptr inbounds double, ptr %p, i64 %idxprom11
   %4 = load double, ptr %arrayidx12, align 8
   %5 = call double @llvm.fmuladd.f64(double %2, double %4, double %sum.03)
+  %inc = add nsw i32 %k.02, 1
+  %cmp5 = icmp slt i32 %inc, %1
 (%5) = fold (double 0.000000e+00) %for.body6 Range(i32 %0, i32 %1)
-%for.body6.dense = λ double %sum.03, i32 %k.02.dense .
-  %a.dense.elem = call addrspace(0) double (ptr, i32, i32, ...) @llvm.load.ptr(ptr %a.dense, i32 %j.05, i32 %k.02.dense)
-  %p.elem = call addrspace(0) double (ptr, i32, ...) @llvm.load.ptr(ptr %p , i32 %k.02.dense)
-  %"5.dense" = call double @llvm.fmuladd.f64(double %p.elem, double %a.dense.elem, double %sum.03)
-(%"5.dense") = fold (double 0.000000e+00) %for.body6 Range(i32 0, i32 %"1.dense")
+%for.body6.dense = λ double %sum.03, i64 %k.02.dense .
+  %a.dense.elem = call addrspace(0) double (ptr, i32, i64, ...) @llvm.load.ptr(ptr %a.dense, i32 %j.05, i64 %k.02.dense)
+  %p.elem = call addrspace(0) double (ptr, i64, ...) @llvm.load.ptr(ptr %p, i64 %k.02.dense)
+  %"5.dense" = call addrspace(0) double @llvm.fmuladd.f64(double %a.dense.elem, double %p.elem, double %sum.03)
+(%"5.dense") = fold (double 0.000000e+00) %for.body6 Range(i64 0, i32 %1.dense)
 pos: ()
-crd: (%3 = i32 %k.02.dense)
+crd: (%3 = i64 %k.02.dense)
 val: (%2 = double %a.dense.elem)
 %for.body = λ ptr 1 double %q, i32 %j.05 .
   %idxprom = zext i32 %j.05 to i64
@@ -291,13 +292,11 @@ val: (%2 = double %a.dense.elem)
   %cmp51 = icmp slt i32 %0, %1
   %.lcssa = double %5
   %sum.0.lcssa = if double %cmp51 then %.lcssa else 0.000000e+00
-  %idxprom13 = zext i32 %j.05 to i64
-  %arrayidx14 = getelementptr inbounds double, ptr %q, i64 %idxprom13
+  %arrayidx14 = getelementptr inbounds double, ptr %q, i64 %idxprom
   %q.1 =  store double %sum.0.lcssa, ptr %arrayidx14, align 8
-  %inc16 = add nuw nsw i32 %j.05, 1
   %cmp = icmp slt i32 %j.05, %sub
 (%q.1) = fold (ptr 1 double %q) %for.body Range(i32 0, i32 %sub)
-pos: (%rowstr = i32 %j.05)
+pos: (%rowstr = i64 %j.05.dense)
 crd: ()
 val: ()
 )")
@@ -333,24 +332,18 @@ REVTEST(
   %arrayidx15 = getelementptr inbounds i8, ptr %call4, i64 %idxprom14
   %1 = load i8, ptr %arrayidx15, align 1
   %cmp17.not = icmp eq i8 %1, -1
-  %idxprom19 = zext i32 %0 to i64
-  %arrayidx20 = getelementptr inbounds i8, ptr %call4, i64 %idxprom19
-  %2 = load i8, ptr %arrayidx20, align 1
-  %inc = add i8 %2, 1
-  %call4.4 =  store i8 %inc, ptr %arrayidx20, align 1
+  %inc = add i8 %1, 1
+  %call4.4 =  store i8 %inc, ptr %arrayidx15, align 1
   %call4.5 = if ptr 1 i8 %cmp17.not then %call4.4 else %call4
   %inc21 = add i32 %i.02, 1
-  %cmp11 = icmp ult i32 %inc21, %mul10
-(%call4.5) = fold (ptr 1 i8 %call4) %for.body13 Range(i32 0, i32 %mul10)
+  %cmp11 = icmp ult i32 %inc21, %mul
+(%call4.5) = fold (ptr 1 i8 %call4) %for.body13 Range(i32 0, i32 %mul)
 pos: ()
 crd: ()
 val: ()
 %for.body = λ ptr 1 i8 %call4, i32 %iter.04 .
-  %mul6 = mul nsw i32 %histo_height, %histo_width
-  %conv7 = sext i32 %mul6 to i64
-  %call4.3 =  call void @llvm.memset.p0.i64(ptr align 1 %call4, i8 0, i64 %conv7, i1 false)
-  %mul10 = mul nsw i32 %img_width, %img_height
-  %cmp111.not = icmp eq i32 %mul10, 0
+  %call4.3 =  call void @llvm.memset.p0.i64(ptr align 1 %call4, i8 0, i64 %conv3, i1 false)
+  %cmp111.not = icmp eq i32 %mul, 0
   %call4.7 = if ptr 1 i8 %cmp111.not then %call4.5 else %call4.3
   %inc23 = add nuw nsw i32 %iter.04, 1
   %cmp = icmp slt i32 %inc23, %numIterations

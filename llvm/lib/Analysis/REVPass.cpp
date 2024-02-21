@@ -1091,7 +1091,7 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
 
   if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
     *I = dyn_cast<Instruction>(Next);
-    LevelMap[*J].PosArrays.push_back(*Row);
+    LevelMap[*I].PosArrays.push_back(*Row);
     //    *Rows = LevelMap[Next].UpperBound;
   } else {
     return false;
@@ -1795,7 +1795,8 @@ public:
   template <class PHITy> void translatePhi(Loop &L, PHITy *Phi) {
     if (Phi->getNumIncomingValues() == 1) {
       OUTS << "  " << getNameOrAsOperand(Phi) << " = ";
-      OUTS << getNameOrAsOperand(Phi->getIncomingValue(0)) << "\n";
+      auto *Val = Phi->getIncomingValue(0);
+      OUTS << *Phi->getType() << " " << getNameOrAsOperand(Val) << "\n";
       return;
     }
     BasicBlock *Then, *Else;
@@ -2019,20 +2020,102 @@ public:
 
 
     auto &Context = L.getHeader()->getParent()->getContext();
-    auto *NewIV = PHINode::Create(Type::getInt64Ty(Context), 2, "iv.dense");
+    auto *NewIV = PHINode::Create(Type::getInt64Ty(Context), 2, IV->getName() + ".dense");
+
+    DenseMap<Value *, Value *> DensifiedLoads;
+    std::vector<Instruction *> DenseOuts;
+    if (LevelMap[IV].LevelType != DENSE) {
+      LS = ListSeparator(", ");
+      OUTS << "%" << L.getName() << ".dense = λ ";
+
+      if (MemoryPhi *BlockPhi = MSSA.getMemoryAccess(Header))
+        OUTS << LS << arrayType(MemPtr) << " " << getNameOrAsOperand(MemPtr);
+
+      for (auto &P : NonIVs)
+        OUTS << LS << *P.getType() << " " << getNameOrAsOperand(&P);
+
+      OUTS << LS << *NewIV->getType() << " " << getNameOrAsOperand(NewIV)
+           << " .\n";
+
+      for (auto *I : LoopBody) {
+        if (!isa<LoadInst>(I) && !isa<StoreInst>(I))
+          continue;
+
+        if (TensorMap.contains(I)) {
+          auto *T = TensorMap[I];
+          //        auto *Delinear = T->toDense(IV, IV, true);
+          //        Delinear->setName(getNameOrAsOperand(I).substr(1));
+          //        OUTS << *Delinear << "\n";
+          //        Delinear->deleteValue();
+          if (auto *Store = dyn_cast<StoreInst>(I)) {
+            auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
+            OUTS << getNameOrAsOperand(MemPtr);
+            OUTS << "." << Def->getID() << " = store ";
+            OUTS << T->toDense2() << ", ";
+            OUTS << *Store->getValueOperand()->getType() << " "
+                 << getNameOrAsOperand(Store->getValueOperand()) << "\n";
+          } else {
+            auto *NewLoad = T->toDense(IV, NewIV);
+            //          OUTS << getNameOrAsOperand(I) << " = load ";
+            OUTS << *NewLoad << "\n";
+            DensifiedLoads[I] = NewLoad;
+          }
+        }
+      }
+
+      // print liveout
+      for (auto &P : L.getExitBlock()->phis()) {
+        auto *NewOut = dyn_cast<Instruction>(P.getIncomingValue(0))->clone();
+        NewOut->setName(getNameOrAsOperand(P.getIncomingValue(0)).substr(1) +
+                        ".dense");
+        for (int i = 0; i < NewOut->getNumOperands(); ++i) {
+          auto *Op = NewOut->getOperand(i);
+          if (DensifiedLoads.contains(Op))
+            NewOut->setOperand(i, DensifiedLoads[Op]);
+        }
+        OUTS << *NewOut << "\n";
+        DenseOuts.push_back(NewOut);
+      }
+
+      LS = ListSeparator(", ");
+      OUTS << "(";
+      for (auto *I : DenseOuts)
+        OUTS << LS << getNameOrAsOperand(I);
+      OUTS << ") = fold (";
+      LS = ListSeparator(", ");
+      if (MemoryPhi *BlockPhi = MSSA.getMemoryAccess(Header)) {
+        OUTS << LS << arrayType(MemPtr) << " " << getNameOrAsOperand(MemPtr);
+        auto *Incoming =
+            BlockPhi->getIncomingValueForBlock(L.getLoopPreheader());
+        bool IsInLoopHeader = false;
+        if (auto *Lp = LI.getLoopFor(Incoming->getBlock()))
+          IsInLoopHeader = Lp->getHeader() == Incoming->getBlock();
+        if (!MSSA.isLiveOnEntryDef(Incoming) && !IsInLoopHeader)
+          OUTS << "." << Incoming->getID();
+      }
+      for (auto &P : NonIVs) {
+        auto *InitialArg = P.getIncomingValueForBlock(L.getLoopPreheader());
+        OUTS << LS << *InitialArg->getType() << " "
+             << getNameOrAsOperand(InitialArg);
+      }
+
+      OUTS << ") %" << L.getName() << " Range(";
+      OUTS << *ConstantInt::get(Type::getInt64Ty(Context), 0) << ", ";
+      OUTS << *End->getType() << " " << getNameOrAsOperand(End) << ".dense)\n";
+    }
 
     OUTS << "pos: (";
     ListSeparator LS1(", ");
     for (auto *Arr : LevelMap[IV].PosArrays) {
       OUTS << LS1 << getNameOrAsOperand(Arr) << " = "
-             << getNameOrAsOperand(NewIV);
+           << *NewIV->getType() << " " << getNameOrAsOperand(NewIV);
     }
     OUTS << ")\n";
     OUTS << "crd: (";
     ListSeparator LS2(", ");
     for (auto *Arr : LevelMap[IV].CoordArrays) {
       OUTS << LS2 << getNameOrAsOperand(Arr) << " = "
-             << getNameOrAsOperand(NewIV);
+           << *NewIV->getType() << " " << getNameOrAsOperand(NewIV);
     }
     OUTS << ")\n";
     auto ChainsInTM =
@@ -2043,38 +2126,16 @@ public:
       if (!TensorMap[P] || TensorMap[P]->Kind == Tensor::CONTIGUOUS)
         continue;
       OUTS << LS3 << getNameOrAsOperand(P) << " = "
-             << getNameOrAsOperand(TensorMap[P]->Root) << ".dense.elem";
+           << *TensorMap[P]->ElemType << " " << getNameOrAsOperand(TensorMap[P]->Root) << ".dense.elem";
     }
     OUTS << ")\n";
 
-    if (LevelMap[IV].LevelType == DENSE)
-      return; // skip already dense levels
-
-    for (auto *I : LoopBody) {
-      if (!isa<LoadInst>(I) && !isa<StoreInst>(I))
-        continue;
-
-      if (TensorMap.contains(I)) {
-        auto *T = TensorMap[I];
-//        auto *Delinear = T->toDense(IV, IV, true);
-//        Delinear->setName(getNameOrAsOperand(I).substr(1));
-//        OUTS << *Delinear << "\n";
-//        Delinear->deleteValue();
-        if (auto *Store = dyn_cast<StoreInst>(I)) {
-          auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
-          OUTS << getNameOrAsOperand(MemPtr);
-          OUTS << "." << Def->getID() << " = store ";
-          OUTS << T->toDense2() << ", ";
-          OUTS << *Store->getValueOperand()->getType() << " " << getNameOrAsOperand(Store->getValueOperand()) << "\n";
-        } else {
-          OUTS << getNameOrAsOperand(I) << " = load ";
-          OUTS << T->toDense2() << "\n";
-        }
-      }
-    }
-
     for (auto *V : reverse(DenseBody))
       V->deleteValue();
+    for (auto *I : DenseOuts)
+      I->deleteValue();
+    for (auto &E : DensifiedLoads)
+      E.second->deleteValue();
     if (NewIV != IV)
       delete NewIV;
   }
