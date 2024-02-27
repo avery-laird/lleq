@@ -28,12 +28,13 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/YAMLTraits.h"
-// #include <ostream>
+#include "llvm/Transforms/Utils/ValueMapper.h"
 #include <queue>
 
 #define DEBUG_TYPE "revpass"
 
-using namespace llvm;
+namespace llvm {
+
 using namespace PatternMatch;
 using llvm::yaml::IO;
 using llvm::yaml::MappingTraits;
@@ -135,8 +136,6 @@ public:
     Str += " " + getNameOrAsOperand(Root);
   }
 
-
-
   std::string toDense2() {
     std::string Output;
     raw_string_ostream OS(Output);
@@ -152,7 +151,8 @@ public:
     return Output;
   }
 
-  Instruction *toDense(PHINode *OldIV, PHINode *NewIV, bool DelinearOnly = false) {
+  Instruction *toDense(PHINode *OldIV, PHINode *NewIV,
+                       bool DelinearOnly = false) {
     std::vector<Value *> IdxList;
     std::vector<Type *> IdxTypes;
     std::string Name = getNameOrAsOperand(Root);
@@ -1092,6 +1092,7 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
   if (LevelMap.contains(Next) && LevelMap[Next].LevelType == DENSE) {
     *I = dyn_cast<Instruction>(Next);
     LevelMap[*I].PosArrays.push_back(*Row);
+//    LevelMap[*J].PosArrays.push_back(*Row);
     //    *Rows = LevelMap[Next].UpperBound;
   } else {
     return false;
@@ -1199,8 +1200,9 @@ bool detectDense1D(LoopInfo *LI, ScalarEvolution *SE, Value *Root, Value **x,
   return true;
 }
 
-bool detectDense1D_fallback(LoopInfo *LI, ScalarEvolution *SE, Value *Root, Value **x,
-                   Value **Ik, DenseMap<Value *, LevelBounds> &LevelMap) {
+bool detectDense1D_fallback(LoopInfo *LI, ScalarEvolution *SE, Value *Root,
+                            Value **x, Value **Ik,
+                            DenseMap<Value *, LevelBounds> &LevelMap) {
   *x = *Ik = nullptr;
 
   Value *Next = nullptr;
@@ -1218,7 +1220,8 @@ bool detectDense1D_fallback(LoopInfo *LI, ScalarEvolution *SE, Value *Root, Valu
     return false;
   }
 
-  *Ik = LI->getLoopFor(dyn_cast<Instruction>(Next)->getParent())->getInductionVariable(*SE);
+  *Ik = LI->getLoopFor(dyn_cast<Instruction>(Next)->getParent())
+            ->getInductionVariable(*SE);
 
   return true;
 }
@@ -1246,7 +1249,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
         auto *TensorCSR = new CSR({I, J}, Load->getType(), Val, Row, Col);
         //        CSR TensorCSR({Rows, nullptr}, Val, Row, Col);
         TensorMap[Load] = TensorCSR;
-//        TensorMap[getLoadStorePointerOperand(Load)] = TensorCSR;
+        //        TensorMap[getLoadStorePointerOperand(Load)] = TensorCSR;
         // find all the memory users of the pos (row) iterator and mark them?
         LLVM_DEBUG({
           dbgs() << "detected CSR:\n";
@@ -1276,7 +1279,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
         //        Vector Dense2D({D1, D2}, A);
         TensorMap[Load] = Dense2D;
         TensorMap[getLoadStorePointerOperand(Load)] = Dense2D;
-            LLVM_DEBUG({
+        LLVM_DEBUG({
           dbgs() << "detected dense 2d\n";
           dbgs() << "A = " << *A << "\n";
           dbgs() << "p_{k-1} = " << *Pk_1 << "\n";
@@ -1301,7 +1304,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
         //        Vector Dense1D({D1}, x);
         TensorMap[Load] = Dense1D;
         TensorMap[getLoadStorePointerOperand(Load)] = Dense1D;
-            LLVM_DEBUG({
+        LLVM_DEBUG({
           dbgs() << "detected dense 1d\n";
           dbgs() << "x = " << *x << "\n";
           dbgs() << "i_k = " << *Ik << "\n";
@@ -1742,14 +1745,13 @@ public:
 
 class Lambda {
 public:
-
   std::string OUTS_STR;
   raw_string_ostream OUTS;
 
   Lambda(LoopInfo &LI, ScalarEvolution &SE, MemorySSA &MSSA,
          DenseMap<Value *, Tensor *> &TM, DenseMap<Value *, LevelBounds> &LM)
-      : OUTS(OUTS_STR), LI(LI), SE(SE), MSSA(MSSA), DT(MSSA.getDomTree()), TensorMap(TM),
-        LevelMap(LM) {}
+      : OUTS(OUTS_STR), LI(LI), SE(SE), MSSA(MSSA), DT(MSSA.getDomTree()),
+        TensorMap(TM), LevelMap(LM) {}
 
   std::string arrayType(Value *I) {
     // TODO don't do reverse lookup
@@ -1764,7 +1766,7 @@ public:
       }
     }
     return Out;
-//    llvm_unreachable("val doesn't exist in tensor map.");
+    //    llvm_unreachable("val doesn't exist in tensor map.");
   }
 
   template <class PHITy>
@@ -1962,7 +1964,6 @@ public:
 
     // we only need the instructions related to outputs
     // vals in MemDef + exit block phis
-
   }
 
   void translateLoop(Loop &L) {
@@ -1975,7 +1976,7 @@ public:
     ListSeparator LS(", ");
     if (MemoryPhi *BlockPhi = MSSA.getMemoryAccess(Header))
       OUTS << LS << arrayType(MemPtr) << " "
-             << getNameOrAsOperand(MemPtr); // << "." << BlockPhi->getID();
+           << getNameOrAsOperand(MemPtr); // << "." << BlockPhi->getID();
     for (auto &P : NonIVs)
       OUTS << LS << *P.getType() << " " << getNameOrAsOperand(&P);
     OUTS << LS << *IV->getType() << " " << getNameOrAsOperand(IV) << " .\n";
@@ -2005,7 +2006,8 @@ public:
     }
     for (auto &P : NonIVs) {
       auto *InitialArg = P.getIncomingValueForBlock(L.getLoopPreheader());
-      OUTS << LS << *InitialArg->getType() << " " << getNameOrAsOperand(InitialArg);
+      OUTS << LS << *InitialArg->getType() << " "
+           << getNameOrAsOperand(InitialArg);
     }
     OUTS << ") ";
     OUTS << "%" << Header->getName() << " ";
@@ -2013,16 +2015,15 @@ public:
     auto *Start = &Bounds->getInitialIVValue();
     auto *End = &Bounds->getFinalIVValue();
     OUTS << "Range(" << *Start->getType() << " " << getNameOrAsOperand(Start)
-           << ", " << *End->getType() << " " << getNameOrAsOperand(End)
-           << ")\n";
+         << ", " << *End->getType() << " " << getNameOrAsOperand(End) << ")\n";
 
     // emit dense
 
-
     auto &Context = L.getHeader()->getParent()->getContext();
-    auto *NewIV = PHINode::Create(Type::getInt64Ty(Context), 2, IV->getName() + ".dense");
+    auto *NewIV =
+        PHINode::Create(IV->getType(), 2, IV->getName() + ".dense");
 
-    DenseMap<Value *, Value *> DensifiedLoads;
+    llvm::ValueToValueMapTy DensifiedLoads;
     std::vector<Instruction *> DenseOuts;
     if (LevelMap[IV].LevelType != DENSE) {
       LS = ListSeparator(", ");
@@ -2049,18 +2050,63 @@ public:
           //        Delinear->deleteValue();
           if (auto *Store = dyn_cast<StoreInst>(I)) {
             auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
-            OUTS << getNameOrAsOperand(MemPtr);
-            OUTS << "." << Def->getID() << " = store ";
-            OUTS << T->toDense2() << ", ";
-            OUTS << *Store->getValueOperand()->getType() << " "
-                 << getNameOrAsOperand(Store->getValueOperand()) << "\n";
+            std::string Name = getNameOrAsOperand(MemPtr).substr(1) + "." + std::to_string(Def->getID());
+//            OUTS << ;
+//            OUTS << "." << Def->getID() << " = store ";
+//            OUTS << T->toDense2() << ", ";
+//            OUTS << *Store->getValueOperand()->getType() << " "
+//                 << getNameOrAsOperand(Store->getValueOperand()) << "\n";
+
+            std::vector<Type*> IdxTypes;
+            llvm::transform(T->Shape, std::back_inserter(IdxTypes), [] (Value *V) { return V->getType(); });
+            IdxTypes.push_back(Store->getValueOperand()->getType());
+            IdxTypes.insert(IdxTypes.begin(), T->Root->getType());
+
+            std::vector<Value*> IdxList(T->Shape);
+            IdxList.push_back(Store->getValueOperand());
+            IdxList.insert(IdxList.begin(), T->Root);
+            auto *FType = FunctionType::get(T->ElemType, IdxTypes, true);
+            unsigned AddrSpace = IV->getParent()->getParent()->getAddressSpace();
+            auto *Func =
+                Function::Create(FType, IV->getParent()->getParent()->getLinkage(),
+                                 AddrSpace, "llvm.store.ptr");
+            auto *StoreIntrinsic = IntrinsicInst::Create(Func, IdxList, Name + ".elem");
+            DensifiedLoads[I] = StoreIntrinsic;
           } else {
+            // actually, should create the affine expr here
+            // <offset> = secondDim
+            // base = mul firstDim, dimMaxSize
+            // idx = add base, offset
+            // access.dense = gep ptr <root.dense>, <idx>
+            // load addr = ptr access.dense
+
             auto *NewLoad = T->toDense(IV, NewIV);
             //          OUTS << getNameOrAsOperand(I) << " = load ";
-            OUTS << *NewLoad << "\n";
+            //            OUTS << *NewLoad << "\n";
             DensifiedLoads[I] = NewLoad;
           }
         }
+      }
+      DensifiedLoads[IV] = NewIV;
+
+      // clone everything in the dense body, and use remap when necessary
+      for (auto *I : LoopBody) {
+        Instruction *NewI;
+        if (DensifiedLoads.count(I)) {
+//          NewI = dyn_cast<Instruction>(DensifiedLoads[I])->clone();
+//          NewI->setName(DensifiedLoads[I]->getName());
+          NewI = dyn_cast<Instruction>(DensifiedLoads[I]);
+        } else {
+          NewI = I->clone();
+          NewI->setName(getNameOrAsOperand(I).substr(1) + ".dense");
+          DensifiedLoads[I] = NewI;
+        }
+        DenseBody.push_back(NewI);
+      }
+
+      for (auto *I : DenseBody) {
+        RemapInstruction(I, DensifiedLoads, RF_IgnoreMissingLocals);
+        OUTS << *I << "\n";
       }
 
       // print liveout
@@ -2068,11 +2114,7 @@ public:
         auto *NewOut = dyn_cast<Instruction>(P.getIncomingValue(0))->clone();
         NewOut->setName(getNameOrAsOperand(P.getIncomingValue(0)).substr(1) +
                         ".dense");
-        for (int i = 0; i < NewOut->getNumOperands(); ++i) {
-          auto *Op = NewOut->getOperand(i);
-          if (DensifiedLoads.contains(Op))
-            NewOut->setOperand(i, DensifiedLoads[Op]);
-        }
+        RemapInstruction(NewOut, DensifiedLoads, RF_IgnoreMissingLocals);
         OUTS << *NewOut << "\n";
         DenseOuts.push_back(NewOut);
       }
@@ -2081,6 +2123,9 @@ public:
       OUTS << "(";
       for (auto *I : DenseOuts)
         OUTS << LS << getNameOrAsOperand(I);
+      for (auto *D : MemDefs) {
+        OUTS << LS << getNameOrAsOperand(MemPtr) << "." << D->getID() << ".elem";
+      }
       OUTS << ") = fold (";
       LS = ListSeparator(", ");
       if (MemoryPhi *BlockPhi = MSSA.getMemoryAccess(Header)) {
@@ -2107,37 +2152,39 @@ public:
     OUTS << "pos: (";
     ListSeparator LS1(", ");
     for (auto *Arr : LevelMap[IV].PosArrays) {
-      OUTS << LS1 << getNameOrAsOperand(Arr) << " = "
-           << *NewIV->getType() << " " << getNameOrAsOperand(NewIV);
+      OUTS << LS1 << getNameOrAsOperand(Arr) << " = " << *NewIV->getType()
+           << " " << getNameOrAsOperand(NewIV);
     }
     OUTS << ")\n";
     OUTS << "crd: (";
     ListSeparator LS2(", ");
     for (auto *Arr : LevelMap[IV].CoordArrays) {
-      OUTS << LS2 << getNameOrAsOperand(Arr) << " = "
-           << *NewIV->getType() << " " << getNameOrAsOperand(NewIV);
+      OUTS << LS2 << getNameOrAsOperand(Arr) << " = " << *NewIV->getType()
+           << " " << getNameOrAsOperand(NewIV);
     }
     OUTS << ")\n";
-    auto ChainsInTM =
-        make_filter_range(LoopBody, [&](Value *V) { return TensorMap.count(V); });
+    auto ChainsInTM = make_filter_range(
+        LoopBody, [&](Value *V) { return TensorMap.count(V); });
     ListSeparator LS3(", ");
     OUTS << "val: (";
     for (auto *P : ChainsInTM) {
       if (!TensorMap[P] || TensorMap[P]->Kind == Tensor::CONTIGUOUS)
         continue;
-      OUTS << LS3 << getNameOrAsOperand(P) << " = "
-           << *TensorMap[P]->ElemType << " " << getNameOrAsOperand(TensorMap[P]->Root) << ".dense.elem";
+      OUTS << LS3 << getNameOrAsOperand(P) << " = " << *TensorMap[P]->ElemType
+           << " " << getNameOrAsOperand(TensorMap[P]->Root) << ".dense.elem";
     }
     OUTS << ")\n";
 
-    for (auto *V : reverse(DenseBody))
-      V->deleteValue();
+//    dbgs() << "\n" << OUTS_STR << "\n";
+
     for (auto *I : DenseOuts)
       I->deleteValue();
-    for (auto &E : DensifiedLoads)
-      E.second->deleteValue();
-    if (NewIV != IV)
-      delete NewIV;
+    for (auto *V : reverse(DenseBody))
+      V->deleteValue();
+//    for (const auto &E : DensifiedLoads)
+//      if (isa<Instruction>(E.second))
+//        E.second->deleteValue();
+    delete NewIV;
   }
   void translateLoopsRecursively(Loop &L) {
     for (Loop *SubLoop : L.getSubLoops())
@@ -2255,7 +2302,6 @@ Value *findLiveOut(const Loop *L, LoopInfo &LI) {
   return StoreInsts[0];
 }
 
-
 AnalysisKey REVPass::Key;
 
 REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
@@ -2330,7 +2376,8 @@ REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   });
 
   if (!Leftover.empty() && TensorMap.empty()) {
-    LLVM_DEBUG(dbgs() << "no sparse formats found, fall back to heaplet mode.\n");
+    LLVM_DEBUG(
+        dbgs() << "no sparse formats found, fall back to heaplet mode.\n");
     for (auto *L : Leftover) {
       Value *x, *Ik;
       bool IsHeaplet = detectDense1D_fallback(&LI, &SE, L, &x, &Ik, LevelMap);
@@ -2353,8 +2400,8 @@ REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     }
   }
 
-//  if (!Leftover.empty())
-//    return PreservedAnalyses::all();
+  //  if (!Leftover.empty())
+  //    return PreservedAnalyses::all();
 
   Lambda Lam(LI, SE, MSSA, TensorMap, LevelMap);
   //  Lam.translate(F, LevelMap);
@@ -2370,8 +2417,10 @@ REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
 }
 
 PreservedAnalyses REVPrinterPass::run(Function &F,
-                                       FunctionAnalysisManager &AM) {
+                                      FunctionAnalysisManager &AM) {
   auto &Res = AM.getResult<REVPass>(F);
   OS << "REV Start\n" << Res.OutStr << "REV End\n";
   return PreservedAnalyses::all();
 }
+
+} // namespace llvm

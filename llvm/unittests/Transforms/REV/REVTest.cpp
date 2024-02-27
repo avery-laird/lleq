@@ -202,7 +202,7 @@ val: ()
 )")
 
 REVTEST(
-    DISABLED_SparseCompRow_matmult,
+    SparseCompRow_matmult,
     "/files/revpy/analysis/SparseCompRow_matmult.ll",
     R"(%for.body8 = λ double %sum.03, i32 %i.02 .
   %idxprom9 = sext i32 %i.02 to i64
@@ -211,20 +211,28 @@ REVTEST(
   %idxprom11 = sext i32 %2 to i64
   %arrayidx12 = getelementptr inbounds double, ptr %x, i64 %idxprom11
   %3 = load double, ptr %arrayidx12, align 8
-  %idxprom13 = sext i32 %i.02 to i64
-  %arrayidx14 = getelementptr inbounds double, ptr %val, i64 %idxprom13
+  %arrayidx14 = getelementptr inbounds double, ptr %val, i64 %idxprom9
   %4 = load double, ptr %arrayidx14, align 8
   %5 = call double @llvm.fmuladd.f64(double %3, double %4, double %sum.03)
   %inc = add nsw i32 %i.02, 1
   %cmp7 = icmp slt i32 %inc, %1
 (%5) = fold (double 0.000000e+00) %for.body8 Range(i32 %0, i32 %1)
-%for.body8.dense = λdouble %sum.03, i64 %iv.dense .
-  %x.elem = call addrspace(0) double (ptr, i64, ...) @llvm.load.ptr(ptr %x, i64 %iv.dense)
-  %val.dense.elem = call addrspace(0) double (ptr, i32, i64, ...) @llvm.load.ptr(ptr %val.dense, i32 %r.05, i64 %iv.dense)
+%for.body8.dense = λ double %sum.03, i32 %i.02.dense .
+  %idxprom9.dense = sext i32 %i.02.dense to i64
+  %arrayidx10.dense = getelementptr inbounds i32, ptr %col, i64 %idxprom9.dense
+  %"2.dense" = load i32, ptr %arrayidx10.dense, align 4
+  %idxprom11.dense = sext i32 %"2.dense" to i64
+  %arrayidx12.dense = getelementptr inbounds double, ptr %x, i64 %idxprom11.dense
+  %x.elem = call addrspace(0) double (ptr, i32, ...) @llvm.load.ptr(ptr %x, i32 %i.02.dense)
+  %arrayidx14.dense = getelementptr inbounds double, ptr %val, i64 %idxprom9.dense
+  %val.dense.elem = call addrspace(0) double (ptr, i32, i32, ...) @llvm.load.ptr(ptr %val.dense, i32 %r.05, i32 %i.02.dense)
   %"5.dense" = call addrspace(0) double @llvm.fmuladd.f64(double %x.elem, double %val.dense.elem, double %sum.03)
-(%"5.dense") = fold (double 0.000000e+00) %for.body8 Range(i32 0, i32 %"1.dense")
+  %inc.dense = add nsw i32 %i.02.dense, 1
+  %cmp7.dense = icmp slt i32 %inc.dense, %1
+  %"5.dense" = call addrspace(0) double @llvm.fmuladd.f64(double %x.elem, double %val.dense.elem, double %sum.03)
+(%"5.dense") = fold (double 0.000000e+00) %for.body8 Range(i64 0, i32 %1.dense)
 pos: ()
-crd: (%2 = i64 %iv.dense)
+crd: (%2 = i32 %i.02.dense)
 val: (%4 = double %val.dense.elem)
 %for.body3 = λ ptr 1 double %y, i32 %r.05 .
   %idxprom = zext i32 %r.05 to i64
@@ -237,20 +245,20 @@ val: (%4 = double %val.dense.elem)
   %cmp71 = icmp slt i32 %0, %1
   %.lcssa = double %5
   %sum.0.lcssa = if double %cmp71 then %.lcssa else 0.000000e+00
-  %idxprom15 = zext i32 %r.05 to i64
-  %arrayidx16 = getelementptr inbounds double, ptr %y, i64 %idxprom15
+  %arrayidx16 = getelementptr inbounds double, ptr %y, i64 %idxprom
   %6 = load double, ptr %arrayidx16, align 8
   %add17 = fadd double %6, %sum.0.lcssa
   %y.1 =  store double %add17, ptr %arrayidx16, align 8
-  %inc19 = add nuw nsw i32 %r.05, 1
-  %cmp2 = icmp slt i32 %inc19, %M
+  %cmp2 = icmp slt i32 %add, %M
 (%y.1) = fold (ptr 1 double %y) %for.body3 Range(i32 0, i32 %M)
-pos: (%row = i32 %r.05)
+pos: (%row = i32 %r.05.dense)
 crd: ()
 val: ()
-%for.body = λptr 1 double %y, i32 %reps.07 .
+%for.body = λ ptr 1 double %y, i32 %reps.07 .
   %cmp24 = icmp sgt i32 %M, 0
   %y.3 = if ptr 1 double %cmp24 then %y.1 else %y
+  %inc22 = add nuw nsw i32 %reps.07, 1
+  %cmp = icmp slt i32 %inc22, %NUM_ITERATIONS
 (%y.3) = fold (ptr 1 double %y) %for.body Range(i32 0, i32 %NUM_ITERATIONS)
 pos: ()
 crd: ()
@@ -273,13 +281,22 @@ REVTEST(
   %inc = add nsw i32 %k.02, 1
   %cmp5 = icmp slt i32 %inc, %1
 (%5) = fold (double 0.000000e+00) %for.body6 Range(i32 %0, i32 %1)
-%for.body6.dense = λ double %sum.03, i64 %k.02.dense .
-  %a.dense.elem = call addrspace(0) double (ptr, i32, i64, ...) @llvm.load.ptr(ptr %a.dense, i32 %j.05, i64 %k.02.dense)
-  %p.elem = call addrspace(0) double (ptr, i64, ...) @llvm.load.ptr(ptr %p, i64 %k.02.dense)
+%for.body6.dense = λ double %sum.03, i32 %k.02.dense .
+  %idxprom7.dense = sext i32 %k.02.dense to i64
+  %arrayidx8.dense = getelementptr inbounds double, ptr %a, i64 %idxprom7.dense
+  %a.dense.elem = call addrspace(0) double (ptr, i32, i32, ...) @llvm.load.ptr(ptr %a.dense, i32 %j.05, i32 %k.02.dense)
+  %arrayidx10.dense = getelementptr inbounds i32, ptr %colidx, i64 %idxprom7.dense
+  %"3.dense" = load i32, ptr %arrayidx10.dense, align 4
+  %idxprom11.dense = sext i32 %"3.dense" to i64
+  %arrayidx12.dense = getelementptr inbounds double, ptr %p, i64 %idxprom11.dense
+  %p.elem = call addrspace(0) double (ptr, i32, ...) @llvm.load.ptr(ptr %p, i32 %k.02.dense)
+  %"5.dense" = call addrspace(0) double @llvm.fmuladd.f64(double %a.dense.elem, double %p.elem, double %sum.03)
+  %inc.dense = add nsw i32 %k.02.dense, 1
+  %cmp5.dense = icmp slt i32 %inc.dense, %1
   %"5.dense" = call addrspace(0) double @llvm.fmuladd.f64(double %a.dense.elem, double %p.elem, double %sum.03)
 (%"5.dense") = fold (double 0.000000e+00) %for.body6 Range(i64 0, i32 %1.dense)
 pos: ()
-crd: (%3 = i64 %k.02.dense)
+crd: (%3 = i32 %k.02.dense)
 val: (%2 = double %a.dense.elem)
 %for.body = λ ptr 1 double %q, i32 %j.05 .
   %idxprom = zext i32 %j.05 to i64
@@ -296,7 +313,7 @@ val: (%2 = double %a.dense.elem)
   %q.1 =  store double %sum.0.lcssa, ptr %arrayidx14, align 8
   %cmp = icmp slt i32 %j.05, %sub
 (%q.1) = fold (ptr 1 double %q) %for.body Range(i32 0, i32 %sub)
-pos: (%rowstr = i64 %j.05.dense)
+pos: (%rowstr = i32 %j.05.dense)
 crd: ()
 val: ()
 )")

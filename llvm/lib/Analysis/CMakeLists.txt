@@ -160,4 +160,5 @@ add_llvm_component_library(LLVMAnalysis
   ProfileData
   Support
   TargetParser
+  TransformUtils
   )
