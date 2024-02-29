@@ -2020,6 +2020,7 @@ public:
     // emit dense
 
     auto &Context = L.getHeader()->getParent()->getContext();
+    auto AddrSpace = L.getHeader()->getParent()->getAddressSpace();
     auto *NewIV =
         PHINode::Create(IV->getType(), 2, IV->getName() + ".dense");
 
@@ -2038,70 +2039,157 @@ public:
       OUTS << LS << *NewIV->getType() << " " << getNameOrAsOperand(NewIV)
            << " .\n";
 
-      for (auto *I : LoopBody) {
-        if (!isa<LoadInst>(I) && !isa<StoreInst>(I))
-          continue;
+//      for (auto *I : LoopBody) {
+//        if (!isa<LoadInst>(I) && !isa<StoreInst>(I))
+//          continue;
+//
+//        if (TensorMap.contains(I)) {
+//          auto *T = TensorMap[I];
+//          //        auto *Delinear = T->toDense(IV, IV, true);
+//          //        Delinear->setName(getNameOrAsOperand(I).substr(1));
+//          //        OUTS << *Delinear << "\n";
+//          //        Delinear->deleteValue();
+//          if (auto *Store = dyn_cast<StoreInst>(I)) {
+//            auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
+//            std::string Name = getNameOrAsOperand(MemPtr).substr(1) + "." + std::to_string(Def->getID());
+////            OUTS << ;
+////            OUTS << "." << Def->getID() << " = store ";
+////            OUTS << T->toDense2() << ", ";
+////            OUTS << *Store->getValueOperand()->getType() << " "
+////                 << getNameOrAsOperand(Store->getValueOperand()) << "\n";
+//
+//            std::vector<Type*> IdxTypes;
+//            llvm::transform(T->Shape, std::back_inserter(IdxTypes), [] (Value *V) { return V->getType(); });
+//            IdxTypes.push_back(Store->getValueOperand()->getType());
+//            IdxTypes.insert(IdxTypes.begin(), T->Root->getType());
+//
+//            std::vector<Value*> IdxList(T->Shape);
+//            IdxList.push_back(Store->getValueOperand());
+//            IdxList.insert(IdxList.begin(), T->Root);
+//            auto *FType = FunctionType::get(T->ElemType, IdxTypes, true);
+//            unsigned AddrSpace = IV->getParent()->getParent()->getAddressSpace();
+//            auto *Func =
+//                Function::Create(FType, IV->getParent()->getParent()->getLinkage(),
+//                                 AddrSpace, "llvm.store.ptr");
+//            auto *StoreIntrinsic = IntrinsicInst::Create(Func, IdxList, Name + ".elem");
+//            DensifiedLoads[I] = StoreIntrinsic;
+//          } else {
+//            auto Name = getNameOrAsOperand(T->Root).substr(1);
+//            // actually, should create the affine expr here
+//            // <offset> = secondDim
+//            // base = mul firstDim, dimMaxSize
+//            // idx = add base, offset
+//            // access.dense = gep ptr <root.dense>, <idx>
+//            // load addr = ptr access.dense
+//            auto *FirstDim = T->Shape[0];
+//            auto *DimMaxSize = LevelMap[FirstDim].UpperBound;
+//            Value *Base, *Idx;
+//            if (T->Shape.size() == 2) {
+//              auto *Offset = T->Shape[1];
+//              Base = BinaryOperator::CreateMul(FirstDim, DimMaxSize,
+//                                               Name + ".mul.dense");
+//              Idx =
+//                  BinaryOperator::CreateAdd(Base, Offset, Name + ".idx.dense");
+//              DenseBody.push_back(dyn_cast<Instruction>(Base));
+//              DenseBody.push_back(dyn_cast<Instruction>(Idx));
+//            } else if (T->Shape.size() == 1) {
+//              Idx = FirstDim;
+//            }
+//
+//            auto *NewGEP = GetElementPtrInst::Create(T->ElemType, T->Root, {Idx}, Name + ".gep.dense");
+//            auto *NewLoad = new LoadInst(T->ElemType, NewGEP, Name + ".dense", false, Align::Constant<4>(), (Instruction*)nullptr);
+//
+//
+//            DenseBody.push_back(NewGEP);
+//            DenseBody.push_back(NewLoad);
+////            auto *NewLoad = T->toDense(IV, NewIV);
+//            //          OUTS << getNameOrAsOperand(I) << " = load ";
+//            //            OUTS << *NewLoad << "\n";
+//            DensifiedLoads[I] = NewLoad;
+//          }
+//        }
+//      }
+      DensifiedLoads[IV] = NewIV;
 
+      // clone everything in the dense body, and use remap when necessary
+      for (auto *I : LoopBody) {
         if (TensorMap.contains(I)) {
           auto *T = TensorMap[I];
-          //        auto *Delinear = T->toDense(IV, IV, true);
-          //        Delinear->setName(getNameOrAsOperand(I).substr(1));
-          //        OUTS << *Delinear << "\n";
-          //        Delinear->deleteValue();
+
+          auto Suffix = T->Kind == Tensor::CONTIGUOUS ? "" : ".dense";
           if (auto *Store = dyn_cast<StoreInst>(I)) {
             auto *Def = cast<MemoryDef>(MSSA.getMemoryAccess(Store));
             std::string Name = getNameOrAsOperand(MemPtr).substr(1) + "." + std::to_string(Def->getID());
-//            OUTS << ;
-//            OUTS << "." << Def->getID() << " = store ";
-//            OUTS << T->toDense2() << ", ";
-//            OUTS << *Store->getValueOperand()->getType() << " "
-//                 << getNameOrAsOperand(Store->getValueOperand()) << "\n";
 
-            std::vector<Type*> IdxTypes;
-            llvm::transform(T->Shape, std::back_inserter(IdxTypes), [] (Value *V) { return V->getType(); });
-            IdxTypes.push_back(Store->getValueOperand()->getType());
-            IdxTypes.insert(IdxTypes.begin(), T->Root->getType());
-
-            std::vector<Value*> IdxList(T->Shape);
-            IdxList.push_back(Store->getValueOperand());
-            IdxList.insert(IdxList.begin(), T->Root);
-            auto *FType = FunctionType::get(T->ElemType, IdxTypes, true);
-            unsigned AddrSpace = IV->getParent()->getParent()->getAddressSpace();
-            auto *Func =
-                Function::Create(FType, IV->getParent()->getParent()->getLinkage(),
-                                 AddrSpace, "llvm.store.ptr");
-            auto *StoreIntrinsic = IntrinsicInst::Create(Func, IdxList, Name + ".elem");
-            DensifiedLoads[I] = StoreIntrinsic;
-          } else {
             // actually, should create the affine expr here
             // <offset> = secondDim
             // base = mul firstDim, dimMaxSize
             // idx = add base, offset
             // access.dense = gep ptr <root.dense>, <idx>
             // load addr = ptr access.dense
+            auto *FirstDim = T->Shape[0];
+            auto *DimMaxSize = LevelMap[FirstDim].UpperBound;
+            Value *Base, *Idx;
+            if (T->Shape.size() == 2) {
+              auto *Offset = T->Shape[1];
+              Base = BinaryOperator::CreateMul(FirstDim, DimMaxSize,
+                                               Name + ".mul.dense");
+              Idx =
+                  BinaryOperator::CreateAdd(Base, Offset, Name + ".idx.dense");
+              DenseBody.push_back(dyn_cast<Instruction>(Base));
+              DenseBody.push_back(dyn_cast<Instruction>(Idx));
+            } else if (T->Shape.size() == 1) {
+              Idx = FirstDim;
+            }
 
-            auto *NewLoad = T->toDense(IV, NewIV);
-            //          OUTS << getNameOrAsOperand(I) << " = load ";
-            //            OUTS << *NewLoad << "\n";
+            auto *NewGEP = GetElementPtrInst::Create(T->ElemType, T->Root, {Idx}, Name + ".gep.dense");
+//            auto *NewLoad = new LoadInst(T->ElemType, NewGEP, Name + ".dense", false, Align::Constant<4>(), (Instruction*)nullptr);
+
+            DenseBody.push_back(NewGEP);
+//            auto *NewStore = new StoreInst(Store->getValueOperand(), NewGEP, false, Align::Constant<4>());
+
+
+            auto *FType = FunctionType::get(T->ElemType, {T->ElemType, PointerType::get(Context, AddrSpace)}, true);
+            auto *Func =
+                Function::Create(FType, IV->getParent()->getParent()->getLinkage(),
+                                 AddrSpace, "llvm.store.ptr");
+            auto *StoreIntrinsic = IntrinsicInst::Create(Func, {Store->getValueOperand(), NewGEP}, Name);
+            DensifiedLoads[I] = StoreIntrinsic;
+            DenseBody.push_back(StoreIntrinsic);
+          } else {
+            std::string Name = getNameOrAsOperand(T->Root).substr(1);
+            auto *FirstDim = T->Shape[0];
+            auto *DimMaxSize = LevelMap[FirstDim].UpperBound;
+            Value *Base, *Idx;
+            if (T->Shape.size() == 2) {
+              auto *Offset = T->Shape[1];
+              Base = BinaryOperator::CreateMul(FirstDim, DimMaxSize,
+                                               Name + ".mul.dense");
+              Idx =
+                  BinaryOperator::CreateAdd(Base, Offset, Name + ".idx.dense");
+              DenseBody.push_back(dyn_cast<Instruction>(Base));
+              DenseBody.push_back(dyn_cast<Instruction>(Idx));
+            } else if (T->Shape.size() == 1) {
+              Idx = FirstDim;
+            }
+
+
+            auto *NewPtr = new Argument(PointerType::get(Context, AddrSpace), Name + Suffix);
+            auto *NewGEP = GetElementPtrInst::Create(T->ElemType, NewPtr, {Idx}, Name + ".gep.dense");
+            auto *NewLoad = new LoadInst(T->ElemType, NewGEP, Name + ".dense.elem", false, Align::Constant<8>());
+
+            DenseBody.push_back(NewGEP);
+            DenseBody.push_back(NewLoad);
             DensifiedLoads[I] = NewLoad;
           }
-        }
-      }
-      DensifiedLoads[IV] = NewIV;
-
-      // clone everything in the dense body, and use remap when necessary
-      for (auto *I : LoopBody) {
-        Instruction *NewI;
-        if (DensifiedLoads.count(I)) {
-//          NewI = dyn_cast<Instruction>(DensifiedLoads[I])->clone();
-//          NewI->setName(DensifiedLoads[I]->getName());
-          NewI = dyn_cast<Instruction>(DensifiedLoads[I]);
         } else {
+          Instruction *NewI;
           NewI = I->clone();
           NewI->setName(getNameOrAsOperand(I).substr(1) + ".dense");
+//          NewI->setName(getNameOrAsOperand(I).substr(1));
           DensifiedLoads[I] = NewI;
+          DenseBody.push_back(NewI);
         }
-        DenseBody.push_back(NewI);
       }
 
       for (auto *I : DenseBody) {
@@ -2124,7 +2212,7 @@ public:
       for (auto *I : DenseOuts)
         OUTS << LS << getNameOrAsOperand(I);
       for (auto *D : MemDefs) {
-        OUTS << LS << getNameOrAsOperand(MemPtr) << "." << D->getID() << ".elem";
+        OUTS << LS << getNameOrAsOperand(MemPtr) << "." << D->getID();
       }
       OUTS << ") = fold (";
       LS = ListSeparator(", ");
@@ -2175,7 +2263,7 @@ public:
     }
     OUTS << ")\n";
 
-//    dbgs() << "\n" << OUTS_STR << "\n";
+    dbgs() << "\n" << OUTS_STR << "\n";
 
     for (auto *I : DenseOuts)
       I->deleteValue();
