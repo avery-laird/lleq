@@ -1761,7 +1761,7 @@ public:
     for (auto &E : TensorMap) {
       if (E.getSecond() && E.getSecond()->Root == I) {
         Tensor *T = E.getSecond();
-        O << " " << T->DimOrder.size() << " " << *T->ElemType;
+        O << " " << "1" << " " << *T->ElemType;
         return Out;
       }
     }
@@ -2263,7 +2263,7 @@ public:
     }
     OUTS << ")\n";
 
-    dbgs() << "\n" << OUTS_STR << "\n";
+//    dbgs() << "\n" << OUTS_STR << "\n";
 
     for (auto *I : DenseOuts)
       I->deleteValue();
@@ -2359,7 +2359,7 @@ private:
   }
 };
 
-Value *findLiveOut(const Loop *L, LoopInfo &LI) {
+Value *findLiveOut(const Loop *L, LoopInfo &LI, bool *Legal) {
   auto *ExitBB = L->getExitBlock();
   assert(ExitBB && "only one exit block allowed.");
   Value *MemoryLO = nullptr;
@@ -2380,11 +2380,12 @@ Value *findLiveOut(const Loop *L, LoopInfo &LI) {
     }
   if (NumPhis == 0 && StoreInsts.empty())
     return nullptr;
-  bool Legal = (NumPhis == 1) != (StoreInsts.size() == 1);
-  assert(Legal && "only one live out allowed.");
+  *Legal = (NumPhis == 1) != (StoreInsts.size() == 1);
+//  assert(*Legal && "only one live out allowed.");
   if (NumPhis == 1) {
-    assert(ScalarLO->getNumIncomingValues() == 1 &&
-           "only one incoming value allowed.");
+    *Legal &= ScalarLO->getNumIncomingValues() == 1;
+//    assert(ScalarLO->getNumIncomingValues() == 1 &&
+//           "only one incoming value allowed.");
     return ScalarLO->getOperand(0);
   }
   return StoreInsts[0];
@@ -2418,9 +2419,11 @@ REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   DenseMap<Loop *, Value *> LiveOutMap;
 
   DenseMap<Loop *, SmallPtrSet<Value *, 5>> Loop2Loads;
+  bool Legal = true;
   for (auto *L : LI.getLoopsInPreorder()) {
     // collect live out (store or scalar live-out)
-    Value *LiveOut = findLiveOut(L, LI);
+    Value *LiveOut = findLiveOut(L, LI, &Legal);
+    if (!Legal) break;
     if (LiveOut == nullptr) {
       LLVM_DEBUG(dbgs() << L->getName() << " has no liveouts.\n");
       continue;
@@ -2430,6 +2433,11 @@ REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
     SmallPtrSet<Value *, 5> TopLevelInputs;
     makeTopLevelInputs(LiveOut, TopLevelInputs);
     Loop2Loads[L] = TopLevelInputs;
+  }
+
+  if (!Legal) {
+    LLVM_DEBUG(dbgs() << "Loop nest contains an unsupported live out pattern.\n");
+    return {""};
   }
 
   SmallVector<Value *> TopLevelLoads;
@@ -2507,7 +2515,8 @@ REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
 PreservedAnalyses REVPrinterPass::run(Function &F,
                                       FunctionAnalysisManager &AM) {
   auto &Res = AM.getResult<REVPass>(F);
-  OS << "REV Start\n" << Res.OutStr << "REV End\n";
+  if (Res.OutStr != "")
+    OS << "REV Start\n" << Res.OutStr << "REV End\n";
   return PreservedAnalyses::all();
 }
 
