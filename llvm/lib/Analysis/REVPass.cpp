@@ -1033,8 +1033,8 @@ bool detectCSC(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
   return true;
 }
 
-bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
-               Value **I, Value **J, DenseMap<Value *, LevelBounds> &LevelMap) {
+bool detectCompressed(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
+               Value **I, Value **J, bool *RowMajor, DenseMap<Value *, LevelBounds> &LevelMap) {
   // Col is optional
   //  Instruction *I, *J;
   *Row = *Col = *Val = *I = *J = nullptr;
@@ -1104,6 +1104,16 @@ bool detectCSR(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value **Val,
     auto JBounds = LevelMap[*J];
     JBounds.LevelType = DENSE;
     LevelMap[*Col] = JBounds;
+    *RowMajor = true;
+    // find the GEP associated with Col
+    for (auto *U : (*Col)->users()) {
+      if (!isa<GEPOperator>(U))
+        continue;
+      if (any_of(U->users(), [] (User *V) { return isa<StoreInst>(V); })) {
+        *RowMajor = false;
+        break;
+      }
+    }
   }
   return true;
 }
@@ -1244,9 +1254,14 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
     for (auto *Load :
          WorkList) { // TODO figure out how to undo LevelMap mutations
       Value *Row, *Col, *Val, *I, *J;
-      auto IsCSR = detectCSR(LI, Load, &Row, &Col, &Val, &I, &J, LevelMap);
+      bool RowMajor;
+      auto IsCSR = detectCompressed(LI, Load, &Row, &Col, &Val, &I, &J, &RowMajor, LevelMap);
       if (IsCSR) {
-        auto *TensorCSR = new CSR({I, J}, Load->getType(), Val, Row, Col);
+        Tensor *TensorCSR;
+        if (RowMajor)
+          TensorCSR = new CSR({I, J}, Load->getType(), Val, Row, Col);
+        else
+          TensorCSR = new CSR({J, I}, Load->getType(), Val, Row, Col);
         //        CSR TensorCSR({Rows, nullptr}, Val, Row, Col);
         TensorMap[Load] = TensorCSR;
         //        TensorMap[getLoadStorePointerOperand(Load)] = TensorCSR;
@@ -2153,7 +2168,7 @@ public:
             auto *Func =
                 Function::Create(FType, IV->getParent()->getParent()->getLinkage(),
                                  AddrSpace, "llvm.store.ptr");
-            auto *StoreIntrinsic = IntrinsicInst::Create(Func, {Store->getValueOperand(), NewGEP}, Name);
+            auto *StoreIntrinsic = IntrinsicInst::Create(Func, {Store->getValueOperand(), NewGEP}, Name + ".dense");
             DensifiedLoads[I] = StoreIntrinsic;
             DenseBody.push_back(StoreIntrinsic);
           } else {
@@ -2212,7 +2227,7 @@ public:
       for (auto *I : DenseOuts)
         OUTS << LS << getNameOrAsOperand(I);
       for (auto *D : MemDefs) {
-        OUTS << LS << getNameOrAsOperand(MemPtr) << "." << D->getID();
+        OUTS << LS << getNameOrAsOperand(MemPtr) << "." << D->getID() << ".dense";
       }
       OUTS << ") = fold (";
       LS = ListSeparator(", ");
@@ -2232,7 +2247,7 @@ public:
              << getNameOrAsOperand(InitialArg);
       }
 
-      OUTS << ") %" << L.getName() << " Range(";
+      OUTS << ") %" << L.getName() << ".dense Range(";
       OUTS << *ConstantInt::get(Type::getInt64Ty(Context), 0) << ", ";
       OUTS << *End->getType() << " " << getNameOrAsOperand(End) << ".dense)\n";
     }
