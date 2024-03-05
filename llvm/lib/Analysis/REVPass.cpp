@@ -1107,11 +1107,19 @@ bool detectCompressed(LoopInfo *LI, Value *Root, Value **Row, Value **Col, Value
     *RowMajor = true;
     // find the GEP associated with Col
     for (auto *U : (*Col)->users()) {
+      if (auto *Cast = dyn_cast<CastInst>(U)) {
+        for (auto *CastU : Cast->users())
+          if (isa<GEPOperator>(CastU))
+            if (any_of(CastU->users(), [] (User *Us) { return isa<StoreInst>(Us); })) {
+              *RowMajor = false;
+              return true;
+            }
+      }
       if (!isa<GEPOperator>(U))
         continue;
-      if (any_of(U->users(), [] (User *V) { return isa<StoreInst>(V); })) {
+      if (any_of(U->users(), [] (User *Us) { return isa<StoreInst>(Us); })) {
         *RowMajor = false;
-        break;
+        return true;
       }
     }
   }
@@ -1267,7 +1275,8 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
         //        TensorMap[getLoadStorePointerOperand(Load)] = TensorCSR;
         // find all the memory users of the pos (row) iterator and mark them?
         LLVM_DEBUG({
-          dbgs() << "detected CSR:\n";
+          if (RowMajor) dbgs() << "detected CSR:\n";
+          else dbgs() << "detected CSC:\n";
           dbgs() << "val = " << *Val << "\n";
           dbgs() << "row = " << *Row << "\n";
           if (Col)
@@ -1898,10 +1907,16 @@ public:
   void translateLoopBody(Loop &L, SmallVector<const MemoryAccess *> &MemDefs,
                          SmallVector<Instruction *> &LoopBody,
                          SmallVector<Instruction *> &DenseBody) {
+//    Value *LiveOut = nullptr;
+//    if (!L.getExitBlock()->phis().empty())
+//      LiveOut = &*(L.getExitBlock()->phis().begin());
     auto *Header = L.getHeader();
+//    bool Done = false;
     for (BasicBlock *BB : L.getBlocks()) {
       if (LI.getLoopFor(BB) != &L)
         continue;
+//      if (Done)
+//        break;
       // All defs are also outputs
       if (auto *Defs = MSSA.getBlockDefs(BB))
         for (const MemoryAccess &MA : *Defs) {
@@ -1921,11 +1936,17 @@ public:
                 return InstBB != UserBB && !L.contains(UserBB);
               })) {
             MemDefs.push_back(&MA);
+//            if (isa<MemoryPhi>(&MA))
+//              return;
+//            LiveOut = dyn_cast<MemoryUseOrDef>(&MA)->getMemoryInst();
+//            Done = true;
+//            break;
           }
         }
       BasicBlock::iterator I =
           BB == Header ? BB->getFirstInsertionPt() : BB->begin();
       BasicBlock::iterator E = BB->end();
+
       for (; I != E; ++I) {
         if (dyn_cast<BranchInst>(&*I) || &*I == BB->getTerminator())
           continue;
@@ -1971,6 +1992,10 @@ public:
         else {
           OUTS << *I << "\n";
         }
+//        if (&*I == LiveOut) {
+//          Done = true;
+//          break;
+//        }
       }
     }
     // now loopbody has all the instructions in the loop body
@@ -2001,6 +2026,12 @@ public:
     SmallVector<Instruction *> LoopBody;
     SmallVector<Instruction *> DenseBody;
     translateLoopBody(L, MemDefs, LoopBody, DenseBody);
+
+//    Value *LiveOut;
+//    if (!L.getExitBlock()->phis().empty())
+//      LiveOut = &*(L.getExitBlock()->phis().begin());
+//    else
+//      LiveOut = dyn_cast<MemoryUseOrDef>(MemDefs[0])->getMemoryInst();
 
     OUTS << "(";
     LS = ListSeparator(", ");
@@ -2205,6 +2236,8 @@ public:
           DensifiedLoads[I] = NewI;
           DenseBody.push_back(NewI);
         }
+//        if (I == LiveOut)
+//          break;
       }
 
       for (auto *I : DenseBody) {
