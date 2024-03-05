@@ -601,6 +601,17 @@ public:
   }
 };
 
+class CSC : public Tensor {
+public:
+  CSC(std::vector<Value *> Shape, Type *T, Value *Root, Value *Row, Value *Col)
+      : Tensor(Shape, Root, T, StorageKind::CSC), Row(Row), Col(Col) {}
+  Value *Row = nullptr;
+  Value *Col = nullptr;
+  static bool classof(const Tensor *T) {
+    return T->getKind() == StorageKind::CSC;
+  }
+};
+
 enum LevelTypeEnum { COMPRESSED, DENSE, UNKNOWN };
 
 std::string printLevelType(LevelTypeEnum &LT) {
@@ -1265,13 +1276,13 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
       bool RowMajor;
       auto IsCSR = detectCompressed(LI, Load, &Row, &Col, &Val, &I, &J, &RowMajor, LevelMap);
       if (IsCSR) {
-        Tensor *TensorCSR;
+        Tensor *TensorCompressed;
         if (RowMajor)
-          TensorCSR = new CSR({I, J}, Load->getType(), Val, Row, Col);
+          TensorCompressed = new CSR({I, J}, Load->getType(), Val, Row, Col);
         else
-          TensorCSR = new CSR({J, I}, Load->getType(), Val, Row, Col);
+          TensorCompressed = new CSC({J, I}, Load->getType(), Val, Row, Col);
         //        CSR TensorCSR({Rows, nullptr}, Val, Row, Col);
-        TensorMap[Load] = TensorCSR;
+        TensorMap[Load] = TensorCompressed;
         //        TensorMap[getLoadStorePointerOperand(Load)] = TensorCSR;
         // find all the memory users of the pos (row) iterator and mark them?
         LLVM_DEBUG({
@@ -1281,7 +1292,7 @@ bool coverAllLoads(LoopInfo *LI, ScalarEvolution *SE,
           dbgs() << "row = " << *Row << "\n";
           if (Col)
             dbgs() << "col = " << *Col << "\n";
-          dbgs() << *TensorCSR << "\n";
+          dbgs() << *TensorCompressed << "\n";
         });
         ToRemove.push_back(Load);
         Change = true;
