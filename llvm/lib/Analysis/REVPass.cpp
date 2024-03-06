@@ -562,24 +562,24 @@ std::string Format2String(Tensor::StorageKind F) {
   }
 }
 
-raw_ostream &operator<<(raw_ostream &os, Tensor const &t) {
-  std::string output = Format2String(t.Kind) + "(<";
-  for (size_t i = 0; i < t.Shape.size(); ++i) {
-    if (i > 0)
-      output += "x";
-    if (t.Shape[i] == nullptr)
-      output += "?";
-    else {
-      output += getNameOrAsOperand(t.Shape[i]);
-      //        std::string type;
-      //        raw_string_ostream rs(type);
-      //        t.Shape[i]->getType()->print(rs);
-      //        output += type;
-    }
-  }
-  output += ">)";
-  return os << output;
-}
+//raw_ostream &operator<<(raw_ostream &os, Tensor const &t) {
+//  std::string output = Format2String(t.Kind) + "(<";
+//  for (size_t i = 0; i < t.Shape.size(); ++i) {
+//    if (i > 0)
+//      output += "x";
+//    if (t.Shape[i] == nullptr)
+//      output += "?";
+//    else {
+//      output += getNameOrAsOperand(t.Shape[i]);
+//      //        std::string type;
+//      //        raw_string_ostream rs(type);
+//      //        t.Shape[i]->getType()->print(rs);
+//      //        output += type;
+//    }
+//  }
+//  output += ">)";
+//  return os << output;
+//}
 
 class Vector : public Tensor {
 public:
@@ -611,6 +611,17 @@ public:
     return T->getKind() == StorageKind::CSC;
   }
 };
+
+raw_ostream &operator<<(raw_ostream &OS, Tensor const& tensor) {
+  if (tensor.Kind == Tensor::StorageKind::CSR) {
+    auto *T = dyn_cast<CSR>(&tensor);
+    OS << "CSR(" << getNameOrAsOperand(tensor.Root) << ", " << getNameOrAsOperand(T->Row) << ", " << getNameOrAsOperand(T->Col) <<  ")";
+  } else if (tensor.Kind == Tensor::StorageKind::CSC) {
+    auto *T = dyn_cast<CSC>(&tensor);
+    OS << "CSC(" << getNameOrAsOperand(tensor.Root) << ", " << getNameOrAsOperand(T->Row) << ", " << getNameOrAsOperand(T->Col) <<  ")";
+  }
+  return OS;
+}
 
 enum LevelTypeEnum { COMPRESSED, DENSE, UNKNOWN };
 
@@ -2559,6 +2570,14 @@ REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
   //    return PreservedAnalyses::all();
 
   Lambda Lam(LI, SE, MSSA, TensorMap, LevelMap);
+  ListSeparator LS(", ");
+  for (auto &E : TensorMap) {
+    auto *T = E.second;
+    if (T->Kind == Tensor::StorageKind::CONTIGUOUS)
+      continue;
+    Lam.OUTS << LS << *T;
+  }
+  Lam.OUTS << "\n";
   //  Lam.translate(F, LevelMap);
   Lam.translateAllLoops(F);
 
