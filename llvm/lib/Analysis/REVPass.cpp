@@ -699,7 +699,7 @@ void makeLevelBounds(LoopInfo &LI, ScalarEvolution *SE,
     Value *LowerBound = &Bounds->getInitialIVValue();
     Value *UpperBound = &Bounds->getFinalIVValue();
 
-    bool IsZero = match(LowerBound, m_ZeroInt());
+    bool IsZero = match(LowerBound, m_ZeroInt()) || isa<Argument>(LowerBound);
     //    bool IsInt = isa<ConstantInt>(UpperBound) ||
     //    isa<Argument>(UpperBound);
     // TODO handle loads better (make sure that bounds are invariant)
@@ -2530,7 +2530,7 @@ REVInfo REVPass::run(Function &F, FunctionAnalysisManager &AM) {
       coverAllLoads(&LI, &SE, TopLevelLoads, LevelMap, Leftover, TensorMap);
   // TODO change this later, but right now the fold assumes at least some loads
   if (TopLevelLoads.size() == 0)
-    return {};
+    AllCovered = true;
   LLVM_DEBUG({
     if (AllCovered)
       dbgs() << "all loads covered.\n";
